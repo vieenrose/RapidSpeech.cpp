@@ -330,6 +330,11 @@ static ggml_context *load_gguf_weights(const char *path,
 // ─────────────────────────────────────────────────────
 // Cross-platform microphone capture via miniaudio
 // ─────────────────────────────────────────────────────
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
