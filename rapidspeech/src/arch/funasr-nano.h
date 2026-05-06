@@ -3,7 +3,6 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "llm_graph.h"
-#include "llm_kv_cache.h"
 #include "llm_model.h"
 #include "qwen3.h"
 #include "sensevoice_encoder.h"
@@ -93,7 +92,12 @@ public:
 
   const RSModelMeta &GetMeta() const override { return meta_; }
 
+  // 2-pass support: runtime toggle for LLM rescoring
+  void SetUseLLM(bool use) override;
+  bool SupportsTwoPass() const override { return true; }
+
 private:
+  bool runtime_use_llm_ = true; // runtime toggle, initialized from hparams
   RSModelMeta meta_;
   FunASRNanoHParams hparams_;
   FunASRNanoVocab vocab_;
@@ -103,7 +107,6 @@ private:
 
   // Qwen3 LLM components (optional)
   llm_model_ptr llm_model_;
-  std::unique_ptr<llm_kv_cache> llm_kv_cache_;
   std::unique_ptr<llm_build_qwen3> llm_graph_builder_;
 
   // Host-side KV cache for autoregressive decode

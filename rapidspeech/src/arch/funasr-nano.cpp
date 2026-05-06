@@ -9,6 +9,7 @@
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
 #include <functional>
+#include <unordered_set>
 
 #include "ggml-cpu.h"
 
@@ -98,6 +99,7 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   if (qwen3_block_count_idx != -1) {
     hparams_.use_llm = true;
   }
+  runtime_use_llm_ = hparams_.use_llm;
 
   // Load adaptor layers if available
   int adaptor_n_layer_idx = gguf_find_key(ctx_gguf, "adaptor.n_layer");
@@ -471,26 +473,16 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   cparams.n_threads = 4;
   cparams.n_threads_batch = 4;
 
-  // Initialize Qwen3 graph builder if not already done
-  if (!llm_graph_builder_) {
-    llm_graph_builder_ =
-        std::make_unique<llm_build_qwen3>(*llm_model_, cparams, sched);
-  }
+  // Always create a fresh graph builder for each segment.
+  // The builder stores a reference to cparams (on our stack) and must not
+  // outlive this call; reusing a stale builder across segments would dangle.
+  llm_graph_builder_ =
+      std::make_unique<llm_build_qwen3>(*llm_model_, cparams, sched);
 
-  // Initialize KV cache (not fully used yet, but created for compatibility)
-  if (!llm_kv_cache_) {
-    llm_kv_cache::config kv_config;
-    kv_config.n_ctx = cparams.n_ctx;
-    kv_config.type_k = GGML_TYPE_F16;
-    kv_config.type_v = GGML_TYPE_F16;
-
-    llm_kv_cache_ = std::make_unique<llm_kv_cache>(
-        kv_config, llm_dim, llm_dim,
-        llm_model_->hparams().n_head_kv > 0 ? llm_model_->hparams().n_head_kv
-                                            : llm_model_->hparams().n_head,
-        llm_model_->hparams().n_layer,
-        ggml_backend_sched_get_backend(sched, 0));
-  }
+  // Clear any stale KV cache state from previous segments
+  host_kv_cache_k_.clear();
+  host_kv_cache_v_.clear();
+  n_cached_tokens_ = 0;
 
   // 3. Build projection graph for prefix + audio
   struct ggml_init_params proj_params = {512 * ggml_tensor_overhead(), nullptr,
@@ -526,6 +518,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
   // 4. Allocate and execute projection graph
   if (!ggml_backend_sched_alloc_graph(sched, gf_proj)) {
+    RS_LOG_ERR("DecodeWithLLM: failed to allocate projection graph");
     ggml_free(ctx_proj);
     return false;
   }
@@ -538,6 +531,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
                           suffix_tokens.size() * sizeof(int32_t));
 
   if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
+    RS_LOG_ERR("DecodeWithLLM: projection graph compute failed");
     ggml_free(ctx_proj);
     return false;
   }
@@ -585,6 +579,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
   // 9. Allocate and execute LLM graph
   if (!ggml_backend_sched_alloc_graph(sched, result->get_graph())) {
+    RS_LOG_ERR("DecodeWithLLM: failed to allocate LLM prefill graph");
     ggml_free(ctx_llm);
     return false;
   }
@@ -621,6 +616,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
       GGML_STATUS_SUCCESS) {
+    RS_LOG_ERR("DecodeWithLLM: LLM prefill compute failed");
     ggml_free(ctx_llm);
     return false;
   }
@@ -628,7 +624,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // 10. Get logits - now only the LAST token position is output (optimised)
   ggml_tensor *logits = result->get_logits();
   if (!logits) {
-    RS_LOG_ERR("No logits from LLM");
+    RS_LOG_ERR("DecodeWithLLM: no logits tensor from LLM prefill");
     ggml_free(ctx_llm);
     return false;
   }
@@ -681,8 +677,14 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
   token_ids.push_back(best_token);
 
-  RS_LOG_INFO("First token: %d (%s)", best_token,
-              llm_model_->vocab().decode(best_token).c_str());
+  // Log EOS probability for diagnostics (compare across segments)
+  const int32_t eos_token_id = llm_model_->vocab().token_eos();
+  float eos_logit = (eos_token_id >= 0 && eos_token_id < n_vocab)
+                        ? logits_host[eos_token_id]
+                        : -INFINITY;
+  RS_LOG_INFO("First token: %d (%s) | EOS=%d logit=%.4f | top_logit=%.4f id=%d",
+              best_token, llm_model_->vocab().decode(best_token).c_str(),
+              eos_token_id, eos_logit, best_prob, best_token);
 
   // Extract K/V per layer from output tensors and store in host cache
   const auto &lp = llm_model_->hparams();
@@ -737,7 +739,19 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // ==========================================
   // Autoregressive decode loop
   // ==========================================
-  const int32_t eos_token_id = llm_model_->vocab().token_eos();
+
+  // Repetition detection: break on degenerate decode loops
+  // Two patterns: consecutive (A→A→A...) and alternating (A→B→A→B...)
+  int consecutive_same_token = 0;
+  int alternating_count = 0;
+  static constexpr int MAX_CONSECUTIVE_REPEAT = 10;
+  static constexpr int MAX_ALTERNATING_REPEAT = 10;
+
+  // Repetition penalty: reduce logits of already-generated tokens to
+  // prevent the model from getting stuck in repetition loops. This is
+  // the standard approach used by llama.cpp / vLLM / etc.
+  static constexpr float REPETITION_PENALTY = 1.10f;
+  static constexpr int PENALTY_WINDOW = 64; // only penalize recent tokens
 
   // ==========================================
   // O3: Allocate persistent GPU-side KV cache buffers
@@ -751,12 +765,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
   ggml_backend_buffer_t kv_gpu_buf = nullptr;
+  struct ggml_context *ctx_kv = nullptr;
 
   {
     struct ggml_init_params kv_buf_params = {
         (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
         true};
-    struct ggml_context *ctx_kv = ggml_init(kv_buf_params);
+    ctx_kv = ggml_init(kv_buf_params);
 
     for (int il = 0; il < n_layer; ++il) {
       gpu_kv_k_vec[il] =
@@ -782,7 +797,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
     if (!kv_gpu_buf) {
-      RS_LOG_ERR("Failed to allocate GPU KV cache buffers");
+      RS_LOG_ERR("DecodeWithLLM: Failed to allocate GPU KV cache buffers");
     }
 
     // Upload initial KV data from host (prefill results)
@@ -882,6 +897,30 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0,
                             n_vocab * sizeof(float));
 
+    // Apply repetition penalty to recently generated tokens.
+    // For each token that appeared in the last PENALTY_WINDOW steps,
+    // divide its logit by REPETITION_PENALTY if it's positive,
+    // multiply by REPETITION_PENALTY if it's negative (discourages
+    // the token further).
+    {
+      int penalty_start =
+          std::max(0, (int)token_ids.size() - PENALTY_WINDOW);
+      std::unordered_set<int32_t> recent_tokens;
+      for (int p = penalty_start; p < (int)token_ids.size(); ++p) {
+        recent_tokens.insert(token_ids[p]);
+      }
+      for (int32_t tid : recent_tokens) {
+        if (tid >= 0 && tid < n_vocab) {
+          float &logit = dec_logits_host[tid];
+          if (logit > 0.0f) {
+            logit /= REPETITION_PENALTY;
+          } else {
+            logit *= REPETITION_PENALTY;
+          }
+        }
+      }
+    }
+
     int32_t next_token = 0;
     float next_prob = dec_logits_host[0];
     for (int v = 1; v < n_vocab; ++v) {
@@ -889,6 +928,23 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         next_prob = dec_logits_host[v];
         next_token = v;
       }
+    }
+
+    // Track consecutive duplicate tokens (A→A→A...)
+    if (next_token == best_token) {
+      consecutive_same_token++;
+    } else {
+      consecutive_same_token = 0;
+    }
+
+    // Track alternating pattern (A→B→A→B...) by checking if this
+    // token matches the token 2 steps back but differs from the
+    // immediately preceding one.
+    if (token_ids.size() >= 2 && next_token == token_ids[token_ids.size() - 2] &&
+        next_token != token_ids.back()) {
+      alternating_count++;
+    } else {
+      alternating_count = 0;
     }
 
     // Update host KV cache + GPU KV buffer: append new column
@@ -928,16 +984,40 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       break;
     }
 
+    if (consecutive_same_token >= MAX_CONSECUTIVE_REPEAT) {
+      RS_LOG_INFO("WARNING: token %d (%s) repeated %d times consecutively — "
+                  "forcing stop",
+                  next_token, llm_model_->vocab().decode(next_token).c_str(),
+                  consecutive_same_token);
+      ggml_backend_sched_reset(sched);
+      break;
+    }
+
+    if (alternating_count >= MAX_ALTERNATING_REPEAT) {
+      RS_LOG_INFO("WARNING: alternating pattern %d→%d→%d repeated %d times — "
+                  "forcing stop",
+                  next_token,
+                  token_ids.size() >= 1 ? token_ids.back() : -1,
+                  next_token,
+                  alternating_count);
+      ggml_backend_sched_reset(sched);
+      break;
+    }
+
     token_ids.push_back(next_token);
     best_token = next_token;
 
     ggml_backend_sched_reset(sched);
   }
 
-  // Free GPU KV cache buffer
+  // Free GPU KV cache buffer and tensor context
   if (kv_gpu_buf) {
     ggml_backend_buffer_free(kv_gpu_buf);
     kv_gpu_buf = nullptr;
+  }
+  if (ctx_kv) {
+    ggml_free(ctx_kv);
+    ctx_kv = nullptr;
   }
 
   // Convert token IDs to text
@@ -1018,15 +1098,19 @@ bool FunASRNanoModel::DecodeWithoutLLM(RSState &state,
   return true;
 };
 
+void FunASRNanoModel::SetUseLLM(bool use) {
+  runtime_use_llm_ = use && hparams_.use_llm && llm_model_;
+}
+
 /**
  * Enhanced Decode function supporting Greedy and Beam Search.
  */
 bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   auto &sv_state = static_cast<SenseVoiceState &>(state);
 
-  // Choose decode path based on LLM availability
+  // Choose decode path based on LLM availability AND runtime toggle
   bool success = false;
-  if (hparams_.use_llm && llm_model_) {
+  if (runtime_use_llm_ && llm_model_) {
     RS_LOG_INFO("Decoding with Qwen3 LLM");
     success = DecodeWithLLM(state, sched);
   } else {
@@ -1038,7 +1122,7 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   }
 
   // Convert token IDs to text (for non-LLM path)
-  if (!hparams_.use_llm || !llm_model_) {
+  if (!runtime_use_llm_ || !llm_model_) {
     for (auto id : sv_state.ids) {
       sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
     }

@@ -72,6 +72,14 @@ if (RS_ENABLE_PYTHON)
     set(GGML_VERSION_PATCH 0 CACHE STRING "" FORCE)
     set(GGML_VERSION "0.10.0" CACHE STRING "" FORCE)
     set(CMAKE_PLATFORM_NO_VERSIONED_SONAME ON)
+
+    # Platform-appropriate runtime library search path.
+    # macOS uses @loader_path, Linux uses $ORIGIN.
+    if (APPLE)
+        set(RS_RPATH "@loader_path")
+    else()
+        set(RS_RPATH "\$ORIGIN")
+    endif()
 endif()
 
 add_subdirectory(${GGML_PATH} ggml)
@@ -88,7 +96,7 @@ if (RS_ENABLE_PYTHON)
                 SOVERSION ""
                 VERSION ""
                 NO_SONAME ON
-                INSTALL_RPATH "@loader_path"
+                INSTALL_RPATH "${RS_RPATH}"
                 BUILD_WITH_INSTALL_RPATH ON
             )
         endif()
@@ -112,6 +120,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/sensevoice.cpp
         rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
+        rapidspeech/src/arch/silero_vad.cpp
         rapidspeech/src/arch/llm_model.h
         rapidspeech/src/arch/llm_model.cpp
         rapidspeech/src/arch/llm_graph.h
@@ -120,7 +129,13 @@ set(RS_SOURCES
         rapidspeech/src/arch/llm_kv_cache.cpp
         rapidspeech/src/arch/qwen3.h
         rapidspeech/src/arch/qwen3.cpp
+#        rapidspeech/src/arch/qwen3_asr.h
+#        rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
+#        rapidspeech/src/arch/mimo_tokenizer.cpp
+#        rapidspeech/src/arch/mimo_tokenizer.h
+#        rapidspeech/src/arch/mimo_asr.cpp
+#        rapidspeech/src/arch/mimo_asr.h
 )
 
 
@@ -150,7 +165,7 @@ if (NOT RS_ENABLE_PYTHON)
 else()
     set_target_properties(rapidspeech-core PROPERTIES
         NO_SONAME ON
-        INSTALL_RPATH "@loader_path"
+        INSTALL_RPATH "${RS_RPATH}"
         BUILD_WITH_INSTALL_RPATH ON
     )
 endif()
@@ -234,9 +249,10 @@ if (RS_ENABLE_PYTHON)
     # in the same directory as the pybind module.
 
     # Set @rpath relative to install location so dylibs find each other
-    # At runtime, @loader_path refers to the directory containing the loading dylib
-    set(CMAKE_INSTALL_RPATH "@loader_path")
-    set(CMAKE_BUILD_RPATH "@loader_path")
+    # At runtime, @loader_path (macOS) / $ORIGIN (Linux) refers to the
+    # directory containing the loading dylib
+    set(CMAKE_INSTALL_RPATH "${RS_RPATH}")
+    set(CMAKE_BUILD_RPATH "${RS_RPATH}")
 
     target_link_libraries(rapidspeech
             PRIVATE rapidspeech-core
@@ -260,11 +276,20 @@ add_executable(rs-asr-offline
         examples/asr/rs-asr-offline.cpp
 )
 
+add_executable(rs-asr-online
+        examples/asr/rs-asr-online.cpp
+)
+
+add_executable(rs-vad-test
+        examples/asr/rs-vad-test.cpp
+)
 add_executable(rs-quantize
         examples/quantize/quantize.cpp
         examples/quantize/common_quantize.cpp
 )
 target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
+target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
+target_link_libraries(rs-vad-test    PRIVATE rapidspeech-core ggml)
 target_link_libraries(rs-quantize PRIVATE ggml)
 
 if (NOT MSVC)
@@ -284,7 +309,31 @@ target_include_directories(rs-asr-offline PRIVATE
     ${GGML_PATH}/src
 )
 
+target_include_directories(rs-asr-online PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+    ${GGML_PATH}/include
+    ${GGML_PATH}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
+)
+# miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
+if(UNIX AND NOT APPLE)
+    target_link_libraries(rs-asr-online PRIVATE dl)
+endif()
+
+target_include_directories(rs-vad-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+    ${GGML_PATH}/include
+    ${GGML_PATH}/src
+)
+
 install(TARGETS rs-asr-offline
+        RUNTIME DESTINATION bin
+)
+install(TARGETS rs-asr-online
         RUNTIME DESTINATION bin
 )
 # --- Tests ---
