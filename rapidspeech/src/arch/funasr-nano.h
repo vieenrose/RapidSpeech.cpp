@@ -96,8 +96,17 @@ public:
   void SetUseLLM(bool use) override;
   bool SupportsTwoPass() const override { return true; }
 
+  // CTC pre-check: lightweight CTC pass before LLM to detect silence.
+  // Skips expensive LLM decode when no speech is present, preventing
+  // hallucination on noise/silence segments.
+  void SetCTCPrecheck(bool enable) override;
+
+  void SetUserInputPrompt(const std::string &prompt) override;
+
 private:
   bool runtime_use_llm_ = true; // runtime toggle, initialized from hparams
+  bool ctc_precheck_ = false;   // CTC pre-check before LLM (disabled by default)
+  std::string user_input_prompt_;
   RSModelMeta meta_;
   FunASRNanoHParams hparams_;
   FunASRNanoVocab vocab_;

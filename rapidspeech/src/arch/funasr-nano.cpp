@@ -24,8 +24,6 @@ struct FunASRNanoState : public RSState {
 
   std::vector<int32_t> ids;
   std::vector<std::string> tokens;
-  std::string user_input =
-      "语音转写："; // User input prompt, default is "语音转写"
   int language_id = 0;
 
   FunASRNanoState() {
@@ -45,7 +43,8 @@ struct FunASRNanoState : public RSState {
 
 // --- FunASRNanoModel Implementation ---
 
-FunASRNanoModel::FunASRNanoModel() : ctx_weights_(nullptr) {
+FunASRNanoModel::FunASRNanoModel()
+    : ctx_weights_(nullptr), user_input_prompt_("语音转写：") {
   encoder_ = std::make_unique<SenseVoiceEncoderModel>();
   ctc_decoder_ = std::make_unique<FunASRNanoTransformerDecoder>();
   audio_adaptor_ = std::make_unique<FunASRNanoTransformerDecoder>();
@@ -447,7 +446,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // Build prompt
   std::string user_input = "<|im_start|>system\nYou are a helpful "
                            "assistant.<|im_end|>\n<|im_start|>user\n" +
-                           sv_state.user_input; // Default: "语音转写"
+                           user_input_prompt_;
   std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
   // Tokenize user_input
   std::vector<int32_t> prefix_tokens;
@@ -784,16 +783,14 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
                     ("gpu_kv_v_" + std::to_string(il)).c_str());
     }
 
-    // Allocate on the GPU backend (Metal), independent of scheduler
-    // Use n_backends to safely check if a GPU backend is available
+    // Allocate KV cache on the fastest available backend
     int n_backends = ggml_backend_sched_get_n_backends(sched);
+    // With a GPU-only scheduler the single backend IS the GPU.
+    // With a mixed scheduler the GPU is typically the last backend.
     ggml_backend_t gpu_backend =
-        (n_backends > 1)
-            ? ggml_backend_sched_get_backend(sched, 1) // GPU backend at index 1
-            : ggml_backend_sched_get_backend(sched, 0); // CPU-only fallback
-    if (n_backends <= 1) {
-      RS_LOG_INFO("GPU backend not available, using CPU for KV cache");
-    }
+        ggml_backend_sched_get_backend(sched, n_backends - 1);
+    RS_LOG_INFO("KV cache allocated on backend %d/%d: %s", n_backends - 1,
+                n_backends, ggml_backend_name(gpu_backend));
 
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
     if (!kv_gpu_buf) {
@@ -1102,11 +1099,80 @@ void FunASRNanoModel::SetUseLLM(bool use) {
   runtime_use_llm_ = use && hparams_.use_llm && llm_model_;
 }
 
+void FunASRNanoModel::SetCTCPrecheck(bool enable) {
+  ctc_precheck_ = enable;
+}
+
+void FunASRNanoModel::SetUserInputPrompt(const std::string &prompt) {
+  user_input_prompt_ = prompt;
+}
+
 /**
- * Enhanced Decode function supporting Greedy and Beam Search.
+ * Enhanced Decode function.
+ *
+ * When LLM is enabled, a fast CTC pre-check runs first to detect silence.
+ * If CTC produces only blank tokens the audio is noise/silence and the
+ * expensive LLM decode is skipped, preventing hallucinated output.
  */
 bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   auto &sv_state = static_cast<SenseVoiceState &>(state);
+
+  if (!sv_state.encoder_out)
+    return false;
+
+  // ── CTC pre-check (optional): detect silence before running LLM ──
+  // LLMs are generative and will produce plausible text from any input,
+  // including silence features.  A cheap CTC pass tells us whether the
+  // audio contains actual speech before we commit to the LLM.
+  // Enabled via rs_set_ctc_precheck() / --ctc-precheck.
+  bool has_speech = true;
+  if (ctc_precheck_ && runtime_use_llm_ && llm_model_) {
+    has_speech = false;
+
+    struct ggml_init_params ctc_params = {2 * 1024 * ggml_tensor_overhead(),
+                                          nullptr, true};
+    struct ggml_context *ctx_ctc = ggml_init(ctc_params);
+    struct ggml_cgraph *gf_ctc =
+        ggml_new_graph_custom(ctx_ctc, 256, false);
+
+    struct ggml_tensor *enc_in = ggml_new_tensor_2d(
+        ctx_ctc, sv_state.encoder_out->type, sv_state.encoder_out->ne[0],
+        sv_state.encoder_out->ne[1]);
+    ggml_set_input(enc_in);
+
+    struct ggml_tensor *cur = ggml_mul_mat(ctx_ctc,
+        ctc_decoder_->ctc_out_linear_weight, enc_in);
+    cur = ggml_add(ctx_ctc, cur, ctc_decoder_->ctc_out_linear_bias);
+    cur = ggml_argmax(ctx_ctc, cur);
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf_ctc, cur);
+
+    if (ggml_backend_sched_alloc_graph(sched, gf_ctc)) {
+      ggml_backend_tensor_copy(sv_state.encoder_out, enc_in);
+      if (ggml_backend_sched_graph_compute(sched, gf_ctc) ==
+          GGML_STATUS_SUCCESS) {
+        int T = sv_state.encoder_out->ne[1];
+        raw_ids.resize(T);
+        ggml_backend_tensor_get(cur, raw_ids.data(), 0,
+                                T * sizeof(int32_t));
+        for (int i = 0; i < T; ++i) {
+          if (raw_ids[i] != 0) { // non-blank token → speech
+            has_speech = true;
+            break;
+          }
+        }
+      }
+    }
+    ggml_free(ctx_ctc);
+
+    // Reset scheduler so the main decode path can allocate a fresh graph.
+    ggml_backend_sched_reset(sched);
+  }
+
+  if (!has_speech) {
+    sv_state.tokens.clear();
+    return true;
+  }
 
   // Choose decode path based on LLM availability AND runtime toggle
   bool success = false;
