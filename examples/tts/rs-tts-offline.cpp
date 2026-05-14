@@ -11,6 +11,7 @@
  *       --instruct <text>    Voice description (default: male)
  *       --lang <lang>        Target language (default: English)
  *       --seed <n>           Random seed (default: 42)
+ *       --n-steps <n>        Diffusion steps (1-128, default: 32)
  *       --threads <n>        CPU threads (default: 4)
  *       --gpu <true|false>   Enable GPU acceleration (default: true)
  *   -h, --help               Show help
@@ -42,6 +43,7 @@ struct TtsArgs {
   const char *ref_path = nullptr;       // reference audio for voice cloning
   const char *ref_text = nullptr;       // transcript of reference audio
   int seed = 42;
+  int n_steps = 32;
   int n_threads = 4;
   bool use_gpu = true;
 };
@@ -63,6 +65,7 @@ static void print_usage(const char *prog) {
       << "      --instruct <text>    Voice description (default: male)\n"
       << "      --lang <lang>        Target language (default: English)\n"
       << "      --seed <n>           Random seed (default: 42)\n"
+      << "      --n-steps <n>        Diffusion steps 1-128 (default: 32)\n"
       << "      --threads <n>        CPU threads (default: 4)\n"
       << "      --gpu <true|false>   Enable GPU acceleration (default: true)\n"
       << "  -h, --help               Show this help\n"
@@ -88,6 +91,8 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.language = argv[++i];
     } else if (a == "--seed" && i + 1 < argc) {
       args.seed = std::stoi(argv[++i]);
+    } else if (a == "--n-steps" && i + 1 < argc) {
+      args.n_steps = std::stoi(argv[++i]);
     } else if (a == "--threads" && i + 1 < argc) {
       args.n_threads = std::stoi(argv[++i]);
     } else if (a == "--gpu" && i + 1 < argc) {
@@ -184,7 +189,8 @@ int main(int argc, char **argv) {
 
   // Set TTS params
   rs_set_tts_params(tts_ctx, args.instruct, args.language, args.seed);
-  LOG_INFO("Instruct: %s  Language: %s  Seed: %d", args.instruct, args.language, args.seed);
+  rs_set_tts_diffusion_steps(tts_ctx, args.n_steps);
+  LOG_INFO("Instruct: %s  Language: %s  Seed: %d  Steps: %d", args.instruct, args.language, args.seed, args.n_steps);
 
   // Push reference audio for voice cloning (optional)
   if (args.ref_path && args.ref_path[0]) {

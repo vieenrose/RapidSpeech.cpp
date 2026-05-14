@@ -169,6 +169,10 @@ void RSProcessor::SetTTSParams(const char *instruct, const char *language,
   tts_seed_ = seed;
 }
 
+void RSProcessor::SetDiffusionSteps(int n_steps) {
+  if (model_) model_->SetDiffusionSteps(n_steps);
+}
+
 int RSProcessor::PushText(const char *text, const char *language) {
   if (!model_ || !state_) return -1;
   const char *lang = language ? language : tts_language_.c_str();

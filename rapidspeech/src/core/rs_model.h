@@ -80,6 +80,9 @@ public:
     (void)state; (void)out_data; return 0;
   }
 
+  // Set number of MaskGIT diffusion steps (OmniVoice TTS only). Default 32.
+  virtual void SetDiffusionSteps(int n_steps) { (void)n_steps; }
+
   // Get metadata
   virtual const RSModelMeta &GetMeta() const = 0;
 };

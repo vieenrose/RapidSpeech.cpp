@@ -79,6 +79,12 @@ public:
   void SetTTSParams(const char *instruct, const char *language, int seed);
 
   /**
+   * Set number of MaskGIT diffusion steps (OmniVoice TTS only).
+   * Default 32. Fewer steps = faster but lower quality.
+   */
+  void SetDiffusionSteps(int n_steps);
+
+  /**
    * Push text for TTS synthesis.
    * @return 0 on success, -1 on error
    */

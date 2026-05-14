@@ -408,6 +408,15 @@ private:
                                             ggml_backend_sched_t sched,
                                             int T_audio);
 
+    // Graph reuse: build LLM graph once, reuse across diffusion steps
+    struct DiffusionGraphState;
+    bool BuildDiffusionGraph(DiffusionGraphState &gs, const OmniVoicePrompt &prompt,
+                             ggml_backend_sched_t sched, int T_audio);
+    std::vector<float> RunDiffusionGraph(DiffusionGraphState &gs,
+                                          const OmniVoicePrompt &prompt,
+                                          ggml_backend_sched_t sched);
+    void FreeDiffusionGraph(DiffusionGraphState &gs, ggml_backend_sched_t sched);
+
     // Audio encoding for voice cloning
     std::vector<int32_t> EncodeReferenceAudio(const float *audio_24k, int n_samples);
 

@@ -209,6 +209,11 @@ RS_API rs_error_t rs_reset(rs_context_t* ctx);
 RS_API rs_error_t rs_set_tts_params(rs_context_t* ctx, const char* instruct,
                                      const char* language, int32_t seed);
 
+// Set number of MaskGIT diffusion steps (OmniVoice TTS only, default 32).
+// Fewer steps = faster but lower quality (min 1, max 128).
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_tts_diffusion_steps(rs_context_t* ctx, int32_t n_steps);
+
 // ── 2-pass (CTC + LLM rescoring) support ──
 
 // Set user input prompt for the LLM decoder (FunASRNano only).

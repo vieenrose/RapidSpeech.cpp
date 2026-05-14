@@ -2528,6 +2528,330 @@ bool OmniVoiceModel::BuildPrompt(OmniVoiceState &state, OmniVoicePrompt &prompt)
 }
 
 // =====================================================================
+// Diffusion Graph State — persistent across MaskGIT steps
+// =====================================================================
+
+struct OmniVoiceModel::DiffusionGraphState {
+    struct ggml_context *gctx = nullptr;
+    struct ggml_cgraph *cgraph = nullptr;
+
+    // Input tensors
+    struct ggml_tensor *t_text_ids = nullptr;
+    struct ggml_tensor *t_shifted = nullptr;
+    struct ggml_tensor *t_mask = nullptr;
+    struct ggml_tensor *t_inv_mask = nullptr;
+    struct ggml_tensor *t_positions = nullptr;
+    struct ggml_tensor *t_attn = nullptr;
+
+    // Output tensors (one of these two paths is active)
+    struct ggml_tensor *cond_audio = nullptr;
+    struct ggml_tensor *uncond_audio = nullptr;
+    struct ggml_tensor *logits_flat = nullptr;
+
+    int S = 0, K = 0, V = 0, B_prime = 0, T_audio = 0;
+    bool allocated = false;
+};
+
+// Build the full LLM graph once. The graph structure is identical across all
+// MaskGIT diffusion steps; only the audio token values change (updated via
+// t_shifted and t_text_ids inputs each step).
+bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
+                                          const OmniVoicePrompt &prompt,
+                                          ggml_backend_sched_t sched, int T_audio) {
+    gs.B_prime = prompt.B_prime;
+    gs.K = prompt.K;
+    gs.S = prompt.S_max;
+    gs.V = audio_vocab_size_;
+    gs.T_audio = T_audio;
+
+    const int B_prime = gs.B_prime;
+    const int K = gs.K;
+    const int S = gs.S;
+    const int V = gs.V;
+    const int H = hparams_.n_embd;
+    const int n_head = hparams_.n_head;
+    const int n_head_kv = hparams_.n_head_kv;
+    const int head_dim = hparams_.head_dim;
+    const int n_layer = hparams_.n_layer;
+
+    if (B_prime <= 0 || K <= 0 || S <= 0) return false;
+
+    const int n_max_nodes = OMNIVOICE_MAX_NODES;
+    struct ggml_init_params gparams = {
+        (size_t)n_max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_max_nodes, false),
+        nullptr, true};
+    gs.gctx = ggml_init(gparams);
+    if (!gs.gctx) return false;
+    struct ggml_context *gctx = gs.gctx;
+
+    // Input tensors (buffers allocated later by sched_alloc_graph)
+    gs.t_text_ids = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, B_prime * S);
+    ggml_set_name(gs.t_text_ids, "text_ids"); ggml_set_input(gs.t_text_ids);
+
+    gs.t_shifted = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, B_prime * S, K);
+    ggml_set_name(gs.t_shifted, "shifted_ids"); ggml_set_input(gs.t_shifted);
+
+    gs.t_mask = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 1, S, B_prime);
+    ggml_set_name(gs.t_mask, "mask"); ggml_set_input(gs.t_mask);
+
+    gs.t_inv_mask = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 1, S, B_prime);
+    ggml_set_name(gs.t_inv_mask, "inv_mask"); ggml_set_input(gs.t_inv_mask);
+
+    gs.t_positions = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, S);
+    ggml_set_name(gs.t_positions, "positions"); ggml_set_input(gs.t_positions);
+
+    // Attention mask — create tensor if prompt has mask data
+    gs.t_attn = nullptr;
+    if (!prompt.attention_mask.empty()) {
+        gs.t_attn = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, S, S, 1, B_prime);
+        ggml_set_name(gs.t_attn, "attn_mask"); ggml_set_input(gs.t_attn);
+    }
+
+    // Custom embed
+    struct ggml_tensor *text_embeds_flat = ggml_get_rows(gctx, text_embd_, gs.t_text_ids);
+    struct ggml_tensor *audio_embeds_flat = nullptr;
+    struct ggml_tensor *embd_table = combined_audio_embeddings_;
+    struct ggml_tensor *head_table = combined_audio_heads_;
+    if (!embd_table && !head_table && combined_codebook_weights_) {
+        int64_t H_dim = combined_codebook_weights_->ne[0];
+        int64_t KV = (int64_t)K * V;
+        if (combined_codebook_weights_->ne[1] == 2 * KV) {
+            embd_table = ggml_view_2d(gctx, combined_codebook_weights_, H_dim, KV,
+                                      combined_codebook_weights_->nb[1], 0);
+            head_table = ggml_view_2d(gctx, combined_codebook_weights_, H_dim, KV,
+                                      combined_codebook_weights_->nb[1], KV * combined_codebook_weights_->nb[1]);
+        }
+    }
+    for (int k = 0; k < K; k++) {
+        struct ggml_tensor *idx_k = ggml_view_1d(gctx, gs.t_shifted, B_prime * S,
+            (size_t)k * (size_t)(B_prime * S) * sizeof(int32_t));
+        struct ggml_tensor *emb_w = acoustic_embeddings_[k];
+        if (!emb_w) emb_w = embd_table;
+        struct ggml_tensor *emb_k = ggml_get_rows(gctx, emb_w, idx_k);
+        audio_embeds_flat = (k == 0) ? emb_k : ggml_add(gctx, audio_embeds_flat, emb_k);
+    }
+
+    struct ggml_tensor *text_embeds = ggml_reshape_3d(gctx, ggml_cont(gctx, text_embeds_flat), H, S, B_prime);
+    struct ggml_tensor *audio_embeds = ggml_reshape_3d(gctx, ggml_cont(gctx, audio_embeds_flat), H, S, B_prime);
+    struct ggml_tensor *text_branch = ggml_mul(gctx, text_embeds, gs.t_inv_mask);
+    struct ggml_tensor *audio_branch = ggml_mul(gctx, audio_embeds, gs.t_mask);
+    struct ggml_tensor *hidden = ggml_add(gctx, text_branch, audio_branch);
+
+    auto to_f32 = [&](struct ggml_tensor *t) -> struct ggml_tensor * {
+        if (!t) return nullptr;
+        if (t->type == GGML_TYPE_F32) return t;
+        return ggml_cast(gctx, t, GGML_TYPE_F32);
+    };
+
+    const float rope_theta = hparams_.rope_theta;
+    const float attn_scale = 1.0f / sqrtf((float)head_dim);
+
+    for (int il = 0; il < n_layer; ++il) {
+        struct ggml_tensor *residual = hidden;
+
+        hidden = ggml_rms_norm(gctx, hidden, hparams_.eps);
+        hidden = ggml_mul(gctx, hidden, to_f32(llm_model_->layers()[il].attn_norm));
+
+        struct ggml_tensor *q = ggml_mul_mat(gctx, llm_model_->layers()[il].wq, hidden);
+        struct ggml_tensor *k = ggml_mul_mat(gctx, llm_model_->layers()[il].wk, hidden);
+        struct ggml_tensor *v = ggml_mul_mat(gctx, llm_model_->layers()[il].wv, hidden);
+
+        if (llm_model_->layers()[il].attn_q_norm) {
+            q = ggml_reshape_4d(gctx, q, head_dim, n_head, S, B_prime);
+            q = ggml_rms_norm(gctx, q, hparams_.eps);
+            q = ggml_mul(gctx, q, to_f32(llm_model_->layers()[il].attn_q_norm));
+            q = ggml_reshape_3d(gctx, q, head_dim * n_head, S, B_prime);
+        }
+        if (llm_model_->layers()[il].attn_k_norm) {
+            k = ggml_reshape_4d(gctx, k, head_dim, n_head_kv, S, B_prime);
+            k = ggml_rms_norm(gctx, k, hparams_.eps);
+            k = ggml_mul(gctx, k, to_f32(llm_model_->layers()[il].attn_k_norm));
+            k = ggml_reshape_3d(gctx, k, head_dim * n_head_kv, S, B_prime);
+        }
+
+        q = ggml_reshape_4d(gctx, q, head_dim, n_head, S, B_prime);
+        k = ggml_reshape_4d(gctx, k, head_dim, n_head_kv, S, B_prime);
+        v = ggml_reshape_4d(gctx, v, head_dim, n_head_kv, S, B_prime);
+
+        q = ggml_rope_ext_inplace(gctx, q, gs.t_positions, nullptr, head_dim, 2, 0,
+                                  rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext_inplace(gctx, k, gs.t_positions, nullptr, head_dim, 2, 0,
+                                  rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        q = ggml_permute(gctx, q, 0, 2, 1, 3);
+        k = ggml_permute(gctx, k, 0, 2, 1, 3);
+        v = ggml_permute(gctx, v, 0, 2, 1, 3);
+
+        struct ggml_tensor *attn_out;
+        if (gs.t_attn) {
+            v = ggml_clamp(gctx, v, -65504.0f, 65504.0f);
+            attn_out = ggml_flash_attn_ext(gctx, q, k, v, gs.t_attn, attn_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        } else {
+            if (n_head != n_head_kv) {
+                int n_rep = n_head / n_head_kv;
+                k = ggml_repeat(gctx, k, ggml_new_tensor_4d(gctx, k->type, head_dim, S, n_head, B_prime));
+                k = ggml_reshape_4d(gctx, k, head_dim, S, n_head, B_prime);
+                v = ggml_repeat(gctx, v, ggml_new_tensor_4d(gctx, v->type, head_dim, S, n_head, B_prime));
+                v = ggml_reshape_4d(gctx, v, head_dim, S, n_head, B_prime);
+            }
+            struct ggml_tensor *scores = ggml_mul_mat(gctx, k, q);
+            scores = ggml_scale_inplace(gctx, scores, attn_scale);
+            struct ggml_tensor *probs = ggml_soft_max_inplace(gctx, scores);
+            struct ggml_tensor *v_tr = ggml_cont(gctx, ggml_transpose(gctx, v));
+            struct ggml_tensor *ctx_out = ggml_mul_mat(gctx, v_tr, probs);
+            attn_out = ggml_cont(gctx, ggml_permute(gctx, ctx_out, 0, 2, 1, 3));
+        }
+        attn_out = ggml_reshape_3d(gctx, attn_out, head_dim * n_head, S, B_prime);
+        attn_out = ggml_mul_mat(gctx, llm_model_->layers()[il].wo, attn_out);
+        hidden = ggml_add(gctx, residual, attn_out);
+
+        struct ggml_tensor *ffn_residual = hidden;
+        hidden = ggml_rms_norm(gctx, hidden, hparams_.eps);
+        hidden = ggml_mul(gctx, hidden, to_f32(llm_model_->layers()[il].ffn_norm));
+
+        struct ggml_tensor *gate = ggml_mul_mat(gctx, llm_model_->layers()[il].ffn_gate, hidden);
+        struct ggml_tensor *up = ggml_mul_mat(gctx, llm_model_->layers()[il].ffn_up, hidden);
+        gate = ggml_silu_inplace(gctx, gate);
+        struct ggml_tensor *ffn_out = ggml_mul(gctx, gate, up);
+        ffn_out = ggml_mul_mat(gctx, llm_model_->layers()[il].ffn_down, ffn_out);
+        hidden = ggml_add(gctx, ffn_residual, ffn_out);
+    }
+
+    hidden = ggml_rms_norm(gctx, hidden, hparams_.eps);
+    hidden = ggml_mul(gctx, hidden, to_f32(output_norm_));
+
+    gs.logits_flat = nullptr;
+    for (int c = 0; c < K; c++) {
+        struct ggml_tensor *head_w = codebook_head_weight_[c];
+        struct ggml_tensor *head_b = codebook_head_bias_[c];
+        if (!head_w && head_table) {
+            head_w = ggml_view_2d(gctx, head_table, head_table->ne[0], V,
+                                  head_table->nb[1], c * V * head_table->nb[1]);
+        }
+        struct ggml_tensor *head_logits = ggml_mul_mat(gctx, head_w, hidden);
+        if (head_b)
+            head_logits = ggml_add(gctx, head_logits, head_b);
+        head_logits = ggml_reshape_4d(gctx, head_logits, V, 1, S, B_prime);
+        gs.logits_flat = (c == 0) ? head_logits : ggml_concat(gctx, gs.logits_flat, head_logits, 1);
+    }
+
+    if (T_audio > 0 && T_audio < S) {
+        gs.cond_audio = ggml_cont(gctx, ggml_view_4d(gctx, gs.logits_flat, V, K, T_audio, 1,
+            gs.logits_flat->nb[1], gs.logits_flat->nb[2], gs.logits_flat->nb[3],
+            (size_t)(S - T_audio) * gs.logits_flat->nb[2] + 0 * gs.logits_flat->nb[3]));
+        ggml_set_name(gs.cond_audio, "cond_audio_logits");
+        ggml_set_output(gs.cond_audio);
+
+        gs.uncond_audio = ggml_cont(gctx, ggml_view_4d(gctx, gs.logits_flat, V, K, T_audio, 1,
+            gs.logits_flat->nb[1], gs.logits_flat->nb[2], gs.logits_flat->nb[3],
+            0 * gs.logits_flat->nb[2] + 1 * gs.logits_flat->nb[3]));
+        ggml_set_name(gs.uncond_audio, "uncond_audio_logits");
+        ggml_set_output(gs.uncond_audio);
+    } else {
+        ggml_set_name(gs.logits_flat, "audio_logits");
+        ggml_set_output(gs.logits_flat);
+    }
+
+    gs.cgraph = ggml_new_graph_custom(gctx, n_max_nodes, false);
+    if (T_audio > 0) {
+        ggml_build_forward_expand(gs.cgraph, gs.cond_audio);
+        ggml_build_forward_expand(gs.cgraph, gs.uncond_audio);
+    } else {
+        ggml_build_forward_expand(gs.cgraph, gs.logits_flat);
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, gs.cgraph)) {
+        RS_LOG_ERR("OmniVoice: sched_alloc_graph failed (B'=%d K=%d S=%d)", B_prime, K, S);
+        FreeDiffusionGraph(gs, sched);
+        return false;
+    }
+    gs.allocated = true;
+
+    // Upload constant inputs (positions, attention mask) — set once, never change
+    std::vector<int32_t> pos_data(S);
+    for (int i = 0; i < S; i++) pos_data[i] = i;
+    ggml_backend_tensor_set(gs.t_positions, pos_data.data(), 0, S * sizeof(int32_t));
+
+    return true;
+}
+
+// Execute one forward pass using the pre-built graph. Only updates inputs that
+// may have changed since the previous step (shifted audio tokens, text_ids,
+// mask/inv_mask; the latter two are constant in practice but updated defensively).
+std::vector<float> OmniVoiceModel::RunDiffusionGraph(DiffusionGraphState &gs,
+                                                      const OmniVoicePrompt &prompt,
+                                                      ggml_backend_sched_t sched) {
+    const int B_prime = gs.B_prime;
+    const int K = gs.K;
+    const int S = gs.S;
+    const int V = gs.V;
+    const int T_audio = gs.T_audio;
+
+    // Pre-compute input data
+    std::vector<int32_t> shifted((size_t)K * B_prime * S);
+    std::vector<int32_t> text_ids_buf((size_t)B_prime * S);
+    for (int b = 0; b < B_prime; b++) {
+        for (int s = 0; s < S; s++) {
+            int m = (prompt.audio_mask[(size_t)b * S + s] != 0) ? 1 : 0;
+            text_ids_buf[(size_t)b * S + s] = prompt.input_ids[((size_t)b * K + 0) * S + s];
+            for (int k = 0; k < K; k++) {
+                shifted[((size_t)k * B_prime + b) * S + s] =
+                    prompt.input_ids[((size_t)b * K + k) * S + s] * m + k * V;
+            }
+        }
+    }
+
+    std::vector<float> mask_data((size_t)B_prime * S);
+    std::vector<float> inv_mask_data((size_t)B_prime * S);
+    for (int b = 0; b < B_prime; b++) {
+        for (int s = 0; s < S; s++) {
+            int m = (prompt.audio_mask[(size_t)b * S + s] != 0) ? 1 : 0;
+            mask_data[(size_t)b * S + s] = (float)m;
+            inv_mask_data[(size_t)b * S + s] = (float)(1 - m);
+        }
+    }
+
+    // Upload inputs
+    ggml_backend_tensor_set(gs.t_text_ids, text_ids_buf.data(), 0, text_ids_buf.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(gs.t_shifted, shifted.data(), 0, shifted.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(gs.t_mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    ggml_backend_tensor_set(gs.t_inv_mask, inv_mask_data.data(), 0, inv_mask_data.size() * sizeof(float));
+
+    // Compute
+    if (ggml_backend_sched_graph_compute(sched, gs.cgraph) != GGML_STATUS_SUCCESS) {
+        RS_LOG_ERR("OmniVoice: LLM forward compute failed");
+        return {};
+    }
+
+    // Read output
+    std::vector<float> out;
+    if (T_audio > 0) {
+        size_t per = (size_t)V * K * T_audio;
+        out.resize(2 * per);
+        ggml_backend_tensor_get(gs.cond_audio, out.data(), 0, per * sizeof(float));
+        ggml_backend_tensor_get(gs.uncond_audio, out.data() + per, 0, per * sizeof(float));
+    } else {
+        size_t n = ggml_nelements(gs.logits_flat);
+        out.resize(n);
+        ggml_backend_tensor_get(gs.logits_flat, out.data(), 0, n * sizeof(float));
+    }
+    return out;
+}
+
+void OmniVoiceModel::FreeDiffusionGraph(DiffusionGraphState &gs, ggml_backend_sched_t sched) {
+    if (gs.allocated) {
+        ggml_backend_sched_reset(sched);
+        gs.allocated = false;
+    }
+    if (gs.gctx) {
+        ggml_free(gs.gctx);
+        gs.gctx = nullptr;
+    }
+    gs = {};
+}
+
+// =====================================================================
 // Batched LLM Forward (CFG: cond + uncond)
 // =====================================================================
 
@@ -2929,11 +3253,28 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
     MaskgitConfig mg_cfg;
     mg_cfg.num_step = n_steps;
-    mg_cfg.guidance_scale = 2.0f;  // reference always uses 2.0
+    mg_cfg.guidance_scale = 2.0f;
     mg_cfg.t_shift = tau;
 
-    uint32_t ctr_lo = 0;
+    // Build attention mask (constant across steps) before building the graph
+    std::vector<uint16_t> attn_f16;
+    if (!prompt.attention_mask.empty()) {
+        attn_f16.resize((size_t)B_prime * S * S);
+        const uint16_t f16_one = ggml_fp32_to_fp16(1.0f);
+        const uint16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+        for (size_t i = 0; i < (size_t)B_prime * S * S; i++)
+            attn_f16[i] = (prompt.attention_mask[i] != 0) ? f16_one : f16_zero;
+    }
 
+    // Build the full LLM graph once — reused across all diffusion steps
+    DiffusionGraphState gs;
+    if (!BuildDiffusionGraph(gs, prompt, sched, T)) return false;
+
+    // Upload attention mask (constant across steps)
+    if (gs.t_attn && !attn_f16.empty())
+        ggml_backend_tensor_set(gs.t_attn, attn_f16.data(), 0, attn_f16.size() * sizeof(uint16_t));
+
+    uint32_t ctr_lo = 0;
     RS_LOG_INFO("MaskGIT: T=%d K=%d S=%d V=%d steps=%d", T, K, S, V, n_steps);
 
     for (int step = 0; step < n_steps; step++) {
@@ -2942,13 +3283,14 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
         state.diff_step = step + 1;
 
-        // Run batched LLM forward
-        std::vector<float> logits_full = RunLLMForwardBatched(prompt, sched, T);
-        if (logits_full.empty()) return false;
+        // Execute forward pass using pre-built graph (only updates changed inputs)
+        std::vector<float> logits_full = RunDiffusionGraph(gs, prompt, sched);
+        if (logits_full.empty()) { FreeDiffusionGraph(gs, sched); return false; }
 
         size_t per_audio = (size_t)V * K * T;
         if (logits_full.size() != 2 * per_audio) {
             RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
+            FreeDiffusionGraph(gs, sched);
             return false;
         }
 
@@ -3056,12 +3398,12 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         int remaining = (int)std::count(state.acoustic_tokens.begin(), state.acoustic_tokens.end(), mask_id);
     }
 
-    // Safety net: force-demask any residual mask tokens
+    // Safety net: force-demask any residual mask tokens (use persistent graph)
     int remaining = (int)std::count(state.acoustic_tokens.begin(), state.acoustic_tokens.end(), mask_id);
     if (remaining > 0) {
         RS_LOG_INFO("MaskGIT: force-demasking %d residual tokens", remaining);
-        std::vector<float> logits_full = RunLLMForwardBatched(prompt, sched, T);
-        if (logits_full.empty()) return false;
+        std::vector<float> logits_full = RunDiffusionGraph(gs, prompt, sched);
+        if (logits_full.empty()) { FreeDiffusionGraph(gs, sched); return false; }
 
         size_t per_audio = (size_t)V * K * T;
         if (logits_full.size() >= 2 * per_audio) {
@@ -3087,6 +3429,7 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
             RS_LOG_ERR("MaskGIT: still %d residual masks after force-demask!", remaining);
     }
 
+    FreeDiffusionGraph(gs, sched);
     return true;
 }
 
@@ -3403,12 +3746,9 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
     ggml_build_forward_expand(gf, cur);
 
-    // Allocate all tensors on CPU backend — bypasses the GPU scheduler entirely.
-    // The DAC vocoder has many small conv ops where GPU kernel launch overhead
-    // dominates (~300x slower than CPU).
-    ggml_backend_buffer_t voc_buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend_);
-    if (!voc_buf) {
-        RS_LOG_ERR("OmniVoice: vocoder CPU alloc failed");
+    // Allocate intermediate tensors and schedule ops on the GPU scheduler.
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        RS_LOG_ERR("OmniVoice: vocoder sched_alloc_graph failed");
         ggml_free(ctx);
         return false;
     }
@@ -3442,11 +3782,10 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
     ggml_backend_tensor_set(tokens_inp, tokens_data.data(), 0, tokens_data.size() * sizeof(int32_t));
 
-    // Compute vocoder graph on CPU
-    ggml_backend_cpu_set_n_threads(cpu_backend_, 4);
-    if (ggml_backend_graph_compute(cpu_backend_, gf) != GGML_STATUS_SUCCESS) {
-        RS_LOG_ERR("OmniVoice: vocoder CPU compute failed");
-        ggml_backend_buffer_free(voc_buf);
+    // Compute vocoder graph on GPU via scheduler
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        RS_LOG_ERR("OmniVoice: vocoder GPU compute failed");
+        ggml_backend_sched_reset(sched);
         ggml_free(ctx);
         return false;
     }
@@ -3484,7 +3823,7 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
     }
 
-    ggml_backend_buffer_free(voc_buf);
+    ggml_backend_sched_reset(sched);
     ggml_free(ctx);
     bool ok = !state.audio_output.empty();
     if (ok) state.vocoder_done = true;

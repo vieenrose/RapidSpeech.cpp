@@ -425,6 +425,27 @@ RS_API rs_error_t rs_set_tts_params(rs_context_t *ctx, const char *instruct,
   }
 }
 
+RS_API rs_error_t rs_set_tts_diffusion_steps(rs_context_t *ctx, int32_t n_steps) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  if (n_steps < 1 || n_steps > 128) {
+    set_error(RS_ERR_INVALID_ARGS, "n_steps must be in [1, 128]");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    ctx->processor->SetDiffusionSteps(n_steps);
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetDiffusionSteps failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetDiffusionSteps unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
 RS_API rs_error_t rs_set_chunk_size(rs_context_t *ctx, int32_t chunk_size_ms) {
   if (!ctx || !ctx->processor) {
     set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
