@@ -15,7 +15,8 @@
 
 // quantize a model
 static bool rs_model_quantize(const std::string &fname_inp,
-                              const std::string &fname_out, ggml_ftype ftype) {
+                              const std::string &fname_out, ggml_ftype ftype,
+                              const std::string &imatrix_file = "") {
 
   RS_QUANTIZE_LOG_INFO("Loading model from '%s'", fname_inp.c_str());
 
@@ -67,7 +68,21 @@ static bool rs_model_quantize(const std::string &fname_inp,
       "_model.encoder.*.reparam_conv.weight",
       "_model.encoder.*.reparam_conv.bias", "_model.decoder.rnn.weight_ih",
       "_model.decoder.rnn.weight_hh", "_model.decoder.decoder.2.weight",
-      "_model.decoder.decoder.2.bias"};
+      "_model.decoder.decoder.2.bias",
+      // OmniVoice audio embedding/head tables — critical for MaskGIT token
+      // generation; Q4_K quantization produces incorrect tokens (silence)
+      "audio_embeddings.weight",
+      "audio_heads.weight",
+      // RVQ codec projection weights — quantization breaks the decode path,
+      // causing constant (saturated) output from DAC vocoder
+      "quantizer.*.project_in.weight",
+      "quantizer.*.project_out.weight",
+      // Vocoder and encoder 2D weights
+      "fc.weight",
+      "fc2.weight",
+      // HuBERT semantic encoder weights — ggml graph uses dup/concat ops that
+      // don't support quantized types; only used for voice cloning (~50 MB)
+      "semantic_model.*.weight"};
 
   if (!is_k_m) {
     // For non-mixed strategies: keep embed/lm_head/ctc at F16/F32
@@ -79,7 +94,7 @@ static bool rs_model_quantize(const std::string &fname_inp,
   const std::vector<std::string> to_quant = {".*"};
 
   if (!rapid_speech_ggml_quantize(ctx, gguf_ctx, fname_inp, fname_out, ftype, 4,
-                                  to_quant, to_skip)) {
+                                  to_quant, to_skip, imatrix_file)) {
     RS_QUANTIZE_LOG_ERROR("Failed to quantize model '%s'", fname_inp.c_str());
     return false;
   }
@@ -89,14 +104,15 @@ static bool rs_model_quantize(const std::string &fname_inp,
 
 static void rs_print_usage(const char *argv0) {
   std::fprintf(stderr,
-               "usage: %s <model-input.gguf> <model-output.gguf> <type>\n\n",
+               "usage: %s <model-input.gguf> <model-output.gguf> <type> [--imatrix <file.dat>]\n\n",
                argv0);
+  std::fprintf(stderr, "  --imatrix <file.dat>  Importance matrix for activation-aware quantization\n\n");
   std::fprintf(stderr, "Quantization types:\n");
   ggml_print_ftypes(stderr);
 }
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
+  if (argc < 4) {
     rs_print_usage(argv[0]);
     return 1;
   }
@@ -118,6 +134,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Parse optional --imatrix <file.dat>
+  std::string imatrix_file;
+  for (int i = 4; i < argc; i++) {
+      if (strcmp(argv[i], "--imatrix") == 0 && i + 1 < argc) {
+          imatrix_file = argv[++i];
+      }
+  }
+
   RS_QUANTIZE_LOG_INFO("Input:  %s", fname_inp.c_str());
   RS_QUANTIZE_LOG_INFO("Output: %s", fname_out.c_str());
   RS_QUANTIZE_LOG_INFO("Type:   %d (%s)", ftype,
@@ -125,6 +149,9 @@ int main(int argc, char **argv) {
                        : ftype == GGML_FTYPE_MOSTLY_Q5_K_M
                            ? "Q5_K_M"
                            : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
+  if (!imatrix_file.empty()) {
+      RS_QUANTIZE_LOG_INFO("IMatrix: %s", imatrix_file.c_str());
+  }
 
   const int64_t t_main_start_us = ggml_time_us();
 
@@ -132,7 +159,7 @@ int main(int argc, char **argv) {
   {
     const int64_t t_start_us = ggml_time_us();
 
-    if (!rs_model_quantize(fname_inp, fname_out, ftype)) {
+    if (!rs_model_quantize(fname_inp, fname_out, ftype, imatrix_file)) {
       RS_QUANTIZE_LOG_ERROR("Failed to quantize model from '%s'",
                             fname_inp.c_str());
       return 1;
