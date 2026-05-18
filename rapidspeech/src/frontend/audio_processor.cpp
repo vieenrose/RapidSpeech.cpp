@@ -265,8 +265,13 @@ void AudioProcessor::ApplyLFR(const std::vector<float> &input_mel, int n_frames,
       if (source_frame_idx >= n_frames)
         source_frame_idx = n_frames - 1;
 
-      std::memcpy(output_lfr.data() + (i * m * n_mels) + (j * n_mels),
-                  input_mel.data() + (source_frame_idx * n_mels),
+      size_t dest_offset = (size_t)i * m * n_mels + (size_t)j * n_mels;
+      size_t src_offset = (size_t)source_frame_idx * n_mels;
+      if (dest_offset + n_mels > output_lfr.size() ||
+          src_offset + n_mels > input_mel.size())
+        continue;
+      std::memcpy(output_lfr.data() + dest_offset,
+                  input_mel.data() + src_offset,
                   n_mels * sizeof(float));
     }
   }
