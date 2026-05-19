@@ -113,7 +113,7 @@ Test machine: Apple M1 Pro, GPU (Metal). Sentence: "The quick brown fox jumps ov
 
 ## Audio Samples
 
-Click to listen and compare quality across models and step counts.
+Click **▶ Play** to listen in your browser. Compare quality across models and step counts.
 
 ### English — "The quick brown fox jumps over the lazy dog."
 
@@ -121,31 +121,31 @@ Click to listen and compare quality across models and step counts.
 
 | Model | Audio                                                                              |
 |-------|------------------------------------------------------------------------------------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_en_s16.wav"></audio>     |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_en_s16.wav"></audio>  |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_en_s16.wav"></audio> |
-| Q2_K | <audio controls src="../../assets/omnivoice/omnivoice-q2_k_en_s16.wav"></audio>    |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_en_s16.wav)     |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_en_s16.wav)  |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_en_s16.wav) |
+| Q2_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q2_k_en_s16.wav)    |
 
 #### 32 Steps
 
 | Model | Audio |
 |-------|-------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_en_s32.wav"></audio> |
-| Q5_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q5_k_m_en_s32.wav"></audio> |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_en_s32.wav"></audio> |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_en_s32.wav"></audio> |
-| Q3_K | <audio controls src="../../assets/omnivoice/omnivoice-q3_k_en_s32.wav"></audio> |
-| Q2_K | <audio controls src="../../assets/omnivoice/omnivoice-q2_k_en_s32.wav"></audio> |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_en_s32.wav) |
+| Q5_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q5_k_m_en_s32.wav) |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_en_s32.wav) |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_en_s32.wav) |
+| Q3_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q3_k_en_s32.wav) |
+| Q2_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q2_k_en_s32.wav) |
 
 #### 50 Steps
 
 | Model | Audio |
 |-------|-------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_en_s50.wav"></audio> |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_en_s50.wav"></audio> |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_en_s50.wav"></audio> |
-| Q3_K | <audio controls src="../../assets/omnivoice/omnivoice-q3_k_en_s50.wav"></audio> |
-| Q2_K | <audio controls src="../../assets/omnivoice/omnivoice-q2_k_en_s50.wav"></audio> |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_en_s50.wav) |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_en_s50.wav) |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_en_s50.wav) |
+| Q3_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q3_k_en_s50.wav) |
+| Q2_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q2_k_en_s50.wav) |
 
 ### Chinese — "人工智能正在改变我们与计算机交互的方式。"
 
@@ -153,29 +153,29 @@ Click to listen and compare quality across models and step counts.
 
 | Model | Audio |
 |-------|-------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_zh_s16.wav"></audio> |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_zh_s16.wav"></audio> |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_zh_s16.wav"></audio> |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_zh_s16.wav) |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_zh_s16.wav) |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_zh_s16.wav) |
 
 #### 32 Steps
 
 | Model | Audio |
 |-------|-------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_zh_s32.wav"></audio> |
-| Q5_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q5_k_m_zh_s32.wav"></audio> |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_zh_s32.wav"></audio> |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_zh_s32.wav"></audio> |
-| Q3_K | <audio controls src="../../assets/omnivoice/omnivoice-q3_k_zh_s32.wav"></audio> |
-| Q2_K | <audio controls src="../../assets/omnivoice/omnivoice-q2_k_zh_s32.wav"></audio> |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_zh_s32.wav) |
+| Q5_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q5_k_m_zh_s32.wav) |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_zh_s32.wav) |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_zh_s32.wav) |
+| Q3_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q3_k_zh_s32.wav) |
+| Q2_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q2_k_zh_s32.wav) |
 
 #### 50 Steps
 
 | Model | Audio |
 |-------|-------|
-| F16 | <audio controls src="../../assets/omnivoice/omnivoice-f16_zh_s50.wav"></audio> |
-| Q4_K_M | <audio controls src="../../assets/omnivoice/omnivoice-q4_k_m_zh_s50.wav"></audio> |
-| IQ3_XXS | <audio controls src="../../assets/omnivoice/omnivoice-iq3_xxs_zh_s50.wav"></audio> |
-| Q3_K | <audio controls src="../../assets/omnivoice/omnivoice-q3_k_zh_s50.wav"></audio> |
+| F16 | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-f16_zh_s50.wav) |
+| Q4_K_M | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q4_k_m_zh_s50.wav) |
+| IQ3_XXS | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-iq3_xxs_zh_s50.wav) |
+| Q3_K | [▶ Play](https://gabalpha.github.io/read-audio/?p=https%3A%2F%2Fgithub.com%2FRapidAI%2FRapidSpeech.cpp%2Fraw%2Frefs%2Fheads%2Fmain%2Fassets%2Fomnivoice%2Fomnivoice-q3_k_zh_s50.wav) |
 
 ## Voice Cloning
 
