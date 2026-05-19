@@ -1,6 +1,7 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "core/rs_processor.h"
+#include "arch/omnivoice.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include <cstdarg>
@@ -584,4 +585,26 @@ RS_API const char *rs_get_backend_name(const rs_context_t *ctx) {
 
   const char *backend_name = ggml_backend_name(primary);
   return backend_name ? backend_name : "unknown";
+}
+
+// ============================================
+// Importance Matrix Collection
+// ============================================
+
+RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
+                                     void (*callback)(void *userdata,
+                                                      struct ggml_cgraph *gf),
+                                     void *userdata) {
+    if (!ctx || !ctx->model) return;
+    auto *omnivoice = dynamic_cast<OmniVoiceModel *>(ctx->model.get());
+    if (!omnivoice) return;
+
+    if (callback) {
+        omnivoice->set_imatrix_callback(
+            [callback, userdata](struct ggml_cgraph *gf) {
+                callback(userdata, gf);
+            });
+    } else {
+        omnivoice->set_imatrix_callback(nullptr);
+    }
 }

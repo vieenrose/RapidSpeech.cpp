@@ -32,6 +32,8 @@ struct OpenVoice2HParams {
   int32_t hop_length      = 256;
   int32_t n_fft           = 1024;
   int32_t n_mels          = 80;
+  int32_t num_tones       = 11;
+  int32_t num_languages   = 4;
   // Streaming chunk size in mel frames (0 = non-streaming)
   int32_t chunk_mel_frames = 50;  // ~0.58s per chunk at 22050/256
 };
@@ -63,6 +65,14 @@ struct OpenVoice2State : public RSState {
   // Per-phoneme tone IDs for tone embedding lookup
   std::vector<int32_t> tone_ids;
   int language_id = 0;
+
+  // Prior distribution from text encoder proj (per-phoneme)
+  std::vector<float> m_p;    // mean: [hidden, T_text]
+  std::vector<float> logs_p; // log-scale: [hidden, T_text]
+
+  // Sampled prior z_p = m_p + noise * exp(logs_p) * noise_scale,
+  // expanded to mel frames: [hidden, T_mel]
+  std::vector<float> z_p_expanded;
 
   // Tone color embedding (optional, from reference audio)
   std::vector<float> tone_embedding;
@@ -127,7 +137,8 @@ public:
   // --- TTS-specific methods ---
 
   /// Push text for synthesis. Must be called before Encode.
-  bool PushText(RSState& state, const char* text, const char* language = "zh");
+  bool PushText(RSState& state, const char* text, const char* language = "zh",
+                const char* instruct = nullptr) override;
 
   /// Push reference audio for voice cloning (optional).
   bool PushReferenceAudio(RSState& state, const float* samples, int n_samples,
