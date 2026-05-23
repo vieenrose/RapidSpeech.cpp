@@ -61,7 +61,12 @@ int RSProcessor::Process() {
       std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
   std::vector<float> features;
-  audio_proc_->Compute(pcm_chunk, features);
+  if (model_->GetMeta().use_external_frontend) {
+    // Architectures like Qwen3-ASR own their mel pipeline and want raw PCM.
+    features = std::move(pcm_chunk);
+  } else {
+    audio_proc_->Compute(pcm_chunk, features);
+  }
   end = std::chrono::steady_clock::now();
   RS_LOG_INFO("compute features takes: %f",
               std::chrono::duration_cast<std::chrono::microseconds>(end - start)

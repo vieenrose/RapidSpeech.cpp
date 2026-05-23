@@ -19,6 +19,11 @@ struct RSModelMeta {
   int audio_sample_rate = 16000;
   int n_mels = 80;
   int vocab_size = 0;
+  // When true, RSProcessor skips its built-in fbank pipeline and passes raw
+  // PCM directly to model->Encode() as `input_frames`. Models such as
+  // Qwen3-ASR run their own Whisper-style mel extractor instead of the
+  // shared Kaldi-style AudioProcessor.
+  bool use_external_frontend = false;
 };
 
 // --- Core Model Interface ---

@@ -154,8 +154,10 @@ set(RS_SOURCES
 	    rapidspeech/src/arch/openvoice2.cpp
         rapidspeech/src/arch/omnivoice.cpp
         rapidspeech/src/frontend/text_frontend.cpp
-#        rapidspeech/src/arch/qwen3_asr.h
-#        rapidspeech/src/arch/qwen3_asr.cpp
+        rapidspeech/src/frontend/whisper_mel.h
+        rapidspeech/src/frontend/whisper_mel.cpp
+        rapidspeech/src/arch/qwen3_asr.h
+        rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.h
@@ -370,9 +372,13 @@ if (RS_BUILD_CLI)
     add_executable(rs-imatrix
             examples/imatrix/rs-imatrix.cpp
     )
+    add_executable(rs-tts-split
+            examples/tts/rs-tts-split.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
 
@@ -410,6 +416,14 @@ if (RS_BUILD_CLI)
         ${GGML_PATH}/src
     )
     target_include_directories(rs-tts-offline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+    target_include_directories(rs-tts-split PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/tts
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src

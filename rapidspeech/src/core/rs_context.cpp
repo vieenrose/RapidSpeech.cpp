@@ -197,7 +197,7 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
 
   // Models with many fine-grained GPU-hostile ops (HiFi-GAN vocoder, etc.)
   // run faster on CPU and trigger Metal command-buffer errors on GPU.
-  bool prefer_cpu = false;  // (arch == "openvoice2") — test GPU path
+  bool prefer_cpu = (arch == "openvoice2");
 
   // 3. Hardware detection and backend initialization
   if (!ctx->init_backend(prefer_cpu)) {

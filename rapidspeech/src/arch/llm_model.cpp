@@ -593,9 +593,12 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   std::string arch_str =
       (arch_idx != -1) ? gguf_get_val_str(ctx_gguf, arch_idx) : "unknown";
 
-  if (arch_str == "qwen3" || arch_str == "FunASRNano") {
+  if (arch_str == "qwen3" || arch_str == "FunASRNano" ||
+      arch_str == "Qwen3ASR") {
     hparams_.arch = LLM_ARCH_QWEN3;
-    arch_key = arch_str == "FunASRNano" ? "qwen3" : arch_str;
+    arch_key = (arch_str == "FunASRNano" || arch_str == "Qwen3ASR")
+                   ? "qwen3"
+                   : arch_str;
   } else if (arch_str == "omnivoice-lm") {
     hparams_.arch = LLM_ARCH_QWEN3;
     arch_key = "omnivoice-lm";
