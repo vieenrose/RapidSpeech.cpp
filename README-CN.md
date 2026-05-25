@@ -202,17 +202,57 @@ cmake --build build --config Release
 
 #### 语音合成（rs-tts-offline）
 
-**基本用法（OpenVoice2）：**
+##### MeloTTS / OpenVoice2
+
+OpenVoice2 基于 [MeloTTS](https://github.com/myshell-ai/MeloTTS) 作为底层声学模型（VITS 风格：文本编码器 + 时长预测器 + Flow 解码器 + HiFi-GAN 声码器）。MeloTTS 每种语言一个权重文件，`--lang` 必须与转换 GGUF 时使用的语言一致。
+
+**英语（MeloTTS-English）：**
 
 ```bash
 ./build/rs-tts-offline \
-  -m /path/to/openvoice2-base.gguf \
+  -m /path/to/openvoice2-base-en.gguf \
   -t "Hello, welcome to RapidSpeech!" \
+  --lang English \
   -o output.wav \
   --threads 4
 ```
 
-**OmniVoice 扩散 TTS：**
+**中文（MeloTTS-Chinese）：**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-zh.gguf \
+  -t "你好，欢迎使用 RapidSpeech 语音合成。" \
+  --lang Chinese \
+  -o output.wav
+```
+
+**日语（MeloTTS-Japanese）：**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-jp.gguf \
+  -t "こんにちは、RapidSpeech へようこそ。" \
+  --lang Japanese \
+  -o output.wav
+```
+
+`--lang` 可选值：`English`/`EN`/`en`、`Chinese`/`ZH`/`zh`、`Japanese`/`JA`/`ja`，大小写不敏感，但必须与模型匹配——给英语模型喂中文文本会产生乱码。
+
+**声音克隆（OpenVoice2 = MeloTTS 基础模型 + 音色转换器）：**
+
+OpenVoice2 把说话人音色和韵律解耦。通过 `--ref` 传入参考音频，即可把对应说话人的音色应用到合成语音上。需要音色转换器 GGUF 与基础 GGUF 放在同一目录（加载器会自动发现）。
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-en.gguf \
+  -t "Hello, this is cloned voice." \
+  --lang English \
+  --ref /path/to/reference.wav \
+  -o output.wav
+```
+
+##### OmniVoice（扩散 TTS，多语种 + 声音克隆）
 
 ```bash
 ./build/rs-tts-offline \
@@ -242,12 +282,14 @@ cmake --build build --config Release
 | `-m, --model` | TTS GGUF 模型文件路径（必填） | — |
 | `-t, --text` | 要合成的文本（必填） | — |
 | `-o, --output` | 输出 WAV 文件路径 | output.wav |
+| `--lang` | 目标语种。MeloTTS：`English`/`Chinese`/`Japanese`（必须与 GGUF 一致）；OmniVoice：`English`/`zh`/... | English |
+| `--ref` | 参考音频 WAV 文件路径，用于声音克隆（OpenVoice2 / OmniVoice） | — |
+| `--ref-text` | 参考音频对应的文本转录（仅 OmniVoice） | — |
+| `--bert` | 中文 BERT GGUF（1024 维，OpenVoice2 中文专用，可选） | — |
+| `--mbert` | 多语种 BERT GGUF（768 维，可选） | — |
 | `--instruct` | 声音描述，如 `male`、`female`、`young adult`（OmniVoice） | male |
-| `--lang` | 目标语种，如 `English`、`zh`（OmniVoice） | English |
 | `--seed` | 随机种子（OmniVoice） | 42 |
 | `--n-steps` | 扩散步数 1-128，越少越快但音质可能下降（OmniVoice） | 32 |
-| `--ref` | 参考音频 WAV 文件路径，用于声音克隆（OmniVoice） | — |
-| `--ref-text` | 参考音频对应的文本转录（OmniVoice） | — |
 | `--threads` | CPU 线程数 | 4 |
 | `--gpu` | 是否启用 GPU 加速（`true`/`false`） | true |
 
@@ -379,27 +421,40 @@ python scripts/convert_silero_to_gguf.py \
 
 转换后的 VAD 模型也可直接从 [HuggingFace](https://huggingface.co/RapidAI/RapidSpeech) 或 [ModelScope](https://www.modelscope.cn/models/RapidAI/RapidSpeech) 下载。
 
-### TTS 模型（OpenVoice2 → GGUF）
+### TTS 模型（OpenVoice2 / MeloTTS → GGUF）
 
-将 MeloTTS（OpenVoice2）基础模型和可选音色转换器转换为 GGUF 格式：
+将 MeloTTS（OpenVoice2 基础模型）以及可选的音色转换器转换为 GGUF。MeloTTS 每种语言对应一个 HuggingFace 仓库，请选择匹配的 `--base-model` 和 `--language` 标签。
 
 ```bash
-# 转换基础 TTS 模型
+# 英语
 python scripts/convert_openvoice2.py \
   --base-model myshell-ai/MeloTTS-English \
   --output-dir ./models \
   --language EN
 
-# 包含音色转换器（用于声音克隆）
+# 中文
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-Chinese \
+  --output-dir ./models \
+  --language ZH
+
+# 日语
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-Japanese \
+  --output-dir ./models \
+  --language JA
+
+# 同时转换音色转换器（启用 --ref 声音克隆）
 python scripts/convert_openvoice2.py \
   --base-model myshell-ai/MeloTTS-English \
   --converter-model myshell-ai/OpenVoiceV2 \
-  --output-dir ./models
+  --output-dir ./models \
+  --language EN
 ```
 
 产物说明：
-- `openvoice2-base.gguf` — 文本编码器 + 时长预测器 + Flow解码器 + HiFi-GAN 声码器
-- `openvoice2-converter.gguf` — 音色转换器（可选，用于声音克隆）
+- `openvoice2-base-<lang>.gguf` — 文本编码器 + 时长预测器 + Flow 解码器 + HiFi-GAN 声码器
+- `openvoice2-converter.gguf` — 音色转换器（仅在指定 `--converter-model` 时生成；`--ref` 声音克隆需要它）
 
 ### TTS 模型（OmniVoice → GGUF）
 

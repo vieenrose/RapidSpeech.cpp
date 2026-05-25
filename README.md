@@ -203,17 +203,57 @@ Parameters:
 
 #### Text-to-Speech (rs-tts-offline)
 
-**Basic usage (OpenVoice2):**
+##### MeloTTS / OpenVoice2
+
+OpenVoice2 builds on [MeloTTS](https://github.com/myshell-ai/MeloTTS) as the base acoustic model (VITS-style: text encoder + duration predictor + stochastic flow decoder + HiFi-GAN vocoder). MeloTTS ships one checkpoint per language; the `--lang` flag must match the language of the GGUF you converted.
+
+**English (MeloTTS-English):**
 
 ```bash
 ./build/rs-tts-offline \
-  -m /path/to/openvoice2-base.gguf \
+  -m /path/to/openvoice2-base-en.gguf \
   -t "Hello, welcome to RapidSpeech!" \
+  --lang English \
   -o output.wav \
   --threads 4
 ```
 
-**OmniVoice diffusion TTS:**
+**Chinese (MeloTTS-Chinese):**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-zh.gguf \
+  -t "你好，欢迎使用 RapidSpeech 语音合成。" \
+  --lang Chinese \
+  -o output.wav
+```
+
+**Japanese (MeloTTS-Japanese):**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-jp.gguf \
+  -t "こんにちは、RapidSpeech へようこそ。" \
+  --lang Japanese \
+  -o output.wav
+```
+
+Accepted `--lang` values: `English`/`EN`/`en`, `Chinese`/`ZH`/`zh`, `Japanese`/`JA`/`ja`. The language string is case-insensitive but must match the model's language — feeding Chinese text to an English model will produce garbled audio.
+
+**Voice cloning (OpenVoice2 = MeloTTS base + Tone Color Converter):**
+
+OpenVoice2 separates speaker timbre from prosody. Pass a reference WAV with `--ref` to apply the speaker's voice to the synthesized speech. Requires the converter GGUF in the same directory as the base GGUF (the loader auto-discovers it).
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base-en.gguf \
+  -t "Hello, this is cloned voice." \
+  --lang English \
+  --ref /path/to/reference.wav \
+  -o output.wav
+```
+
+##### OmniVoice (diffusion TTS, multilingual + voice cloning)
 
 ```bash
 ./build/rs-tts-offline \
@@ -243,12 +283,14 @@ Parameters:
 | `-m, --model` | Path to TTS GGUF model file (required) | — |
 | `-t, --text` | Text to synthesize (required) | — |
 | `-o, --output` | Output WAV file path | output.wav |
+| `--lang` | Target language. MeloTTS: `English`/`Chinese`/`Japanese` (must match GGUF). OmniVoice: `English`/`zh`/... | English |
+| `--ref` | Reference audio WAV for voice cloning (OpenVoice2 / OmniVoice) | — |
+| `--ref-text` | Transcript of the reference audio (OmniVoice only) | — |
+| `--bert` | ZH BERT GGUF (1024-dim, OpenVoice2 Chinese only, optional) | — |
+| `--mbert` | Multilingual BERT GGUF (768-dim, optional) | — |
 | `--instruct` | Voice description, e.g. `male`, `female`, `young adult` (OmniVoice) | male |
-| `--lang` | Target language, e.g. `English`, `zh` (OmniVoice) | English |
 | `--seed` | Random seed (OmniVoice) | 42 |
 | `--n-steps` | Diffusion steps 1-128, fewer = faster but lower quality (OmniVoice) | 32 |
-| `--ref` | Reference audio WAV for voice cloning (OmniVoice) | — |
-| `--ref-text` | Transcript of the reference audio (OmniVoice) | — |
 | `--threads` | Number of CPU threads | 4 |
 | `--gpu` | Enable GPU acceleration (`true`/`false`) | true |
 
@@ -380,27 +422,40 @@ python scripts/convert_silero_to_gguf.py \
 
 The converted VAD model is also available for direct download from [HuggingFace](https://huggingface.co/RapidAI/RapidSpeech) and [ModelScope](https://www.modelscope.cn/models/RapidAI/RapidSpeech).
 
-### TTS Model (OpenVoice2 → GGUF)
+### TTS Model (OpenVoice2 / MeloTTS → GGUF)
 
-Convert MeloTTS (OpenVoice2) base model and optional tone color converter to GGUF:
+Convert MeloTTS (OpenVoice2 base) and the optional Tone Color Converter to GGUF. MeloTTS releases one HuggingFace repo per language; choose the matching `--base-model` and `--language` tag.
 
 ```bash
-# Convert base TTS model
+# English
 python scripts/convert_openvoice2.py \
   --base-model myshell-ai/MeloTTS-English \
   --output-dir ./models \
   --language EN
 
-# Convert with tone color converter for voice cloning
+# Chinese
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-Chinese \
+  --output-dir ./models \
+  --language ZH
+
+# Japanese
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-Japanese \
+  --output-dir ./models \
+  --language JA
+
+# With Tone Color Converter (enables voice cloning via --ref)
 python scripts/convert_openvoice2.py \
   --base-model myshell-ai/MeloTTS-English \
   --converter-model myshell-ai/OpenVoiceV2 \
-  --output-dir ./models
+  --output-dir ./models \
+  --language EN
 ```
 
 Outputs:
-- `openvoice2-base.gguf` — Text encoder + duration predictor + flow decoder + HiFi-GAN vocoder
-- `openvoice2-converter.gguf` — Tone color converter (optional, for voice cloning)
+- `openvoice2-base-<lang>.gguf` — Text encoder + duration predictor + flow decoder + HiFi-GAN vocoder
+- `openvoice2-converter.gguf` — Tone color converter (only when `--converter-model` is supplied; needed for `--ref` voice cloning)
 
 ### TTS Model (OmniVoice → GGUF)
 
