@@ -13,9 +13,12 @@
 // ============================================
 // Route through rs_log so the framework-wide log level controls visibility.
 
-#define LLM_LOG_INFO(fmt, ...) RS_LOG_INFO("[LLM] " fmt, ##__VA_ARGS__)
-#define LLM_LOG_ERROR(fmt, ...) RS_LOG_ERR("[LLM] " fmt, ##__VA_ARGS__)
-#define LLM_LOG_WARN(fmt, ...) RS_LOG_WARN("[LLM] " fmt, ##__VA_ARGS__)
+// NOTE: portable variadic — adjacent string literal concatenation lets us
+// prepend "[LLM] " without `, ##__VA_ARGS__` (which MSVC's traditional
+// preprocessor refuses to swallow the trailing comma for, causing C2059).
+#define LLM_LOG_INFO(...)  RS_LOG_INFO("[LLM] " __VA_ARGS__)
+#define LLM_LOG_ERROR(...) RS_LOG_ERR("[LLM] " __VA_ARGS__)
+#define LLM_LOG_WARN(...)  RS_LOG_WARN("[LLM] " __VA_ARGS__)
 
 // ============================================
 // Model Registry
