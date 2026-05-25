@@ -378,9 +378,6 @@ if (RS_BUILD_CLI)
     add_executable(rs-tts-split
             examples/tts/rs-tts-split.cpp
     )
-    add_executable(rs-bert-smoke
-            examples/bert_smoke.cpp
-    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
