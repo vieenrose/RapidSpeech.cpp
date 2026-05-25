@@ -37,7 +37,7 @@ def load_cmvn(mvn_path: str):
 
 def get_tensors(model_dir: Path):
     """Loads weights from model.pt and optional silero_vad.pt"""
-    checkpoints = ["model.pt", "silero_vad.pt"]
+    checkpoints = ["model.pt"]
     for ckpt in checkpoints:
         path = model_dir / ckpt
         if not path.exists():
@@ -152,10 +152,10 @@ def main():
         added_tokens = model_dir / "Qwen3-0.6B/tokenizer_config.json"
 
         if vocab_path.exists():
+            ctc_id_to_token = None
 
             # CTC token
-            if args.without_llm:
-
+            try:
                 from funasr.models.sense_voice.whisper_lib.tokenizer import get_tokenizer
 
                 tokenizer = get_tokenizer(
@@ -165,16 +165,26 @@ def main():
                 )
 
                 enc = tokenizer.encoding
-
-                id_to_token = [""] * enc.n_vocab
+                ctc_id_to_token = [""] * enc.n_vocab
 
                 for token_bytes, token_id in enc._mergeable_ranks.items():
-                    # 用 latin-1 做 1:1 映射
-                    id_to_token[token_id] = token_bytes.decode("latin-1")
+                    # latin-1 keeps a 1:1 byte mapping for C++ detokenization.
+                    ctc_id_to_token[token_id] = token_bytes.decode("latin-1")
 
-                # special tokens
                 for token_str, token_id in enc._special_tokens.items():
-                    id_to_token[token_id] = token_str
+                    ctc_id_to_token[token_id] = token_str
+
+                writer.add_array("ctc.tokenizer.ggml.tokens", ctc_id_to_token)
+                writer.add_int32("ctc.tokenizer.vocab_size", len(ctc_id_to_token))
+                print(f"Wrote {len(ctc_id_to_token)} CTC tokens")
+            except Exception as e:
+                print(f"WARNING: failed to export CTC tokenizer: {e}")
+
+            if args.without_llm:
+                if ctc_id_to_token is None:
+                    print("ERROR: --without_llm requires the CTC tokenizer")
+                    return
+                id_to_token = ctc_id_to_token
 
                 # Write BPE merges from tiktoken
                 # tiktoken stores merges in _mergeable_ranks as a dict: {token_bytes: rank}
