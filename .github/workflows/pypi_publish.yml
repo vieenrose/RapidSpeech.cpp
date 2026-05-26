@@ -61,13 +61,21 @@ jobs:
           # Debug tip: build only for Python 3.9 in debug mode to save time
           CIBW_BUILD: ${{ github.event.inputs.debug_mode == 'true' && 'cp39-*' || '*' }}
 
+          # Only build 64-bit wheels. 32-bit (i686) is not realistic for a speech/ML
+          # library, and the manylinux2014_i686 image ships a pip-cmake binary that
+          # is dynamically linked against libatomic.so.1 (not present in the image)
+          # and has no patchelf available via yum — both block the build.
+          CIBW_ARCHS_LINUX: x86_64
+          # macos-latest is arm64-only; build arm64 wheels (Metal backend).
+          CIBW_ARCHS_MACOS: arm64
+
           # Install build dependencies (patchelf on Linux fixes ggml NEEDED entries)
           CIBW_BEFORE_BUILD: >
             pip install pybind11 numpy cmake &&
             (command -v yum >/dev/null 2>&1 && yum install -y patchelf zip unzip || true)
 
-          # Skip legacy Python versions and PyPy
-          CIBW_SKIP: cp36-* cp37-* pp*
+          # Skip legacy Python versions, PyPy, and musllinux (not needed for end users).
+          CIBW_SKIP: cp36-* cp37-* pp* *-musllinux_*
 
           # Fix NEEDED entries before auditwheel repair on Linux.
           # cmake embeds build-tree paths like "ggml/src/libggml-base.so"
