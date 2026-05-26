@@ -212,9 +212,13 @@ static int run_asr(rs_context_t *ctx, const ImatrixArgs &args) {
             continue;
         }
         if (sr != kExpectedSampleRate) {
-            LOG_ERROR("Skipping %s: sample rate %d != %d",
-                      path.c_str(), sr, kExpectedSampleRate);
-            continue;
+            std::vector<float> resampled;
+            if (!resample_pcm(pcm, sr, resampled, kExpectedSampleRate)) {
+                LOG_ERROR("Resampling failed for %s (%d -> %d)",
+                          path.c_str(), sr, kExpectedSampleRate);
+                continue;
+            }
+            pcm = std::move(resampled);
         }
         if (pcm.size() < (size_t)kExpectedSampleRate) {
             // Pad to 1 second so RSProcessor::Process() has enough audio

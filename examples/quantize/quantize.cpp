@@ -53,10 +53,12 @@ static bool rs_model_quantize(const std::string &fname_inp,
   RS_QUANTIZE_LOG_INFO("Number of tensors: %d", n_tensors);
 
   // Regexes of tensor names to NOT quantize (keep original precision)
-  // For Q4_K_M / Q5_K_M: embed/output/ctc_lo are quantized to Q6_K by
-  // rs_get_qtype_for_tensor, so they must NOT be in the skip list.
+  // For Q3_K_M / Q4_K_M / Q5_K_M: embed/output/ctc_lo are quantized by
+  // rs_get_qtype_for_tensor to higher-precision K-quants, so they must NOT
+  // be in the skip list.
   bool is_k_m =
-      (ftype == GGML_FTYPE_MOSTLY_Q4_K_M || ftype == GGML_FTYPE_MOSTLY_Q5_K_M);
+      (ftype == GGML_FTYPE_MOSTLY_Q3_K_M || ftype == GGML_FTYPE_MOSTLY_Q4_K_M ||
+       ftype == GGML_FTYPE_MOSTLY_Q5_K_M);
 
   std::vector<std::string> to_skip = {
       // FSMN block weights — 1D convolution, quantization hurts accuracy
@@ -145,7 +147,8 @@ int main(int argc, char **argv) {
   RS_QUANTIZE_LOG_INFO("Input:  %s", fname_inp.c_str());
   RS_QUANTIZE_LOG_INFO("Output: %s", fname_out.c_str());
   RS_QUANTIZE_LOG_INFO("Type:   %d (%s)", ftype,
-                       ftype == GGML_FTYPE_MOSTLY_Q4_K_M ? "Q4_K_M"
+                       ftype == GGML_FTYPE_MOSTLY_Q3_K_M ? "Q3_K_M"
+                       : ftype == GGML_FTYPE_MOSTLY_Q4_K_M ? "Q4_K_M"
                        : ftype == GGML_FTYPE_MOSTLY_Q5_K_M
                            ? "Q5_K_M"
                            : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
