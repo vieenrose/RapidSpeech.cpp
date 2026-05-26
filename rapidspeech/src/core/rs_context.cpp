@@ -18,6 +18,9 @@
 #ifdef RS_USE_CANN
 #include "ggml-cann.h"
 #endif
+#ifdef RS_USE_WEBGPU
+#include "ggml-webgpu.h"
+#endif
 
 #include <functional>
 #include <iostream>
@@ -131,6 +134,24 @@ bool rs_context_t::init_backend(bool prefer_cpu) {
         backends.push_back(b);
         RS_LOG_INFO("CANN backend added to scheduler.");
         gpu_initialized = true;
+      }
+    }
+#endif
+
+#ifdef RS_USE_WEBGPU
+    // WebGPU: portable GPU backend usable both natively (via Dawn) and in
+    // Emscripten/browser builds. Tried last among GPU backends because the
+    // native vendor-specific paths (CUDA/Metal/Vulkan/CANN) are typically
+    // faster when available.
+    if (!gpu_initialized) {
+      ggml_backend_t b = ggml_backend_webgpu_init();
+      if (b) {
+        backends.push_back(b);
+        RS_LOG_INFO("WebGPU backend added to scheduler.");
+        gpu_initialized = true;
+      } else {
+        RS_LOG_WARN("ggml_backend_webgpu_init() returned NULL — no compatible "
+                    "WebGPU adapter found");
       }
     }
 #endif

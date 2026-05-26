@@ -13,6 +13,7 @@ option(RS_CUDA "Enable CUDA acceleration" OFF)
 option(RS_VULKAN "Enable Vulkan acceleration" OFF)
 option(RS_CANN "Enable CANN acceleration (Huawei)" OFF)
 option(RS_OPENCL "Enable OpenCL acceleration" OFF)
+option(RS_WEBGPU "Enable WebGPU acceleration (Dawn native / emdawnwebgpu for WASM)" OFF)
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
 option(RS_BUILD_CLI "Build command-line example executables" ON)
 
@@ -56,6 +57,10 @@ endif()
 
 if (RS_OPENCL)
     set(GGML_OPENCL ON CACHE BOOL "ggml: enable OpenCL" FORCE)
+endif()
+
+if (RS_WEBGPU)
+    set(GGML_WEBGPU ON CACHE BOOL "ggml: enable WebGPU" FORCE)
 endif()
 
 # Override ggml's install directories so all shared libraries end up
@@ -173,6 +178,7 @@ set(RS_SOURCES
 add_library(rapidspeech-core SHARED
         ${RS_SOURCES}
         rapidspeech/src/c_api/rapidspeech_c.cpp
+        rapidspeech/src/c_api/rs_vad.cpp
 )
 
 target_include_directories(rapidspeech-core PUBLIC
@@ -287,6 +293,15 @@ if (RS_OPENCL)
     target_compile_definitions(rapidspeech-core PRIVATE RS_USE_OPENCL)
     if (TARGET ggml-opencl)
         target_link_libraries(rapidspeech-core PRIVATE ggml-opencl)
+    endif()
+endif()
+
+# 6. WebGPU Configuration (browser/Dawn-native — works as a portable GPU backend)
+if (RS_WEBGPU)
+    message(STATUS "RapidSpeech: WebGPU acceleration enabled.")
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_WEBGPU)
+    if (TARGET ggml-webgpu)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-webgpu)
     endif()
 endif()
 
