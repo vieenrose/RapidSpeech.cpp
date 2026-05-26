@@ -9,9 +9,13 @@
 #include <vector>
 
 // Custom mixed-precision ftypes — NOT in ggml.h.
-// Use unused values 5, 6 from ggml_ftype enum.
+// Use values outside ggml's current enumerators but inside the underlying-type
+// range (clang infers [-32, 31] from the existing enumerators, so values must
+// stay within that). 5/6 sit in the 4→7 gap; 28 is the next free slot above
+// the current top (Q1_0 = 27).
 #define GGML_FTYPE_MOSTLY_Q4_K_M  ((enum ggml_ftype)5)
 #define GGML_FTYPE_MOSTLY_Q5_K_M  ((enum ggml_ftype)6)
+#define GGML_FTYPE_MOSTLY_Q3_K_M  ((enum ggml_ftype)28)
 
 // Parse quantization type string (e.g. "q4_k") to ggml_ftype enum
 enum ggml_ftype ggml_parse_ftype(const char *str);

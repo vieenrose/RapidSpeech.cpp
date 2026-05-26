@@ -21,6 +21,7 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q8_0",    GGML_FTYPE_MOSTLY_Q8_0},
     {"q2_k",    GGML_FTYPE_MOSTLY_Q2_K},
     {"q3_k",    GGML_FTYPE_MOSTLY_Q3_K},
+    {"q3_k_m",  GGML_FTYPE_MOSTLY_Q3_K_M},
     {"q4_k",    GGML_FTYPE_MOSTLY_Q4_K},
     {"q4_k_m",  GGML_FTYPE_MOSTLY_Q4_K_M},
     {"q5_k",    GGML_FTYPE_MOSTLY_Q5_K},
@@ -327,6 +328,36 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   // Select per-tensor type based on the overall strategy
   switch (ftype) {
   // ================================================================
+  // Q3_K_M: ~3.9 bpw mixed. Baseline = Q3_K with critical-tensor bumps.
+  // embed → Q4_K, lm_head/ctc → Q5_K, attn_v → Q4_K (Q5_K critical),
+  // attn_k → Q4_K, attn_output → Q3_K (Q4_K critical),
+  // ffn_down → Q4_K on first/last 1/8 layers else Q3_K.
+  // Designed to avoid the LLM repetition / token drift seen with pure Q2_K
+  // on small (<1B) LLMs while staying ~15% smaller than Q4_K_M.
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_Q3_K_M: {
+    if (cat == tensor_category::TOKEN_EMBD) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q5_K);
+    }
+    if (cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : pick(GGML_TYPE_Q4_K);
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
+    }
+    if (cat == tensor_category::ATTENTION_K) {
+      return pick(GGML_TYPE_Q4_K);
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+    }
+    return pick(GGML_TYPE_Q3_K);
+  }
+
+  // ================================================================
   // Q4_K_M: ~4.5 bpw mixed. Baseline = Q4_K, embed/lm_head = Q6_K
   // ================================================================
   case GGML_FTYPE_MOSTLY_Q4_K_M: {
@@ -486,6 +517,7 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
     case GGML_FTYPE_MOSTLY_Q4_K:
     case GGML_FTYPE_MOSTLY_Q5_K:
     case GGML_FTYPE_MOSTLY_Q6_K:
+    case GGML_FTYPE_MOSTLY_Q3_K_M:
     case GGML_FTYPE_MOSTLY_Q4_K_M:
     case GGML_FTYPE_MOSTLY_Q5_K_M:
     case GGML_FTYPE_MOSTLY_IQ1_M:
@@ -741,7 +773,8 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
          total_size_org / 1024.0 / 1024.0);
   printf("%s: quant size  = %8.2f MB | ftype = %d (%s)\n", __func__,
          total_size_new / 1024.0 / 1024.0, ftype,
-         ftype == GGML_FTYPE_MOSTLY_Q4_K_M   ? "Q4_K_M"
+         ftype == GGML_FTYPE_MOSTLY_Q3_K_M   ? "Q3_K_M"
+         : ftype == GGML_FTYPE_MOSTLY_Q4_K_M ? "Q4_K_M"
          : ftype == GGML_FTYPE_MOSTLY_Q5_K_M ? "Q5_K_M"
          : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
 
