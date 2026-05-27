@@ -4255,5 +4255,9 @@ struct OmniVoiceRegistrar {
             return std::make_shared<OmniVoiceModel>();
         });
     }
-} __attribute__((used)) global_omnivoice_reg;
+}
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((used))
+#endif
+global_omnivoice_reg;
 }  // namespace
