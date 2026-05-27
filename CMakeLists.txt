@@ -121,7 +121,6 @@ if (RS_ENABLE_PYTHON)
                 set_target_properties(${_t} PROPERTIES
                     SOVERSION ""
                     VERSION ""
-                    NO_SONAME ON
                     INSTALL_RPATH "${RS_RPATH}"
                     BUILD_WITH_INSTALL_RPATH ON
                 )
@@ -223,7 +222,6 @@ else()
         )
     else()
         set_target_properties(rapidspeech-core PROPERTIES
-            NO_SONAME ON
             INSTALL_RPATH "${RS_RPATH}"
             BUILD_WITH_INSTALL_RPATH ON
         )
@@ -329,12 +327,6 @@ if (RS_ENABLE_PYTHON)
     # We overrode CMAKE_INSTALL_LIBDIR/BINDIR to "." above so they end up
     # in the same directory as the pybind module.
 
-    # Set @rpath relative to install location so dylibs find each other
-    # At runtime, @loader_path (macOS) / $ORIGIN (Linux) refers to the
-    # directory containing the loading dylib
-    set(CMAKE_INSTALL_RPATH "${RS_RPATH}")
-    set(CMAKE_BUILD_RPATH "${RS_RPATH}")
-
     target_link_libraries(rapidspeech
             PRIVATE rapidspeech-core
     )
@@ -344,8 +336,14 @@ if (RS_ENABLE_PYTHON)
             ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    # Linux / macOS：确保符号可见
+    # Embed $ORIGIN (Linux) / @loader_path (macOS) rpath so the pybind module
+    # finds librapidspeech-core.so / .dylib in the same directory at runtime.
+    # Setting INSTALL_RPATH directly on the target (rather than via the
+    # CMAKE_INSTALL_RPATH initializer) avoids the ordering trap where the
+    # variable is set after pybind11_add_module() has already captured it.
     set_target_properties(rapidspeech PROPERTIES
+            INSTALL_RPATH "${RS_RPATH}"
+            BUILD_WITH_INSTALL_RPATH ON
             CXX_VISIBILITY_PRESET hidden
             VISIBILITY_INLINES_HIDDEN ON
     )

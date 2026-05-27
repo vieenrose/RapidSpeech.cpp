@@ -3,7 +3,7 @@
  *
  * Architecture:
  *   WAV file
- *     → Silero VAD segmentation (detect speech segments)
+ *     → VAD segmentation (Silero or FireRed, auto-detected from GGUF arch)
  *       → Per-segment ASR inference (FunASR-Nano / SenseVoice)
  *         → Timestamped transcription output
  *
@@ -14,18 +14,23 @@
  * Options:
  *   -m, --model <path>       ASR model path (required)
  *   -w, --wav <path>         WAV file path (required)
- *   -v, --vad <path>         Silero-VAD GGUF path (optional, enables VAD
- * segmentation) -t, --threads <n>        CPU threads (default: 4)
+ *   -v, --vad <path>         VAD GGUF path — Silero or FireRed
+ *                            (optional, auto-detected from general.architecture)
+ *   -t, --threads <n>        CPU threads (default: 4)
  *       --gpu <true|false>   Enable GPU acceleration (default: true)
  *       --vad-threshold <f>  VAD speech probability threshold (default: 0.5)
- *       --silence-ms <ms>    Silence duration to split segments (default: 600)
+ *       --silence-ms <ms>    Silence duration to split segments. Silero: live
+ *                            endpoint trigger. FireRed: post-merge adjacent
+ *                            segments whose gap is shorter (default: 600)
  *       --speech-pad-ms <ms> Pre-roll padding before speech start (default: 200)
  *       --preroll-ms <ms>    Extra audio before speech onset to include (default: 0)
- *       --prob-smooth <f>    VAD prob EMA alpha, 0=disable (default: 0.3)
+ *       --prob-smooth <f>    VAD prob EMA alpha, 0=disable (Silero only,
+ *                            default: 0.3)
  *   -h, --help               Show help
  */
 
 #include "arch/silero_vad.h"
+#include "arch/fireredvad.h"
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
 
@@ -102,6 +107,15 @@ static ggml_context *load_gguf_weights(const char *path,
   return ctx;
 }
 
+// Read `general.architecture` from a loaded gguf_context (empty if absent).
+static std::string read_gguf_arch(gguf_context *gguf) {
+  if (!gguf) return "";
+  int idx = gguf_find_key(gguf, "general.architecture");
+  if (idx < 0) return "";
+  const char *s = gguf_get_val_str(gguf, idx);
+  return s ? std::string(s) : std::string();
+}
+
 // ─────────────────────────────────────────────────────
 // Argument parsing
 // ─────────────────────────────────────────────────────
@@ -130,8 +144,9 @@ static void print_usage(const char *prog) {
       << "Options:\n"
       << "  -m, --model <path>       ASR model path (required)\n"
       << "  -w, --wav <path>         WAV audio file path (required)\n"
-      << "  -v, --vad <path>         Silero-VAD GGUF path (optional, enables "
-         "VAD segmentation)\n"
+      << "  -v, --vad <path>         VAD GGUF path — Silero or FireRed\n"
+      << "                           (optional, auto-detected from "
+         "general.architecture)\n"
       << "  -t, --threads <n>        CPU threads (default: 4)\n"
       << "      --gpu <true|false>   Enable GPU acceleration (default: true)\n"
       << "      --vad-threshold <f>  VAD speech probability threshold "
@@ -376,6 +391,64 @@ vad_segment(const std::vector<float> &pcm, SileroVadModel &vad_model,
 }
 
 // ─────────────────────────────────────────────────────
+// FireRed VAD segmentation
+//
+// FireRedVAD's built-in DFSMN state-machine postprocessor handles smoothing
+// and speech/silence gating internally. Its baked-in `min_silence_frame`
+// (default 200 ms) is much shorter than the Silero path's `silence_ms`,
+// so adjacent timestamps are post-merged here whenever the inter-segment
+// gap is < silence_ms — preserving the silence audio between them.
+// Padding (speech_pad_ms / preroll_ms) is applied on the merged timestamps
+// for parity with the Silero path's CLI options.
+// ─────────────────────────────────────────────────────
+static std::vector<SpeechSegment>
+firered_segment(const std::vector<float> &pcm, FireRedVadModel &vad_model,
+                int silence_ms, int speech_pad_ms, int preroll_ms) {
+  const int SAMPLE_RATE = 16000;
+  std::vector<SpeechSegment> segments;
+  if (pcm.empty()) return segments;
+
+  std::cout << "  VAD scanning (FireRed)... " << std::flush;
+  auto full = vad_model.DetectFull(pcm);
+  const size_t raw_count = full.timestamps.size();
+
+  // Merge adjacent timestamps whose gap is shorter than silence_ms.
+  // FireRed's internal min_silence_frame (~200 ms) over-segments otherwise.
+  std::vector<std::pair<float, float>> merged;
+  merged.reserve(raw_count);
+  const float silence_s = (float)silence_ms / 1000.0f;
+  for (const auto &ts : full.timestamps) {
+    if (!merged.empty() && ts.first - merged.back().second < silence_s) {
+      merged.back().second = ts.second;
+    } else {
+      merged.push_back(ts);
+    }
+  }
+  std::cout << "done. " << raw_count << " raw → " << merged.size()
+            << " merged segment(s) (silence_ms=" << silence_ms << ")\n"
+            << std::flush;
+
+  const int pad_pre_samples =
+      ((speech_pad_ms + preroll_ms) * SAMPLE_RATE) / 1000;
+  const int n_total = (int)pcm.size();
+
+  for (const auto &ts : merged) {
+    int start_sample = (int)(ts.first * SAMPLE_RATE) - pad_pre_samples;
+    int end_sample = (int)(ts.second * SAMPLE_RATE);
+    start_sample = std::max(0, start_sample);
+    end_sample = std::min(n_total, end_sample);
+    if (end_sample <= start_sample) continue;
+
+    SpeechSegment seg;
+    seg.start_s = (float)start_sample / SAMPLE_RATE;
+    seg.end_s = (float)end_sample / SAMPLE_RATE;
+    seg.pcm.assign(pcm.begin() + start_sample, pcm.begin() + end_sample);
+    segments.push_back(std::move(seg));
+  }
+  return segments;
+}
+
+// ─────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────
 int main(int argc, char **argv) {
@@ -445,10 +518,6 @@ int main(int argc, char **argv) {
   std::vector<SpeechSegment> segments;
 
   if (args.vad_path) {
-    LOG_INFO("VAD model: %s (threshold=%.2f, silence=%dms, smooth=%.2f)",
-             args.vad_path, args.vad_threshold, args.silence_ms,
-             args.prob_smooth);
-
     VadBackend vad_backend;
     if (!vad_backend.init()) {
       LOG_ERROR("Failed to init VAD backend");
@@ -463,26 +532,58 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    auto vad_model = std::make_shared<SileroVadModel>();
-    if (!vad_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
-      LOG_ERROR("Failed to load Silero VAD weights");
-      rs_free(asr_ctx);
-      return 1;
-    }
+    // Auto-detect VAD architecture from GGUF metadata.
+    // Silero VAD: "silero-vad"   FireRedVAD: "firered-vad" / "firered_vad"
+    const std::string vad_arch = read_gguf_arch(vad_gguf);
+    const bool use_firered =
+        (vad_arch == "firered-vad" || vad_arch == "firered_vad");
+    LOG_INFO("VAD model: %s", args.vad_path);
+    LOG_INFO("VAD arch: %s",
+             vad_arch.empty() ? "<unknown, defaulting to silero-vad>"
+                              : vad_arch.c_str());
 
-    auto vad_state =
-        std::dynamic_pointer_cast<SileroVadState>(vad_model->CreateState());
-    if (!vad_state) {
-      LOG_ERROR("Failed to create VAD state");
-      rs_free(asr_ctx);
-      return 1;
-    }
+    if (use_firered) {
+      LOG_INFO("VAD params: threshold=%.2f, silence=%dms, speech-pad=%dms, "
+               "preroll=%dms",
+               args.vad_threshold, args.silence_ms, args.speech_pad_ms,
+               args.preroll_ms);
 
-    LOG_INFO("Running VAD segmentation...");
-    segments =
-        vad_segment(pcm_normalized, *vad_model, *vad_state, vad_backend.sched,
-                    args.vad_threshold, args.silence_ms, args.speech_pad_ms,
-                    args.preroll_ms, args.prob_smooth);
+      auto vad_model = std::make_shared<FireRedVadModel>();
+      if (!vad_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
+        LOG_ERROR("Failed to load FireRed VAD weights");
+        rs_free(asr_ctx);
+        return 1;
+      }
+      vad_model->SetThreshold(args.vad_threshold);
+
+      LOG_INFO("Running VAD segmentation...");
+      segments = firered_segment(pcm_normalized, *vad_model, args.silence_ms,
+                                 args.speech_pad_ms, args.preroll_ms);
+    } else {
+      LOG_INFO("VAD params: threshold=%.2f, silence=%dms, smooth=%.2f",
+               args.vad_threshold, args.silence_ms, args.prob_smooth);
+
+      auto vad_model = std::make_shared<SileroVadModel>();
+      if (!vad_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
+        LOG_ERROR("Failed to load Silero VAD weights");
+        rs_free(asr_ctx);
+        return 1;
+      }
+
+      auto vad_state =
+          std::dynamic_pointer_cast<SileroVadState>(vad_model->CreateState());
+      if (!vad_state) {
+        LOG_ERROR("Failed to create VAD state");
+        rs_free(asr_ctx);
+        return 1;
+      }
+
+      LOG_INFO("Running VAD segmentation...");
+      segments = vad_segment(pcm_normalized, *vad_model, *vad_state,
+                             vad_backend.sched, args.vad_threshold,
+                             args.silence_ms, args.speech_pad_ms,
+                             args.preroll_ms, args.prob_smooth);
+    }
 
     LOG_INFO("Detected %zu speech segment(s)", segments.size());
   } else {

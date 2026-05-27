@@ -244,12 +244,9 @@ std::string SenseVoiceModel::GetTranscription(RSState &state) {
 extern void
 rs_register_model_arch(const std::string &arch,
                        std::function<std::shared_ptr<ISpeechModel>()> creator);
-namespace {
-struct SenseVoiceRegistrar {
-  SenseVoiceRegistrar() {
-    rs_register_model_arch("SenseVoiceSmall", []() {
-      return std::make_shared<SenseVoiceModel>();
-    });
-  }
-} global_sensevoice_reg;
-} // namespace
+
+void rs_register_sensevoice() {
+  rs_register_model_arch("SenseVoiceSmall", []() {
+    return std::make_shared<SenseVoiceModel>();
+  });
+}

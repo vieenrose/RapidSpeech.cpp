@@ -28,10 +28,16 @@
 #include <unordered_map>
 #include <vector>
 
-// Global registry for model architectures
+// Global registry for model architectures.
+// Stored as a raw pointer so ASYNCIFY rewind cannot reset it — rewind
+// re-runs global-object constructors but does not free heap allocations,
+// so the map survives across suspend/resume cycles.
+static std::unordered_map<std::string, ModelCreator> *s_model_registry = nullptr;
+
 static std::unordered_map<std::string, ModelCreator> &get_model_registry() {
-  static std::unordered_map<std::string, ModelCreator> registry;
-  return registry;
+  if (!s_model_registry)
+    s_model_registry = new std::unordered_map<std::string, ModelCreator>();
+  return *s_model_registry;
 }
 
 void rs_register_model_arch(const std::string &arch, ModelCreator creator) {
