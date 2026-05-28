@@ -24,10 +24,13 @@ jobs:
           # 2. Linux CUDA
           - os: ubuntu-latest
             backend: cuda
-          # 3. Windows CUDA
+          # 3. Windows CPU
+          - os: windows-latest
+            backend: cpu
+          # 4. Windows CUDA
           - os: windows-latest
             backend: cuda
-          # 4. macOS Metal (macOS supports Metal by default)
+          # 5. macOS Metal (macOS supports Metal by default)
           - os: macos-latest
             backend: metal
 
