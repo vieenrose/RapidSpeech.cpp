@@ -273,20 +273,44 @@ ggml_tensor *llm_build_qwen2::build_attention_layer(
   const int32_t n_embd_head = hparams.head_dim;
   const int32_t n_rot      = hparams.n_rot;
 
-  ggml_tensor *q = ggml_mul_mat(ctx, layer.wq, cur);
-  ggml_tensor *k = ggml_mul_mat(ctx, layer.wk, cur);
-  ggml_tensor *v = ggml_mul_mat(ctx, layer.wv, cur);
+  ggml_tensor *q = nullptr;
+  ggml_tensor *k = nullptr;
+  ggml_tensor *v = nullptr;
 
-  // Qwen2 difference vs Qwen3: add Q/K/V bias before head split.
-  // q/k/v shape here is [n_embd_q_or_kv, n_tokens]; bias [n_embd_q_or_kv,]
-  // broadcasts along ne[1] automatically.
-  if (layer.wq_b) q = ggml_add(ctx, q, layer.wq_b);
-  if (layer.wk_b) k = ggml_add(ctx, k, layer.wk_b);
-  if (layer.wv_b) v = ggml_add(ctx, v, layer.wv_b);
+  if (layer.wqkv) {
+    // Fused QKV path: one mul_mat + one add, then three zero-cost views.
+    // Layout per token in qkv: [Q (n_q_out) | K (n_kv_out) | V (n_kv_out)].
+    const int64_t n_q_out  = (int64_t)n_head    * n_embd_head;
+    const int64_t n_kv_out = (int64_t)n_head_kv * n_embd_head;
+    const int64_t n_total  = n_q_out + 2 * n_kv_out;
+    const size_t  es       = sizeof(float); // mul_mat output is F32
 
-  q = ggml_reshape_3d(ctx, q, n_embd_head, n_head, n_tokens);
-  k = ggml_reshape_3d(ctx, k, n_embd_head, n_head_kv, n_tokens);
-  v = ggml_reshape_3d(ctx, v, n_embd_head, n_head_kv, n_tokens);
+    ggml_tensor *qkv = ggml_mul_mat(ctx, layer.wqkv, cur); // [n_total, n_tokens]
+    if (layer.wqkv_b) qkv = ggml_add(ctx, qkv, layer.wqkv_b);
+
+    q = ggml_view_3d(ctx, qkv, n_embd_head, n_head,    n_tokens,
+                     n_embd_head * es, n_total * es, 0);
+    k = ggml_view_3d(ctx, qkv, n_embd_head, n_head_kv, n_tokens,
+                     n_embd_head * es, n_total * es, n_q_out * es);
+    v = ggml_view_3d(ctx, qkv, n_embd_head, n_head_kv, n_tokens,
+                     n_embd_head * es, n_total * es,
+                     (n_q_out + n_kv_out) * es);
+  } else {
+    q = ggml_mul_mat(ctx, layer.wq, cur);
+    k = ggml_mul_mat(ctx, layer.wk, cur);
+    v = ggml_mul_mat(ctx, layer.wv, cur);
+
+    // Qwen2 difference vs Qwen3: add Q/K/V bias before head split.
+    // q/k/v shape here is [n_embd_q_or_kv, n_tokens]; bias [n_embd_q_or_kv,]
+    // broadcasts along ne[1] automatically.
+    if (layer.wq_b) q = ggml_add(ctx, q, layer.wq_b);
+    if (layer.wk_b) k = ggml_add(ctx, k, layer.wk_b);
+    if (layer.wv_b) v = ggml_add(ctx, v, layer.wv_b);
+
+    q = ggml_reshape_3d(ctx, q, n_embd_head, n_head, n_tokens);
+    k = ggml_reshape_3d(ctx, k, n_embd_head, n_head_kv, n_tokens);
+    v = ggml_reshape_3d(ctx, v, n_embd_head, n_head_kv, n_tokens);
+  }
 
   // Qwen2 has no Q/K RMS-norm — skip the qwen3 block here.
 
