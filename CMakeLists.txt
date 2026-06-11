@@ -33,6 +33,8 @@ option(RS_METAL "Enable Metal acceleration (Apple only)" ${RS_METAL_DEFAULT})
 
 # --- Dependencies Configuration ---
 set(GGML_PATH "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 if (NOT EXISTS "${GGML_PATH}/CMakeLists.txt")
     message(FATAL_ERROR "ggml not found at ${GGML_PATH}. Please init submodules.")
@@ -253,7 +255,7 @@ set_target_properties(rapidspeech-core PROPERTIES
     VISIBILITY_INLINES_HIDDEN ON
 )
 
-target_link_libraries(rapidspeech-core PRIVATE ggml)
+target_link_libraries(rapidspeech-core PRIVATE ggml Threads::Threads)
 
 # --- Hardware Acceleration Logic ---
 
@@ -419,17 +421,17 @@ if (RS_BUILD_CLI)
             examples/kws/rs-kws.cpp
     )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-    target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
-    target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml Threads::Threads)
 
 
     if (NOT MSVC)
-        target_link_libraries(rs-quantize PRIVATE pthread)
+        target_link_libraries(rs-quantize PRIVATE Threads::Threads)
     endif()
 
     target_include_directories(rs-quantize PRIVATE
@@ -493,7 +495,8 @@ if (RS_BUILD_CLI)
 
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
-        target_link_libraries(rs-asr-vad-online PRIVATE dl)
+        target_link_libraries(rs-asr-vad-online PRIVATE ${CMAKE_DL_LIBS})
+        target_link_libraries(rs-kws PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
     install(TARGETS rs-asr-offline
