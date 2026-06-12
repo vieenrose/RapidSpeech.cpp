@@ -1,1 +1,3 @@
-build
+buildggml/
+ggml.upstream/
+build*/

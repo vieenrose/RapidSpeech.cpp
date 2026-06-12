@@ -1,3 +1,4 @@
+#include "rs_ggml_compat.h"
 #include "cosyvoice3_hift.h"
 
 #include "ggml-alloc.h"

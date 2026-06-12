@@ -1,3 +1,4 @@
+#include "rs_ggml_compat.h"
 #include "llm_kv_cache.h"
 #include "ggml-backend.h"
 #include "ggml.h"
