@@ -244,6 +244,15 @@ OpenVoice2 builds on [MeloTTS](https://github.com/myshell-ai/MeloTTS) as the bas
 
 Accepted `--lang` values: `English`/`EN`/`en`, `Chinese`/`ZH`/`zh`, `Japanese`/`JA`/`ja`. The language string is case-insensitive but must match the model's language — feeding Chinese text to an English model will produce garbled audio.
 
+> ⚠️ **`--lang` also selects the speaker id, so it is mandatory for non-English models.** It is
+> not just a front-end hint: `Chinese` → speaker 1, English/Japanese/other → speaker 0. The
+> CLI **defaults to English (speaker 0)** when `--lang` is omitted. MeloTTS-Chinese has only one
+> valid voice — speaker **1** (`spk2id = {'ZH': 1}`) — so running a Chinese GGUF without
+> `--lang Chinese` picks speaker 0, feeds the wrong speaker embedding into the flow/vocoder, and
+> yields **silent or near-silent audio** (the decoder log-magnitudes collapse, not just a wrong
+> timbre). Always pass `--lang Chinese` for ZH models. The same applies to the distilled 8 kHz
+> melo build ([Luigi/vits-melo-tts-zh_en-8k](https://huggingface.co/Luigi/vits-melo-tts-zh_en-8k)).
+
 **Voice cloning (OpenVoice2 = MeloTTS base + Tone Color Converter):**
 
 OpenVoice2 separates speaker timbre from prosody. Pass a reference WAV with `--ref` to apply the speaker's voice to the synthesized speech. Requires the converter GGUF in the same directory as the base GGUF (the loader auto-discovers it).
