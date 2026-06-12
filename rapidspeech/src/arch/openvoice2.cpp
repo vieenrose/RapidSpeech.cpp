@@ -35,12 +35,15 @@ static struct ggml_tensor *conv1d_im2col(struct ggml_context *ctx,
   (void)kernel_size; (void)in_channels;  // kept for API compatibility
   struct ggml_tensor *x_t = ggml_cont(ctx, ggml_transpose(ctx, x));
 
-  // CPU im2col requires F16 input; cast if needed
+  // This ggml tree's conv kernels require F16 KERNEL + F32 data
+  // (jetson-nano-gen1: older ggml; newer trees also accepted F16 data).
   struct ggml_tensor *x_in = x_t;
   struct ggml_tensor *w_in = weight;
-  if (x_t->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32) {
-    x_in = ggml_cpy(ctx, x_t, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, x_t->ne[0], x_t->ne[1]));
+  if (weight->type == GGML_TYPE_F32) {
     w_in = ggml_cpy(ctx, weight, ggml_new_tensor_3d(ctx, GGML_TYPE_F16, weight->ne[0], weight->ne[1], weight->ne[2]));
+  }
+  if (x_t->type == GGML_TYPE_F16) {
+    x_in = ggml_cpy(ctx, x_t, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x_t->ne[0], x_t->ne[1]));
   }
 
   struct ggml_tensor *out = ggml_conv_1d(ctx, w_in, x_in, 1, padding, dilation);
@@ -493,6 +496,10 @@ bool OpenVoice2Model::Load(const std::unique_ptr<rs_context_t>& ctx,
   // which stores n_layers_trans_flow — transformer layers per coupling block).
   read_i32("openvoice2.n_layers_trans_flow", hparams_.n_flow_layers);  // ignored if not present
   read_i32("openvoice2.sample_rate",     hparams_.sample_rate);
+  {
+    int64_t k = gguf_find_key(ctx_gguf, "openvoice2.resample_scale");
+    if (k >= 0) hparams_.resample_scale = gguf_get_val_f32(ctx_gguf, k);
+  }
   read_i32("openvoice2.hop_length",      hparams_.hop_length);
   read_i32("openvoice2.n_fft",           hparams_.n_fft);
   read_i32("openvoice2.n_mels",          hparams_.n_mels);
@@ -2942,6 +2949,185 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
 //   3. Conv1D post-conv (hidden → 1) → tanh
 // =====================================================================
 
+
+// =====================================================================
+// Vocos8k vocoder — jetson-tts 8 kHz distilled student
+// (ConvNeXt @125 Hz + iSTFT head; see github.com/vieenrose/jetson-tts).
+// Graph ported from the parity-proven ggml_offload/src/melo8k.cpp
+// (max_abs 2.1e-4 vs ORT reference). Requires whole-utterance chunks.
+// =====================================================================
+bool OpenVoice2Model::RunVocoderVocos8k(OpenVoice2State& state,
+                                        ggml_backend_sched_t sched,
+                                        int mel_start, int mel_len) {
+  auto& w = weights_.vocoder;
+  const int   Z_CH   = hparams_.n_mels > 0 ? hparams_.n_mels : 192;
+  const int   DIM    = 256;
+  const int   NBLK   = 8;
+  const int   NBINS  = 129;
+  const int   NFFT   = 256;
+  const int   HOP    = 64;
+  const float SCALE  = hparams_.resample_scale > 0 ? hparams_.resample_scale
+                                                   : 125.0f / (44100.0f / 512.0f);
+  if (mel_start != 0 || mel_len != state.total_mel_frames) {
+    RS_LOG_WARN("Vocos8k: chunked vocoding unsupported (iSTFT overlap); "
+                "running full utterance");
+    mel_start = 0; mel_len = state.total_mel_frames;
+  }
+  const int T  = mel_len;
+  const int T2 = (int)(T * SCALE);
+
+  struct ggml_context *ctx0 = nullptr;
+  struct ggml_cgraph *gf = nullptr;
+  if (!init_compute_ctx(&ctx0, &gf, OV2_MAX_NODES)) return false;
+  g_pending_inputs.clear();
+
+  auto W = [&](const std::string &n) -> struct ggml_tensor * {
+    auto it = w.find(n);
+    if (it == w.end()) { RS_LOG_ERR("Vocos8k: missing %s", n.c_str()); return nullptr; }
+    return it->second;
+  };
+
+  // ---- inputs -----------------------------------------------------------
+  struct ggml_tensor *z = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, Z_CH, T); // [C,T]
+  ggml_set_name(z, "voc_z"); ggml_set_input(z);
+  static std::vector<float> z_data;             // keep alive until flush
+  z_data.assign((size_t)Z_CH * T, 0.0f);
+  for (int t = 0; t < T; t++)
+    for (int c = 0; c < Z_CH; c++)
+      z_data[(size_t)t * Z_CH + c] = state.mel_spectrogram[c + (size_t)t * Z_CH];
+  register_pending_input(z, z_data.data(), z_data.size() * sizeof(float));
+
+  struct ggml_tensor *R = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T2);
+  ggml_set_name(R, "voc_resample"); ggml_set_input(R);
+  static std::vector<float> R_data;
+  R_data.assign((size_t)T * T2, 0.0f);
+  for (int t2 = 0; t2 < T2; t2++) {           // ONNX Resize linear half_pixel
+    float src = (t2 + 0.5f) / SCALE - 0.5f;
+    int i0 = (int)floorf(src);
+    float w1 = src - i0;
+    int ia = i0 < 0 ? 0 : (i0 >= T ? T - 1 : i0);
+    int ib = i0 + 1 < 0 ? 0 : (i0 + 1 >= T ? T - 1 : i0 + 1);
+    R_data[(size_t)t2 * T + ia] += 1.0f - w1;
+    R_data[(size_t)t2 * T + ib] += w1;
+  }
+  register_pending_input(R, R_data.data(), R_data.size() * sizeof(float));
+
+  struct ggml_tensor *ones = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T2, 1);
+  ggml_set_name(ones, "voc_ones"); ggml_set_input(ones);
+  static std::vector<float> ones_data;
+  ones_data.assign(T2, 1.0f);
+  register_pending_input(ones, ones_data.data(), ones_data.size() * sizeof(float));
+
+  // ---- resample + conv_pre + cond ----------------------------------------
+  struct ggml_tensor *z_t  = ggml_cont(ctx0, ggml_transpose(ctx0, z));  // [T,C]
+  struct ggml_tensor *x_tc = ggml_mul_mat(ctx0, R, z_t);                // [T2,C]
+  struct ggml_tensor *pre_w = W("vocoder.conv_pre.weight");
+  struct ggml_tensor *pre_b = W("vocoder.conv_pre.bias");
+  if (!pre_w || !pre_b) { ggml_free(ctx0); return false; }
+  x_tc = ggml_conv_1d(ctx0, pre_w, x_tc, 1, 3, 1);                      // [T2,DIM]
+  x_tc = ggml_add(ctx0, x_tc, ggml_reshape_2d(ctx0, pre_b, 1, DIM));
+  {
+    auto eg = weights_.embeddings.find("emb_g.weight");
+    struct ggml_tensor *cw = W("vocoder.cond.weight");
+    struct ggml_tensor *cb = W("vocoder.cond.bias");
+    if (eg != weights_.embeddings.end() && cw) {
+      struct ggml_tensor *sid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+      ggml_set_name(sid_t, "voc_sid"); ggml_set_input(sid_t);
+      static int32_t sid_v; sid_v = state.speaker_id;
+      register_pending_input(sid_t, &sid_v, sizeof(int32_t));
+      struct ggml_tensor *gv = ggml_get_rows(ctx0, eg->second, sid_t);  // [256,1]
+      struct ggml_tensor *cw2 = cw;
+      if (cw->ne[0] == 1)
+        cw2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cw), cw->ne[1], cw->ne[2]);
+      struct ggml_tensor *cg = ggml_mul_mat(ctx0, cw2,
+          ggml_reshape_2d(ctx0, gv, cw2->ne[0], 1));                    // [DIM,1]
+      if (cb) cg = ggml_add(ctx0, cg, ggml_reshape_2d(ctx0, cb, DIM, 1));
+      x_tc = ggml_add(ctx0, x_tc, ggml_cont(ctx0, ggml_transpose(ctx0, cg)));
+    }
+  }
+
+  auto layer_norm = [&](struct ggml_tensor *x, const std::string &base) {
+    x = ggml_norm(ctx0, x, 1e-5f);
+    x = ggml_mul(ctx0, x, W(base + ".weight"));
+    x = ggml_add(ctx0, x, W(base + ".bias"));
+    return x;
+  };
+
+  // ---- norm_in + ConvNeXt blocks ([DIM,T2] layout) ------------------------
+  struct ggml_tensor *x_ct = ggml_cont(ctx0, ggml_transpose(ctx0, x_tc));
+  x_ct = layer_norm(x_ct, "vocoder.student.norm_in");
+  for (int b = 0; b < NBLK; b++) {
+    const std::string B = "vocoder.student.blocks." + std::to_string(b);
+    struct ggml_tensor *res = x_ct;
+    struct ggml_tensor *h_tc = ggml_cont(ctx0, ggml_transpose(ctx0, x_ct));
+    h_tc = ggml_conv_1d_dw(ctx0, W(B + ".dw.weight"), h_tc, 1, 3, 1);
+    struct ggml_tensor *h_ct = ggml_cont(ctx0, ggml_transpose(ctx0, h_tc));
+    h_ct = ggml_add(ctx0, h_ct, ggml_reshape_2d(ctx0, W(B + ".dw.bias"), DIM, 1));
+    h_ct = layer_norm(h_ct, B + ".norm");
+    h_ct = ggml_add(ctx0, ggml_mul_mat(ctx0, W(B + ".pw1.weight"), h_ct),
+                    W(B + ".pw1.bias"));
+    h_ct = ggml_gelu_erf(ctx0, h_ct);
+    h_ct = ggml_add(ctx0, ggml_mul_mat(ctx0, W(B + ".pw2.weight"), h_ct),
+                    W(B + ".pw2.bias"));
+    h_ct = ggml_mul(ctx0, h_ct, ggml_reshape_2d(ctx0, W(B + ".gamma"), DIM, 1));
+    x_ct = ggml_add(ctx0, res, h_ct);
+  }
+
+  // ---- head + iSTFT -------------------------------------------------------
+  x_ct = layer_norm(x_ct, "vocoder.student.norm_out");
+  struct ggml_tensor *h = ggml_add(ctx0,
+      ggml_mul_mat(ctx0, W("vocoder.student.head.weight"), x_ct),
+      W("vocoder.student.head.bias"));                                  // [258,T2]
+  struct ggml_tensor *mag = ggml_cont(ctx0,
+      ggml_view_2d(ctx0, h, NBINS, T2, h->nb[1], 0));
+  mag = ggml_exp(ctx0, ggml_clamp(ctx0, mag, -1e30f, 9.0f));
+  struct ggml_tensor *ph = ggml_cont(ctx0,
+      ggml_view_2d(ctx0, h, NBINS, T2, h->nb[1], NBINS * sizeof(float)));
+  struct ggml_tensor *re = ggml_mul(ctx0, mag, ggml_cos(ctx0, ph));
+  struct ggml_tensor *im = ggml_mul(ctx0, mag, ggml_sin(ctx0, ph));
+  // CUDA conv_transpose_1d kernels must be F32; the CPU op wants F16.
+  const bool cpu_only = ggml_backend_sched_get_n_backends(sched) <= 1;
+  auto istft_w = [&](const char *n) -> struct ggml_tensor * {
+    struct ggml_tensor *k = W(n);
+    if (!k) return k;
+    if (cpu_only && k->type == GGML_TYPE_F32)
+      k = ggml_cpy(ctx0, k, ggml_new_tensor_3d(ctx0, GGML_TYPE_F16,
+                                               k->ne[0], k->ne[1], k->ne[2]));
+    return k;
+  };
+  struct ggml_tensor *y = ggml_add(ctx0,
+      ggml_conv_transpose_1d(ctx0, istft_w("vocoder.student.istft.cos_w"),
+          ggml_cont(ctx0, ggml_transpose(ctx0, re)), HOP, 0, 1),
+      ggml_conv_transpose_1d(ctx0, istft_w("vocoder.student.istft.sin_w"),
+          ggml_cont(ctx0, ggml_transpose(ctx0, im)), HOP, 0, 1));
+  struct ggml_tensor *nrm = ggml_conv_transpose_1d(ctx0,
+      istft_w("vocoder.student.istft.win_sq"), ones, HOP, 0, 1);
+  nrm = ggml_clamp(ctx0, nrm, 1e-8f, 1e30f);
+  y = ggml_div(ctx0, y, nrm);
+  const int S = (T2 - 1) * HOP;
+  y = ggml_cont(ctx0, ggml_view_1d(ctx0,
+      ggml_reshape_1d(ctx0, y, ggml_nelements(y)), S, (NFFT / 2) * sizeof(float)));
+  ggml_set_name(y, "audio_output");
+  ggml_set_output(y);
+  ggml_build_forward_expand(gf, y);
+
+  // ---- execute ------------------------------------------------------------
+  ggml_backend_sched_reset(sched);
+  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    RS_LOG_ERR("Vocos8k: graph allocation failed");
+    ggml_free(ctx0); return false;
+  }
+  flush_pending_inputs();
+  ggml_backend_sched_graph_compute(sched, gf);
+
+  std::vector<float> audio(S);
+  ggml_backend_tensor_get(y, audio.data(), 0, (size_t)S * sizeof(float));
+  state.audio_output.insert(state.audio_output.end(), audio.begin(), audio.end());
+  ggml_free(ctx0);
+  RS_LOG_INFO("Vocos8k: %d z-frames -> %d samples @8kHz", T, S);
+  return true;
+}
+
 bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
                                   ggml_backend_sched_t sched,
                                   int mel_start, int mel_len) {
@@ -2952,6 +3138,10 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
 
   RS_LOG_INFO("OpenVoice2: RunVocoder called: mel_start=%d, mel_len=%d, T_mel=%d, n_mels=%d, hop=%d, mel_spec_size=%zu",
               mel_start, mel_len, T_mel, n_mels, hop, state.mel_spectrogram.size());
+
+  if (weights_.vocoder.count("vocoder.student.head.weight")) {
+    return RunVocoderVocos8k(state, sched, mel_start, mel_len);
+  }
   for (auto& [name, t] : w) {
     if (t->ne[2] > 1)
       RS_LOG_INFO("  %s: [%lld, %lld, %lld]", name.c_str(), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2]);

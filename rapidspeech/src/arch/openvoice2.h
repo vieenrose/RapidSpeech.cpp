@@ -39,6 +39,7 @@ struct OpenVoice2HParams {
   int32_t num_tones       = 11;
   int32_t num_languages   = 4;
   // Streaming chunk size in mel frames (0 = non-streaming)
+  float   resample_scale = 0.0f;   // vocos8k: z frame-rate -> 125 Hz
   int32_t chunk_mel_frames = 0;  // 0 = non-streaming (whole utterance per vocoder call)
   // HiFiGAN upsample rates (empty = infer from kernel sizes)
   std::vector<int32_t> upsample_rates;
@@ -189,6 +190,8 @@ private:
   bool RunTextEncoder(OpenVoice2State& state, ggml_backend_sched_t sched);
   bool RunDurationPredictor(OpenVoice2State& state, ggml_backend_sched_t sched);
   bool RunFlowDecoder(OpenVoice2State& state, ggml_backend_sched_t sched);
+  bool RunVocoderVocos8k(OpenVoice2State& state, ggml_backend_sched_t sched,
+                         int mel_start, int mel_len);
   bool RunVocoder(OpenVoice2State& state, ggml_backend_sched_t sched,
                   int mel_start, int mel_len);
   bool RunToneColorEncoder(OpenVoice2State& state, const std::vector<float>& mel,
