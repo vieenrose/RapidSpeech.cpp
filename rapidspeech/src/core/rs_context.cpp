@@ -222,9 +222,18 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   std::string arch = gguf_get_val_str(ctx->ctx_gguf, arch_key);
   RS_LOG_INFO("Architecture detected: %s", arch.c_str());
 
-  // Models with many fine-grained GPU-hostile ops (HiFi-GAN vocoder, etc.)
-  // run faster on CPU and trigger Metal command-buffer errors on GPU.
+  // OpenVoice2/MeloTTS is a small model dominated by many fine-grained ops; it
+  // tends to run as fast or faster on CPU and historically hit GPU op-coverage
+  // issues (e.g. Metal command buffers, the CUDA im2col F16/F32 assert fixed in
+  // openvoice2.cpp). We therefore default it to CPU. GPU is now correct (the
+  // Vocos decoder + convs run on CUDA bit-identically to CPU), so it can be
+  // opted into with RS_FORCE_GPU=1 for boxes where the GPU wins.
   bool prefer_cpu = (arch == "openvoice2");
+  if (prefer_cpu && getenv("RS_FORCE_GPU") &&
+      getenv("RS_FORCE_GPU")[0] == '1') {
+    RS_LOG_INFO("RS_FORCE_GPU=1 — overriding openvoice2 CPU pin, forcing GPU");
+    prefer_cpu = false;
+  }
 
   // 3. Hardware detection and backend initialization
   if (!ctx->init_backend(prefer_cpu)) {

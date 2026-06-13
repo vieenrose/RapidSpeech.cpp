@@ -35,11 +35,13 @@ static struct ggml_tensor *conv1d_im2col(struct ggml_context *ctx,
   (void)kernel_size; (void)in_channels;  // kept for API compatibility
   struct ggml_tensor *x_t = ggml_cont(ctx, ggml_transpose(ctx, x));
 
-  // CPU im2col requires F16 input; cast if needed
+  // ggml im2col: the KERNEL (src0/weight) may be F16, but the DATA (src1) must
+  // stay F32 — the CUDA im2col kernel asserts src1->type==F32 (im2col.cu:85),
+  // while the CPU path accepts F32 data too. Casting the data to F16 (as the
+  // original CPU-only code did) aborts on CUDA. So cast only the weight to F16.
   struct ggml_tensor *x_in = x_t;
   struct ggml_tensor *w_in = weight;
-  if (x_t->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32) {
-    x_in = ggml_cpy(ctx, x_t, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, x_t->ne[0], x_t->ne[1]));
+  if (weight->type == GGML_TYPE_F32) {
     w_in = ggml_cpy(ctx, weight, ggml_new_tensor_3d(ctx, GGML_TYPE_F16, weight->ne[0], weight->ne[1], weight->ne[2]));
   }
 
@@ -3028,6 +3030,48 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
   struct ggml_tensor *pre_w  = (pre_wv  && pre_wg)  ? apply_weight_norm(ctx0, pre_wv,  pre_wg)  : pre_wv;
   struct ggml_tensor *post_w = (post_wv && post_wg) ? apply_weight_norm(ctx0, post_wv, post_wg) : post_wv;
 
+  // -------------------------------------------------------------------------
+  // Vocos8k student decoder detection.
+  //
+  // This melo8k checkpoint ships a distilled Vocos-style vocoder (ConvNeXt
+  // backbone @125 Hz + iSTFT head), NOT a HiFi-GAN upsampling stack. Its
+  // weights live under "vocoder.student.*". When present we run the Vocos
+  // path (resample → conv_pre+cond → norm_in → 8×ConvNeXt → norm_out → head →
+  // iSTFT) instead of the HiFi-GAN upsamplers below. The two share conv_pre +
+  // cond; Vocos additionally needs an 86.13→125 Hz latent resample first.
+  // Reference: github.com/vieenrose/jetson-tts student/{models,istft}.py.
+  bool is_vocos = (w.count("vocoder.student.norm_in.weight") > 0);
+  int vocos_T = 0;  // # intermediate (125 Hz) frames, set during resample
+  if (is_vocos) {
+    // Resample the z latent from the teacher's 86.13 Hz grid to 125 Hz so an
+    // integer ×64 iSTFT hop lands on exactly 8000 Hz. F.interpolate(linear,
+    // align_corners=False) == a fixed [T_in, T_out] matmul; build that matrix
+    // on CPU and register it as a graph input.
+    const double RESAMPLE_SCALE = 125.0 / (44100.0 / 512.0);  // 1.45124716...
+    int T_in = mel_len;
+    int T_out = (int)((double)T_in * RESAMPLE_SCALE);
+    vocos_T = T_out;
+    std::vector<float> R((size_t)T_in * T_out, 0.0f);  // ne0=T_in, ne1=T_out
+    for (int j = 0; j < T_out; j++) {
+      double x = ((double)j + 0.5) / RESAMPLE_SCALE - 0.5;  // source coord
+      int x0 = (int)std::floor(x);
+      double frac = x - x0;
+      int x0c = std::min(std::max(x0, 0), T_in - 1);
+      int x1c = std::min(std::max(x0 + 1, 0), T_in - 1);
+      R[(size_t)j * T_in + x0c] += (float)(1.0 - frac);
+      R[(size_t)j * T_in + x1c] += (float)frac;
+    }
+    struct ggml_tensor *Rt = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_in, T_out);
+    ggml_set_name(Rt, "vocos_resample");
+    ggml_set_input(Rt);
+    register_pending_input(Rt, R.data(), R.size() * sizeof(float));
+    // cur: [n_mels, T_in] -> transpose [T_in, n_mels] -> matmul(R) ->
+    // [T_out, n_mels] -> transpose [n_mels, T_out].
+    struct ggml_tensor *cur_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+    struct ggml_tensor *res = ggml_mul_mat(ctx0, Rt, cur_t);      // [T_out, n_mels]
+    cur = ggml_cont(ctx0, ggml_transpose(ctx0, res));             // [n_mels, T_out]
+  }
+
   // Pre-conv: mel → hidden
   if (pre_w) {
     int k_pre = static_cast<int>(pre_w->ne[0]);  // kernel size
@@ -3070,7 +3114,86 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
     }
   }
 
-  // --- Upsampling blocks ---
+  // =========================================================================
+  // Vocos8k student decoder path (ConvNeXt @125 Hz + iSTFT head).
+  // cur here = conv_pre(resample(z)) + cond(g), shape [dim=256, T].
+  // Produces `cur` = per-frame iSTFT contributions [n_fft=256, T]; the
+  // overlap-add + window normalisation is finished on the CPU after compute.
+  // =========================================================================
+  bool vocos_istft_output = false;
+  int vocos_nfft = 0, vocos_hop = 0, vocos_nframes = 0;
+  if (is_vocos) {
+    auto W = [&](const std::string& n) -> struct ggml_tensor* {
+      auto it = w.find(n); return it == w.end() ? nullptr : it->second;
+    };
+    const float EPS = 1e-5f;
+    int dim = (int)cur->ne[0];  // 256
+
+    // norm_in (LayerNorm over channels)
+    cur = layer_norm(ctx0, cur, W("vocoder.student.norm_in.weight"),
+                     W("vocoder.student.norm_in.bias"), EPS);
+
+    // 8 ConvNeXt blocks: dw(k7,p3,groups=dim) → LN → pw1 → GELU → pw2 → *γ → +res
+    for (int i = 0; i < 8; i++) {
+      std::string p = "vocoder.student.blocks." + std::to_string(i) + ".";
+      struct ggml_tensor *res = cur;
+      // depthwise conv1d: data must be [T, C] for ggml_conv_1d_dw; kernel [K,1,C]
+      struct ggml_tensor *xtc = ggml_cont(ctx0, ggml_transpose(ctx0, cur));   // [T,C]
+      struct ggml_tensor *h = ggml_conv_1d_dw(ctx0, W(p + "dw.weight"), xtc, 1, 3, 1);
+      h = ggml_cont(ctx0, ggml_transpose(ctx0, h));                            // [C,T]
+      struct ggml_tensor *dwb = ggml_reshape_2d(ctx0, W(p + "dw.bias"), dim, 1);
+      h = ggml_add(ctx0, h, dwb);
+      h = layer_norm(ctx0, h, W(p + "norm.weight"), W(p + "norm.bias"), EPS);
+      // pw1 (Linear dim->dim*mult), GELU(erf), pw2 (Linear back)
+      h = ggml_mul_mat(ctx0, W(p + "pw1.weight"), h);
+      h = ggml_add(ctx0, h, ggml_reshape_2d(ctx0, W(p + "pw1.bias"), W(p + "pw1.bias")->ne[0], 1));
+      h = ggml_gelu_erf(ctx0, h);
+      h = ggml_mul_mat(ctx0, W(p + "pw2.weight"), h);
+      h = ggml_add(ctx0, h, ggml_reshape_2d(ctx0, W(p + "pw2.bias"), dim, 1));
+      // scale by gamma (per-channel), then residual
+      h = ggml_mul(ctx0, h, ggml_reshape_2d(ctx0, W(p + "gamma"), dim, 1));
+      cur = ggml_add(ctx0, res, h);
+    }
+
+    // norm_out → head (Linear dim -> 2*n_bins)
+    cur = layer_norm(ctx0, cur, W("vocoder.student.norm_out.weight"),
+                     W("vocoder.student.norm_out.bias"), EPS);
+    struct ggml_tensor *h = ggml_mul_mat(ctx0, W("vocoder.student.head.weight"), cur);
+    h = ggml_add(ctx0, h, ggml_reshape_2d(ctx0, W("vocoder.student.head.bias"),
+                                          W("vocoder.student.head.bias")->ne[0], 1));
+    int n_out = (int)h->ne[0];           // 258
+    int n_bins = n_out / 2;              // 129
+    int T = (int)h->ne[1];
+    // mag = exp(clamp(h[:n_bins], max=9)); phase = h[n_bins:]
+    struct ggml_tensor *mag_h = ggml_cont(ctx0,
+        ggml_view_2d(ctx0, h, n_bins, T, h->nb[1], 0));
+    struct ggml_tensor *phase = ggml_cont(ctx0,
+        ggml_view_2d(ctx0, h, n_bins, T, h->nb[1], (size_t)n_bins * sizeof(float)));
+    struct ggml_tensor *mag = ggml_exp(ctx0, ggml_clamp(ctx0, mag_h, -1e30f, 9.0f));
+    struct ggml_tensor *real = ggml_mul(ctx0, mag, ggml_cos(ctx0, phase));  // [n_bins,T]
+    struct ggml_tensor *imag = ggml_mul(ctx0, mag, ggml_sin(ctx0, phase));
+
+    // iSTFT DFT basis: gguf cos_w/sin_w are [n_fft,1,n_bins] (ne0=n_fft).
+    // Want basis [n_bins, n_fft] (ne0=n_bins) so mul_mat contracts over n_bins.
+    int n_fft = (int)W("vocoder.student.istft.cos_w")->ne[0];  // 256
+    auto basis = [&](const char* nm) {
+      struct ggml_tensor *t = W(nm);
+      t = ggml_reshape_2d(ctx0, t, n_fft, n_bins);             // [n_fft, n_bins]
+      return ggml_cont(ctx0, ggml_transpose(ctx0, t));         // [n_bins, n_fft]
+    };
+    struct ggml_tensor *cos_b = basis("vocoder.student.istft.cos_w");
+    struct ggml_tensor *sin_b = basis("vocoder.student.istft.sin_w");
+    struct ggml_tensor *frames = ggml_add(ctx0,
+        ggml_mul_mat(ctx0, cos_b, real),    // [n_fft, T]
+        ggml_mul_mat(ctx0, sin_b, imag));
+    cur = frames;
+    vocos_istft_output = true;
+    vocos_nfft = n_fft; vocos_hop = hop; vocos_nframes = T;
+    (void)vocos_T;
+  }
+
+  // --- Upsampling blocks (HiFi-GAN path; naturally skipped for Vocos, which
+  //     has no vocoder.ups.* / resblocks / conv_post weights) ---
   // Count upsamplers
   int n_ups = 0;
   for (int i = 0; i < 8; i++) {
@@ -3317,7 +3440,43 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
 
   ggml_backend_sched_graph_compute(sched, gf);
 
-  // --- Read audio output ---
+  int n_audio = 0;
+  if (vocos_istft_output) {
+    // cur = per-frame iSTFT contributions [n_fft, T]. Finish the inverse STFT
+    // on the CPU: windowed overlap-add at stride=hop, divide by the overlap-
+    // added squared window, then trim n_fft/2 each side (center=True), exactly
+    // matching student/istft.py:ISTFTHead.forward.
+    int n_fft = vocos_nfft, hop = vocos_hop, T = vocos_nframes;
+    std::vector<float> frames((size_t)n_fft * T);
+    ggml_backend_tensor_get(cur, frames.data(), 0, frames.size() * sizeof(float));
+    // window normalisation: gguf win_sq is [n_fft,1,1]
+    std::vector<float> win_sq(n_fft, 0.0f);
+    if (auto it = w.find("vocoder.student.istft.win_sq"); it != w.end())
+      ggml_backend_tensor_get(it->second, win_sq.data(), 0, n_fft * sizeof(float));
+    int full = (T - 1) * hop + n_fft;
+    std::vector<float> y(full, 0.0f), norm(full, 0.0f);
+    for (int t = 0; t < T; t++) {
+      int s = t * hop;
+      const float *fr = &frames[(size_t)t * n_fft];
+      for (int k = 0; k < n_fft; k++) {
+        y[s + k] += fr[k];
+        norm[s + k] += win_sq[k];
+      }
+    }
+    int p = n_fft / 2;
+    int out_len = full - 2 * p;
+    size_t prev_size = state.audio_output.size();
+    state.audio_output.resize(prev_size + out_len);
+    for (int i = 0; i < out_len; i++)
+      state.audio_output[prev_size + i] = y[p + i] / (norm[p + i] + 1e-8f);
+    n_audio = out_len;
+    ggml_free(ctx0);
+    RS_LOG_INFO("OpenVoice2: Vocos iSTFT [%d..%d] -> %d samples",
+                mel_start, mel_start + mel_len, n_audio);
+    return true;
+  }
+
+  // --- Read audio output (HiFi-GAN path) ---
   int n_samples = cur->ne[0] * cur->ne[1];
   if (n_samples <= 0) {
     ggml_free(ctx0);
@@ -3334,7 +3493,7 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
               n_samples * sizeof(float));
 
   ggml_free(ctx0);
-  int n_audio = n_samples;
+  n_audio = n_samples;
   RS_LOG_INFO("OpenVoice2: Vocoder chunk [%d..%d] -> %d samples",
               mel_start, mel_start + mel_len, n_audio);
   return true;
