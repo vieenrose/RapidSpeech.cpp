@@ -33,20 +33,27 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
    equals the ONNX `[80,T]` mel buffer directly — no transpose. Linear weights are numpy `[in,out]`
    → ggml `ne=[out,in]`, transposed before `mul_mat`. The iSTFT tail (mag/phase → waveform) is
    separate DSP to wire from `cosyvoice3_hift` (n_fft=512).
-3. **gguf loader + hparams** — map tensors into a `MatchaModel` (encoder / dur-pred / CFM / vocos). TODO.
-3. **Text frontend** — the bundle ships `tokens.txt` + `lexicon.txt` + jieba/espeak data +
+3. **iSTFT tail — ✅ DONE & VALIDATED** — head `[514,T]` → `mag = exp(min(log_mag, 9))`,
+   `phase` → `re = mag·cos(phase)`, `im = mag·sin(phase)` → overlap-add iSTFT
+   (n_fft=512, hop=128, periodic-hann, center, window-sum normalised, center-trimmed) → waveform.
+   Implemented in `matcha_vocos_validate.cpp`; matches the numpy reference at **corr 1.000000,
+   rel 8e-4** (same 4992 samples). So the **full vocoder (mel → waveform) is numerically correct.**
+   (sherpa-onnx does this same iSTFT on CPU via knf::IStft — cheap deterministic tail, no GPU needed.)
+4. **gguf loader + hparams** — map tensors into a `MatchaModel` (encoder / dur-pred / CFM / vocos). TODO.
+5. **Text frontend** — the bundle ships `tokens.txt` + `lexicon.txt` + jieba/espeak data +
    rule FSTs; reuse RapidSpeech's existing TTS frontend plumbing where possible. TODO.
-4. **Forward graph (ggml)** — encoder → duration/length-regulate → CFM ODE loop (3 steps) →
-   vocos. Needs: InstanceNorm (build from existing ops), Snake activation (`x + sin²`/Softplus
-   form), `Sin` time-embedding, and an iSTFT (the one genuinely new primitive — compose from
-   ggml rfft/irfft or a matmul-DFT, like RapidSpeech's existing CosyVoice3 HiFi head). TODO.
-5. **Validate vs ONNX** — deterministic check (fixed noise) GPU==CPU and vs the sherpa-onnx
-   reference wav; ASR round-trip. TODO.
-6. **CUDA-10.2/sm_53 build + benchmark** — warm time + peak RSS in the container; add to the
-   edge-speech-gpu-bench comparison. TODO.
+6. **Acoustic model forward graph (ggml) — the big remaining half** — text encoder (embedding →
+   conv prenet → transformer blocks w/ InstanceNorm) → duration predictor → length-regulate →
+   CFM decoder UNet solved with 3 Euler ODE steps (InstanceNorm, Snake `x + sin²`/Softplus form,
+   `Sin` time-embedding, `RandomNormalLike` seed noise). Needs the same staged ONNX-intermediate
+   validation that worked for the vocoder. TODO — this is the bulk of the remaining effort.
+7. **End-to-end validate + CUDA-10.2/sm_53 build + benchmark** — deterministic (fixed-noise)
+   GPU==CPU and vs the sherpa-onnx reference wav; ASR round-trip; warm time + peak RSS in the
+   container; add to the edge-speech-gpu-bench comparison. TODO.
 
-## Effort note
-Milestones 2–5 are a substantial arch implementation — comparable in size to the existing
-`openvoice2.cpp` (VITS, ~2k lines), with the CFM ODE loop and the iSTFT head as the two pieces
-with no direct precedent in the current arch set. This is multi-session work; the converter
-(milestone 1) is the validated foundation it builds on.
+## Status summary
+The **vocoder half (mel → waveform) is DONE and numerically validated** — Vocos ConvNeXt network
+(rel 3e-4) + iSTFT tail (corr 1.0). What remains is the **acoustic model** (text → mel): a
+substantial arch comparable to the existing `openvoice2.cpp` (~2k lines), with the CFM ODE loop as
+the piece with no direct precedent. The staged ONNX-intermediate validation method (extract per-stage
+reference, compare, fix layout) is proven and carries directly to the acoustic graph.

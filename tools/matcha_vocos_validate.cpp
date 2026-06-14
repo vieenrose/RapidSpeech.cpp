@@ -136,5 +136,45 @@ int main(int argc, char** argv) {
     }
   printf("vocos mag: mean|abs err|=%.6f  (ref mean|val|=%.6f)  rel=%.4f  over %d bins\n",
          err / cnt, ssr / cnt, err / (ssr + 1e-9), cnt);
+
+  // ---- iSTFT tail: head[514,T] -> mag/phase -> complex -> overlap-add waveform ----
+  // n_fft=512 hop=128 win=512 periodic-hann center; mag = exp(min(log_mag, 9)).
+  const int NFFT = 512, HOP = 128;
+  std::vector<float> win(NFFT);
+  for (int n = 0; n < NFFT; n++) win[n] = 0.5f - 0.5f * std::cos(2.0 * M_PI * n / NFFT);
+  // per-frame complex spectrum re/im (mag*cos, mag*sin)
+  int L = (T - 1) * HOP + NFFT;
+  std::vector<double> out(L, 0.0), wsum(L, 0.0);
+  std::vector<double> frame(NFFT);
+  const double w = 2.0 * M_PI / NFFT;
+  for (int f = 0; f < T; f++) {
+    // gather re[k], im[k]
+    // irfft(512) from 257 bins: out[n] = (1/N)[Re0 + 2 sum_{1..255}(Re cos - Im sin) + Re256 cos(pi n)]
+    for (int n = 0; n < NFFT; n++) {
+      double acc = 0.0;
+      for (int k = 0; k < BINS; k++) {
+        float mlog = od[f * HEAD + k]; if (mlog > 9.0f) mlog = 9.0f;
+        double mag = std::exp(mlog);
+        double ph = od[f * HEAD + BINS + k];
+        double re = mag * std::cos(ph), im = mag * std::sin(ph);
+        double ang = w * k * n;
+        double coef = (k == 0 || k == NFFT / 2) ? 1.0 : 2.0;
+        acc += coef * (re * std::cos(ang) - im * std::sin(ang));
+      }
+      frame[n] = acc / NFFT;
+    }
+    for (int n = 0; n < NFFT; n++) {
+      out[f * HOP + n] += frame[n] * win[n];
+      wsum[f * HOP + n] += (double)win[n] * win[n];
+    }
+  }
+  for (int i = 0; i < L; i++) { if (wsum[i] < 1e-8) wsum[i] = 1.0; out[i] /= wsum[i]; }
+  // trim center padding
+  int start = NFFT / 2, wavn = L - NFFT;  // = L - 2*(NFFT/2)
+  std::vector<float> wav(wavn);
+  for (int i = 0; i < wavn; i++) wav[i] = (float)out[start + i];
+  FILE* wf = fopen("/work/gg_wav.f32", "wb"); fwrite(wav.data(), 4, wavn, wf); fclose(wf);
+  double rms = 0; for (float v : wav) rms += (double)v * v; rms = std::sqrt(rms / wavn);
+  printf("istft wav: %d samples (%.3fs @8k) rms=%.4f -> /work/gg_wav.f32\n", wavn, wavn / 8000.0, rms);
   return 0;
 }
