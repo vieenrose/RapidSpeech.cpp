@@ -178,6 +178,7 @@ set(RS_SOURCES
         rapidspeech/src/frontend/cosyvoice3_mel.h
         rapidspeech/src/frontend/cosyvoice3_mel.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
+        rapidspeech/src/arch/matcha.cpp
         rapidspeech/src/arch/omnivoice.cpp
         rapidspeech/src/arch/campplus.cpp
         rapidspeech/src/arch/bert.cpp
