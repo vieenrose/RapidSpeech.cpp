@@ -64,6 +64,23 @@ nvcc 10.2 + real CUDA-10.2 cuBLAS), both models ran to completion with correct
 output. Reproduce with `scripts/build_jetson_nano_gen1_native.sh` then run
 `rs-asr-offline` / `rs-tts-offline` with `--gpu true RS_FORCE_CC=530`.
 
+## Memory footprint (peak RSS)
+
+Re-built and re-run on a GB10 in an aarch64 **CUDA-10.2** container (genuine nvcc 10.2
+toolchain, `RS_FORCE_CC=530`), measuring peak `VmHWM`:
+
+| Model (CUDA, gen1) | peak RSS |
+|---|---|
+| SenseVoice + silero-VAD | **756 MB** |
+| melo8k TTS | **572 MB** |
+
+RSS still carries the GB10's larger CUDA-13 driver context, so on a real 4 GB Nano
+(small CUDA-10.2 context) the absolute numbers are lower — but the figure is useful
+relatively: the ggml backend keeps the conv-heavy ASR model well under 1 GB, where a
+cuDNN-based stack alone faults in ~782 MB before weights. (The cuDNN-free onnxruntime
+1.11 build of the same models needs ~1.2 GB / ~720 MB respectively — see the
+edge-speech-gpu-bench comparison.)
+
 ## Why speed isn't here
 
 The GB10 has no native sm_53 cuBLAS SASS, so every kernel **JIT-compiles to sm_121

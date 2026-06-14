@@ -35,7 +35,12 @@ command -v g++-8 >/dev/null || { $SUDO apt-get update; $SUDO apt-get install -y 
 #      - a no-op __builtin_assume for compilers that lack it
 #      - RS_FORCE_CC / RS_GEMM_NO_TENSOR env hooks (test-only; harmless on Nano)
 # ---------------------------------------------------------------------------
-git -C "$ROOT" submodule update --init ggml
+# `protocol.file.allow=always` lets the submodule fetch use file:// transport,
+# which git >= 2.38.1 blocks by default (CVE-2022-39253) — this bites inside
+# containers / against a local object cache. If the pinned commit is already
+# present (offline), fall back to checking it out directly.
+git -C "$ROOT" -c protocol.file.allow=always submodule update --init ggml \
+  || git -C "$ROOT/ggml" checkout -q "$(git -C "$ROOT" ls-tree HEAD ggml | awk '{print $3}')"
 if ! git -C "$ROOT/ggml" apply --reverse --check "$ROOT/patches/ggml-cuda-10.2-sm53.patch" 2>/dev/null; then
   git -C "$ROOT/ggml" apply "$ROOT/patches/ggml-cuda-10.2-sm53.patch"
 fi
