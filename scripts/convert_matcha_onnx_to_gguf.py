@@ -31,17 +31,52 @@ def semantic_rename_map(graph, prefix):
     """ONNX exporters fold Linear/MatMul weights into anonymous `onnx::MatMul_*`
     initializers. Recover a semantic name from the consuming node's path, e.g.
     node `/blocks.0/pw1/MatMul` consuming `onnx::MatMul_284` -> `<prefix>.blocks.0.pw1.weight`.
+
+    Some weights are first consumed by an `Identity` passthrough (e.g. when the 3 unrolled
+    CFM-ODE copies share one weight) — naming by Identity gives a useless name, so we
+    follow Identity outputs to the first *real* consumer (e.g. attn1/to_q/MatMul).
     Returns {init_name: semantic_name} for every anonymous initializer."""
     inits = {i.name for i in graph.initializer}
-    ren = {}
+    # consumers[tensor] = list of nodes that read it
+    consumers = {}
     for nd in graph.node:
         for inp in nd.input:
-            if inp in inits and inp.startswith("onnx::") and inp not in ren:
-                path = nd.name.strip("/").split("/")
-                if path and path[-1] in ("MatMul", "Gemm", "Conv", "Add", "Mul"):
-                    path = path[:-1]
-                if path:
-                    ren[inp] = f"{prefix}.{'.'.join(path)}.weight"
+            consumers.setdefault(inp, []).append(nd)
+
+    def real_consumer(tensor, depth=0):
+        # first non-Identity consumer (follow Identity chains); returns (node, input_index, op)
+        for nd in consumers.get(tensor, []):
+            if nd.op_type == "Identity" and depth < 8:
+                r = real_consumer(nd.output[0], depth + 1)
+                if r is not None:
+                    return r
+            elif nd.op_type != "Identity":
+                return (nd, list(nd.input).index(tensor), nd.op_type)
+        return None
+
+    ren = {}
+    for inp in inits:
+        if not inp.startswith("onnx::"):
+            continue
+        rc = real_consumer(inp)
+        if rc is None:
+            continue
+        nd, idx, op = rc
+        path = nd.name.strip("/").split("/")
+        if path and path[-1] in ("MatMul", "Gemm", "Conv", "Add", "Mul", "InstanceNormalization"):
+            path = path[:-1]
+        if not path:
+            continue
+        # disambiguate multi-weight ops by input role:
+        #   InstanceNorm(x, scale=in1, bias=in2) -> .weight / .bias
+        #   MatMul/Gemm weight (the non-activation input) -> .weight; bias-add input -> .bias
+        if op == "InstanceNormalization":
+            suffix = "weight" if idx == 1 else ("bias" if idx == 2 else f"in{idx}")
+        elif idx >= 2 or op == "Add":
+            suffix = "bias"
+        else:
+            suffix = "weight"
+        ren[inp] = f"{prefix}.{'.'.join(path)}.{suffix}"
     return ren
 
 
