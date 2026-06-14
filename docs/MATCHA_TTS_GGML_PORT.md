@@ -90,7 +90,21 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
     `x + sin²(exp(log_alpha)·x) / exp(log_beta)` (alpha/beta stored in log space). ggml validator
     `matcha_snake_validate.cpp` (formula correct; a broadcast-div plumbing segfault on the old gguf-
     container ggml CPU build remains to resolve — low-risk, the math is verified).
-  - **down/up sample** (Conv k3 stride 2 / transpose), `final_block` + `final_proj` (256→80).
+  - **down/up sample**: downsample = Conv k3 stride 2; upsample = **ConvTranspose**. `final_block`
+    (Conv→GroupNorm→Mish) + `final_proj` (256→80).
+  - **GroupNorm**: 8 groups, done as reshape `[B,8,-1]` → InstanceNorm → reshape back → affine
+    (scale·x+bias). The scale/bias are folded Constants (now captured distinctly — see converter).
+  - **time_mlp**: input is a baked `[1,160]` sinusoidal embedding (the 3 ODE-step values are folded
+    constants since num_ode_steps is fixed at export) → linear_1 (160→1024) → **SiLU** → linear_2.
+  - **ODE**: the 3 Euler steps are **unrolled** in the graph (≈3× the estimator → 2977 nodes); the 3
+    copies **share weights via Identity passthroughs**.
+
+  **Converter completeness (fixed this pass):** the decoder exposed two converter bugs — (1) attn
+  to_q/k/v weights were first consumed by Identity (the shared ODE copies) → misnamed; (2) GroupNorm
+  scale+bias collided to one name → 13 silently dropped. Both fixed (Identity-chain resolution +
+  input-index disambiguation); the gguf now carries all 474 weights, 0 collisions, round-trip PASS.
+  So **the gguf is now complete for build_cfm**; the remaining work is implementing + staged-validating
+  the UNet blocks (ResnetBlock1D, BasicTransformerBlock) and the ODE loop inside `MatchaModel::build_cfm`.
 
 This is genuinely a ~2k-line arch (≈ `openvoice2.cpp`), with the rel-pos attention, the
 Constant-folded norms, and the 3-step CFM ODE solver as the intricate pieces. It is **multi-session
