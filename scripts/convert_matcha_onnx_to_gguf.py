@@ -45,6 +45,32 @@ def semantic_rename_map(graph, prefix):
     return ren
 
 
+def folded_constants(graph, prefix):
+    """ONNX export folds some learned params (encoder LayerNorm gamma/beta, relative-
+    position embeddings, Snake alpha/beta sometimes) into multi-element `Constant`
+    nodes rather than initializers. Capture them keyed by the consuming node's path so
+    the gguf carries every learned tensor. Skip 1-element scalars (loop/shape consts)."""
+    out = {}
+    consumers = {}  # const-output-name -> consuming node
+    for nd in graph.node:
+        for inp in nd.input:
+            consumers.setdefault(inp, nd)
+    for nd in graph.node:
+        if nd.op_type != "Constant" or not nd.attribute:
+            continue
+        try:
+            arr = numpy_helper.to_array(nd.attribute[0].t)
+        except Exception:
+            continue
+        if arr.size <= 1:
+            continue
+        oc = nd.output[0]
+        cons = consumers.get(oc)
+        path = (cons.name.strip("/").replace("/", ".") if cons and cons.name else oc)
+        out[f"{prefix}.const.{path}"] = arr
+    return out
+
+
 def load_inits(path, prefix):
     m = onnx.load(path)
     meta = {kv.key: kv.value for kv in m.metadata_props}
@@ -53,7 +79,13 @@ def load_inits(path, prefix):
     for i in m.graph.initializer:
         name = ren.get(i.name, i.name)
         tensors[name] = numpy_helper.to_array(i)
-    return tensors, meta, len(ren)
+    # also capture folded multi-element Constants (encoder norms / rel-pos / etc.)
+    nconst = 0
+    for name, arr in folded_constants(m.graph, prefix).items():
+        if name not in tensors:
+            tensors[name] = arr
+            nconst += 1
+    return tensors, meta, len(ren), nconst
 
 
 def main(src_dir, dst):
@@ -61,9 +93,10 @@ def main(src_dir, dst):
     vocos = sorted(glob.glob(os.path.join(src_dir, "vocos-*.onnx")))
     if not acoustic or not vocos:
         sys.exit(f"need model-steps-*.onnx and vocos-*.onnx in {src_dir}")
-    a_t, meta, a_ren = load_inits(acoustic[0], "model")
-    v_t, _, v_ren = load_inits(vocos[0], "voc")
+    a_t, meta, a_ren, a_const = load_inits(acoustic[0], "model")
+    v_t, _, v_ren, v_const = load_inits(vocos[0], "voc")
     print(f"semantic-renamed anonymous weights: acoustic {a_ren}, vocos {v_ren}")
+    print(f"captured folded Constants (norms/rel-pos/etc): acoustic {a_const}, vocos {v_const}")
     # acoustic weights namespaced `model.*`, vocos `voc.*` — disjoint.
     tensors = {}
     tensors.update(a_t)

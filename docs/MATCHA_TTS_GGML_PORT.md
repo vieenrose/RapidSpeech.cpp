@@ -20,11 +20,16 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   on ggml it's a native op.)
 
 ## Milestones
-1. **onnx→gguf converter** ✅ DONE — `scripts/convert_matcha_onnx_to_gguf.py`. Extracts all
-   385 weights into one gguf + model-card hparams; round-trip-validated (gguf == onnx, PASS;
-   ~104 MB f32). ONNX folds Linear weights into anonymous `onnx::MatMul_*` initializers, so the
-   converter **traces the graph and gives them semantic names** (97 acoustic + 17 vocos resolved,
-   e.g. `/blocks.0/pw1/MatMul`'s weight → `voc.blocks.0.pw1.weight`) — makes the gguf self-describing.
+1. **onnx→gguf converter** ✅ DONE — `scripts/convert_matcha_onnx_to_gguf.py`. Extracts **all 474
+   learned tensors** into one gguf + model-card hparams; round-trip-validated (gguf == onnx, PASS).
+   Two ONNX-export quirks the converter handles:
+   - **Anonymous Linear weights** (`onnx::MatMul_*` initializers) → traced to semantic names from
+     the consuming node (97 acoustic + 17 vocos, e.g. `voc.blocks.0.pw1.weight`).
+   - **Folded learned Constants** — the acoustic encoder's **LayerNorm gamma/beta and relative-
+     position embeddings are baked into multi-element `Constant` nodes**, not initializers (128
+     such constants in the graph). The converter harvests the 89 that are genuine learned params
+     (`model.const.<consumer-path>`), so no weight is lost. (This is why an initializer-only scan
+     shows the encoder having attention/FFN convs but "no norms".)
 2. **Vocos vocoder (ggml) — ✅ DONE & VALIDATED** — `tools/matcha_vocos_validate.cpp` builds the
    ConvNeXt graph (conv_pre → norm_in → 8× {dw-conv → LN → pw1 → GELU → pw2 → ×gamma → residual}
    → norm_out → head) and matches the ONNX reference (`scripts/gen_vocos_fixture.py`) to
@@ -51,9 +56,29 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
    GPU==CPU and vs the sherpa-onnx reference wav; ASR round-trip; warm time + peak RSS in the
    container; add to the edge-speech-gpu-bench comparison. TODO.
 
-## Status summary
-The **vocoder half (mel → waveform) is DONE and numerically validated** — Vocos ConvNeXt network
-(rel 3e-4) + iSTFT tail (corr 1.0). What remains is the **acoustic model** (text → mel): a
-substantial arch comparable to the existing `openvoice2.cpp` (~2k lines), with the CFM ODE loop as
-the piece with no direct precedent. The staged ONNX-intermediate validation method (extract per-stage
-reference, compare, fix layout) is proven and carries directly to the acoustic graph.
+## Status summary (honest)
+**Done & numerically validated:**
+- onnx→gguf converter — all **474 learned tensors** (incl. 89 folded-Constant encoder norms/rel-pos),
+  round-trip exact.
+- **Full Vocos vocoder, mel → waveform** — ConvNeXt network (rel 3e-4 vs ONNX) + iSTFT tail (corr 1.0).
+
+**Remaining — the acoustic model (text → mel), the larger half.** Scope, measured from the graph:
+- **Text encoder** (~1800 nodes): embedding ×√192 → ConvReLUNorm prenet (3× conv k5 + inline
+  LayerNorm-from-Constants) → **6-layer relative-position multi-head transformer** (attention
+  conv_q/k/v/o + rel-pos windows in Constants; inline LayerNorm; FFN conv_1/conv_2) → `proj_m`
+  (→ mel mean μ) and `proj_w` duration predictor (conv→conv→proj).
+- **Length regulator** — expand μ by ceil(exp(logw)·length_scale) durations.
+- **CFM decoder** (**2977 nodes**) — a 1-D UNet (down/mid/up ResnetBlock1D with time-MLP
+  conditioning + Snake-activation transformer blocks `alpha`/`beta`, InstanceNorm, down/up sample)
+  solved with **3 Euler ODE steps** from `RandomNormalLike` seed noise scaled by `noise_scale`.
+
+This is genuinely a ~2k-line arch (≈ `openvoice2.cpp`), with the rel-pos attention, the
+Constant-folded norms, and the 3-step CFM ODE solver as the intricate pieces. It is **multi-session
+work** — not completable in one pass without large amounts of unvalidated code. The proven method
+(per-stage ONNX-intermediate extraction → ggml compare → fix → next stage) carries directly over;
+the next concrete stage is the embedding+prenet front, then the rel-pos transformer block, each
+validated before moving on.
+
+For a **working Matcha on the Nano today**, the validated path is **sherpa-onnx on the cuDNN-free
+ORT 1.11** (681 MB / 139 ms, output matches the HF reference) — see edge-speech-gpu-bench. This
+ggml port is the lighter-RAM alternative, in progress.
