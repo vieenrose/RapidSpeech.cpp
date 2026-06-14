@@ -39,10 +39,10 @@ def main(gguf_path, out, T=10):
     h = h + (g(P+"mlp.1.weight") @ mish(temb) + g(P+"mlp.1.bias"))[:, None]
     h = mish(gn8(conv1d(h, g(P+"block2.block.0.weight"), g(P+"block2.block.0.bias"), 1),
                  g(P+"block2.block.block.1"+N2+".weight").reshape(-1), g(P+"block2.block.block.1"+N2+".bias").reshape(-1)))
-    out = h + conv1d(x, g(P+"res_conv.weight"), g(P+"res_conv.bias"), 0)
-    x.tofile(out+"/res_x.f32"); temb.tofile(out+"/res_temb.f32"); out_a = out+"/res_ref.f32"
-    np.ascontiguousarray(out).astype(np.float32).tofile(out_a)
-    print(f"resnet ref: out[256,{T}] mean={out.mean():.4f} std={out.std():.4f} -> {out}")
+    y = h + conv1d(x, g(P+"res_conv.weight"), g(P+"res_conv.bias"), 0)
+    x.tofile(out+"/res_x.f32"); temb.tofile(out+"/res_temb.f32")
+    np.ascontiguousarray(y).astype(np.float32).tofile(out+"/res_ref.f32")
+    print(f"resnet ref: out[256,{T}] mean={y.mean():.4f} std={y.std():.4f}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3: sys.exit(__doc__)
