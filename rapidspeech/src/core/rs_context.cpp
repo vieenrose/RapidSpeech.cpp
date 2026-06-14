@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "core/rs_context.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -228,8 +229,10 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   // on many fine-grained ops); CUDA handles the graph fine — keep GPU there.
 #ifdef RS_USE_CUDA
   // matcha-tts has a very fine-grained CFM-decoder graph (3-step ODE x UNet); the CPU path is
-  // faster for it and avoids the GB10 sm_53->sm_121 PTX-JIT stall on first use.
-  bool prefer_cpu = (arch == "matcha-tts");
+  // faster for it and avoids the GB10 sm_53->sm_121 PTX-JIT stall on first use. Its forward path
+  // is backend-agnostic (ggml_backend_sched) though, so it CAN target CUDA — opt in with
+  // MATCHA_USE_CUDA=1 (useful on Ampere+, where ggml's CUDA-graph replay (cc>=800) actually helps).
+  bool prefer_cpu = (arch == "matcha-tts" && getenv("MATCHA_USE_CUDA") == nullptr);
 #else
   bool prefer_cpu = (arch == "openvoice2" || arch == "matcha-tts");
 #endif

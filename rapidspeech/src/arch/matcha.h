@@ -11,6 +11,7 @@
 // Weights come from scripts/convert_matcha_onnx_to_gguf.py (474 tensors, arch="matcha-tts").
 #include "core/rs_context.h"
 #include "core/rs_model.h"
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -63,6 +64,14 @@ private:
   std::map<std::string, ggml_tensor*> w_;   // weights from gguf_data
   rs_context_t* rsctx_ = nullptr;
   int cfm_ylen_ = 0;   // valid (length-regulated) mel length for the current synthesis
+
+  // Backend-sched path: build graphs in a no_alloc context, register host input data here,
+  // and flush (ggml_backend_tensor_set) after ggml_backend_sched_alloc_graph.
+  struct PendingInput { ggml_tensor* t; std::vector<uint8_t> data; };
+  std::vector<PendingInput> pending_;
+  ggml_tensor* inp_f32(ggml_context* c, int ne0, int ne1, const float* data);  // ne1<=0 -> 1-D
+  ggml_tensor* inp_i32(ggml_context* c, int ne0, const int32_t* data);
+  void flush_inputs();
 
   ggml_tensor* W(const std::string& name) const;
   // forward stages (defined in matcha.cpp); ctx is a graph-build context

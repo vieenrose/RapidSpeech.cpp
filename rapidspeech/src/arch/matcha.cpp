@@ -18,6 +18,7 @@
 #include "utils/rs_log.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include <cmath>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <utility>
+#include <cstdint>
 
 namespace {
 constexpr float PI = 3.14159265358979323846f;
@@ -39,10 +41,10 @@ ggml_tensor* conv1d(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor
 ggml_tensor* cln(ggml_context* c, ggml_tensor* x, ggml_tensor* g, ggml_tensor* b) {
   x = ggml_norm(c, x, 1e-5f); x = ggml_mul(c, x, r1(c, g)); return ggml_add(c, x, r1(c, b));
 }
-// mish = x*tanh(softplus(x)), softplus(x)=log(1+exp(x)). 5 ops, single exp (broadcast-add the
-// scalar 1 via ggml_add1 instead of fabricating a full ones tensor — was 8 ops / two exp).
-ggml_tensor* mish(ggml_context* c, ggml_tensor* x) {
-  ggml_tensor* sp = ggml_log(c, ggml_add1(c, ggml_exp(c, x), ggml_new_f32(c, 1.0f)));
+// mish = x*tanh(softplus(x)), softplus(x)=log(1+exp(x)). `one` is a scalar [1] tensor (a registered
+// input — ggml_new_f32 writes data and is illegal in the no_alloc graph-build context).
+ggml_tensor* mish(ggml_context* c, ggml_tensor* x, ggml_tensor* one) {
+  ggml_tensor* sp = ggml_log(c, ggml_add1(c, ggml_exp(c, x), one));
   return ggml_mul(c, x, ggml_tanh(c, sp));
 }
 ggml_tensor* msk(ggml_context* c, ggml_tensor* x, ggml_tensor* m) { return m ? ggml_mul(c, x, m) : x; }
@@ -52,6 +54,26 @@ ggml_tensor* MatchaModel::W(const std::string& name) const {
   auto it = w_.find(name);
   if (it == w_.end()) { RS_LOG_ERR("matcha: missing weight %s", name.c_str()); return nullptr; }
   return it->second;
+}
+
+// --- backend-sched input helpers: create a no_alloc graph input + queue its host data ---
+ggml_tensor* MatchaModel::inp_f32(ggml_context* c, int ne0, int ne1, const float* data) {
+  ggml_tensor* t = ne1 > 0 ? ggml_new_tensor_2d(c, GGML_TYPE_F32, ne0, ne1) : ggml_new_tensor_1d(c, GGML_TYPE_F32, ne0);
+  ggml_set_input(t);
+  const uint8_t* p = (const uint8_t*)data;
+  pending_.push_back({t, std::vector<uint8_t>(p, p + ggml_nbytes(t))});
+  return t;
+}
+ggml_tensor* MatchaModel::inp_i32(ggml_context* c, int ne0, const int32_t* data) {
+  ggml_tensor* t = ggml_new_tensor_1d(c, GGML_TYPE_I32, ne0);
+  ggml_set_input(t);
+  const uint8_t* p = (const uint8_t*)data;
+  pending_.push_back({t, std::vector<uint8_t>(p, p + ggml_nbytes(t))});
+  return t;
+}
+void MatchaModel::flush_inputs() {
+  for (auto& pi : pending_) ggml_backend_tensor_set(pi.t, pi.data.data(), 0, pi.data.size());
+  pending_.clear();
 }
 
 // =====================================================================
@@ -136,8 +158,9 @@ ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, flo
   const std::string E = "model.decoder.estimator.";
   auto V = [&](const std::string& s) { return W(E + s); };
   int T2 = (T - 1) / 2 + 1, ylen = cfm_ylen_, YH = (ylen + 1) / 2;
-  auto mk = [&](int n, int valid, float in, float out) { ggml_tensor* m = ggml_new_tensor_1d(c, GGML_TYPE_F32, n); for (int i = 0; i < n; i++) ((float*)m->data)[i] = i < valid ? in : out; return m; };
-  ggml_tensor* mF = mk(T, ylen, 1, 0), *mH = mk(T2, YH, 1, 0);  // mult masks
+  auto mk = [&](int n, int valid) { std::vector<float> v(n); for (int i = 0; i < n; i++) v[i] = i < valid ? 1.0f : 0.0f; return inp_f32(c, n, 0, v.data()); };
+  ggml_tensor* mF = mk(T, ylen), *mH = mk(T2, YH);  // mult masks (registered inputs)
+  const float ONEV = 1.0f; ggml_tensor* one = inp_f32(c, 1, 0, &ONEV);  // scalar for mish softplus
   auto gn8 = [&](ggml_tensor* x, int t, const std::string& aff) {
     ggml_tensor* xr = ggml_norm(c, ggml_reshape_2d(c, ggml_cont(c, x), t * 256 / 8, 8), 1e-5f);
     ggml_tensor* xn = ggml_reshape_2d(c, xr, t, 256);
@@ -145,11 +168,11 @@ ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, flo
   };
   auto resnet = [&](ggml_tensor* x, ggml_tensor* te, const std::string& p, int t, ggml_tensor* mm) {
     auto blk = [&](ggml_tensor* in, const std::string& bp) {
-      return msk(c, mish(c, gn8(conv1d(c, msk(c, in, mm), V(bp + ".block.0.weight"), V(bp + ".block.0.bias"), 1, 1, 256), t, bp + ".block.block.1_2")), mm);
+      return msk(c, mish(c, gn8(conv1d(c, msk(c, in, mm), V(bp + ".block.0.weight"), V(bp + ".block.0.bias"), 1, 1, 256), t, bp + ".block.block.1_2"), one), mm);
     };
     ggml_tensor* h = blk(x, p + ".block1");
     ggml_tensor* mw = ggml_reshape_2d(c, V(p + ".mlp.1.weight"), 1024, 256);
-    ggml_tensor* tc = ggml_add(c, ggml_mul_mat(c, mw, mish(c, te)), r1(c, V(p + ".mlp.1.bias")));
+    ggml_tensor* tc = ggml_add(c, ggml_mul_mat(c, mw, mish(c, te, one)), r1(c, V(p + ".mlp.1.bias")));
     h = ggml_add(c, h, ggml_reshape_2d(c, tc, 1, 256));
     h = blk(h, p + ".block2");
     return ggml_add(c, h, conv1d(c, msk(c, x, mm), V(p + ".res_conv.weight"), V(p + ".res_conv.bias"), 1, 0, 256));
@@ -168,9 +191,10 @@ ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, flo
     xc = ggml_add(c, xc, o);
     ggml_tensor* f = cln(c, xc, V(p + ".norm3.weight"), V(p + ".norm3.bias"));
     f = ggml_add(c, mmT(p + ".ff.net.0.proj_2.weight", f), V(p + ".ff.net.0.proj.bias"));
-    const float* la = (const float*)V(p + ".ff.net.0.alpha")->data, *lb = (const float*)V(p + ".ff.net.0.beta")->data;
-    ggml_tensor* a = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1024), *ib = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1024);
-    for (int i = 0; i < 1024; i++) { ((float*)a->data)[i] = std::exp(la[i]); ((float*)ib->data)[i] = 1.0f / std::exp(lb[i]); }
+    // SnakeBeta in-graph (backend-safe — no host read of weight ->data):
+    //   a = exp(log_alpha);  inv_b = 1/exp(log_beta) = exp(-log_beta)
+    ggml_tensor* a = ggml_exp(c, V(p + ".ff.net.0.alpha"));
+    ggml_tensor* ib = ggml_exp(c, ggml_neg(c, V(p + ".ff.net.0.beta")));
     f = ggml_add(c, f, ggml_mul(c, ggml_sqr(c, ggml_sin(c, ggml_mul(c, f, a))), ib));
     f = ggml_add(c, mmT(p + ".ff.net.2_2.weight", f), V(p + ".ff.net.2.bias"));
     return ggml_cont(c, ggml_transpose(c, ggml_add(c, xc, f)));
@@ -192,13 +216,14 @@ ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, flo
     x = ggml_concat(c, x, skip0, 1);
     x = resnet(x, te, "up_blocks.1.0", T, mF); x = transformer(x, T, "up_blocks.1.1.0");
     x = conv1d(c, msk(c, x, mF), V("up_blocks.1.2.weight"), V("up_blocks.1.2.bias"), 1, 1, 256);
-    x = mish(c, gn8(conv1d(c, msk(c, x, mF), V("final_block.block.0.weight"), V("final_block.block.0.bias"), 1, 1, 256), T, "final_block.block.block.1_2"));
+    x = mish(c, gn8(conv1d(c, msk(c, x, mF), V("final_block.block.0.weight"), V("final_block.block.0.bias"), 1, 1, 256), T, "final_block.block.block.1_2"), one);
     return msk(c, conv1d(c, msk(c, x, mF), V("final_proj.weight"), V("final_proj.bias"), 1, 0, 80), mF);
   };
-  // sinusoidal time-emb (host) -> time_mlp; 3-step Euler ODE
+  // sinusoidal time-emb (host const -> registered input) -> time_mlp; 3-step Euler ODE
   auto temb = [&](float t) {
-    ggml_tensor* e = ggml_new_tensor_1d(c, GGML_TYPE_F32, 160);
-    for (int i = 0; i < 80; i++) { float fr = std::exp(-(float)i * std::log(10000.0f) / 79.0f), an = 1000.0f * t * fr; ((float*)e->data)[i] = std::sin(an); ((float*)e->data)[80 + i] = std::cos(an); }
+    std::vector<float> ev(160);
+    for (int i = 0; i < 80; i++) { float fr = std::exp(-(float)i * std::log(10000.0f) / 79.0f), an = 1000.0f * t * fr; ev[i] = std::sin(an); ev[80 + i] = std::cos(an); }
+    ggml_tensor* e = inp_f32(c, 160, 0, ev.data());
     ggml_tensor* h = ggml_silu(c, ggml_add(c, ggml_mul_mat(c, V("time_mlp.linear_1.weight"), e), r1(c, V("time_mlp.linear_1.bias"))));
     return ggml_add(c, ggml_mul_mat(c, V("time_mlp.linear_2.weight"), h), r1(c, V("time_mlp.linear_2.bias")));
   };
@@ -206,7 +231,8 @@ ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, flo
   const float dt = 1.0f / 3.0f;
   for (int s = 0; s < 3; s++) x = ggml_add(c, x, ggml_scale(c, estimator(x, temb((float)s / 3.0f)), dt));
   ggml_tensor* xl = ggml_cont(c, ggml_view_2d(c, x, ylen, 80, x->nb[1], 0));  // slice to ylen
-  return ggml_add1(c, ggml_scale(c, xl, 5.446792f), ggml_new_f32(c, -2.9521978f));  // [ylen,80] mel
+  const float NEGV = -2.9521978f; ggml_tensor* negsh = inp_f32(c, 1, 0, &NEGV);
+  return ggml_add1(c, ggml_scale(c, xl, 5.446792f), negsh);  // [ylen,80] mel
 }
 
 // =====================================================================
@@ -341,24 +367,29 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   auto pf = [] { return std::chrono::high_resolution_clock::now(); };
   auto pa0 = pf();
 #endif
-  // PHASE A: encoder -> mu[80,L], logw[L]
-  ggml_init_params ipA{ (size_t)256 * 1024 * 1024, nullptr, false };
-  ggml_context* cA = ggml_init(ipA);
-  ggml_tensor* ids = ggml_new_tensor_1d(cA, GGML_TYPE_I32, L);
-  ggml_tensor* cosT = ggml_new_tensor_2d(cA, GGML_TYPE_F32, ROT, L), *sinT = ggml_new_tensor_2d(cA, GGML_TYPE_F32, ROT, L);
-  memcpy(ids->data, st.phoneme_ids.data(), (size_t)L * 4);
-  memcpy(cosT->data, cosv.data(), cosv.size() * 4); memcpy(sinT->data, sinv.data(), sinv.size() * 4);
+  ggml_backend_sched_t sched = rsctx_->sched;
+
+  // PHASE A: encoder -> mu[80,L], logw[L]  (backend-sched path — runs on CPU or CUDA backend)
+  ggml_context* cA = nullptr; ggml_cgraph* gA = nullptr;
+  if (!init_compute_ctx(&cA, &gA, 8192)) return false;
+  pending_.clear();
+  ggml_tensor* ids = inp_i32(cA, L, st.phoneme_ids.data());
+  ggml_tensor* cosT = inp_f32(cA, ROT, L, cosv.data());
+  ggml_tensor* sinT = inp_f32(cA, ROT, L, sinv.data());
   ggml_tensor* logw = nullptr;
   ggml_tensor* mu = build_encoder(cA, ids, L, cosT, sinT, &logw);
-  ggml_cgraph* gA = ggml_new_graph(cA);
+  ggml_set_output(mu); ggml_set_output(logw);
   ggml_build_forward_expand(gA, mu); ggml_build_forward_expand(gA, logw);
-  ggml_graph_compute_with_ctx(cA, gA, 4);
-  std::vector<float> mu_data((size_t)80 * L), logw_data(L);
-  const float* md = (const float*)mu->data;  // mu [80,L] ggml ne0=80 -> (ci,t) at ci+80*t? no: mu is [80,L] ne0=80
-  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < L; t++) mu_data[ci * L + t] = md[t * 80 + ci];
-  const float* ld = (const float*)logw->data;  // [L,1] ne0=L
-  for (int t = 0; t < L; t++) logw_data[t] = ld[t];
+  ggml_backend_sched_reset(sched);
+  if (!ggml_backend_sched_alloc_graph(sched, gA)) { RS_LOG_ERR("matcha: sched alloc A failed"); ggml_free(cA); return false; }
+  flush_inputs();
+  if (ggml_backend_sched_graph_compute(sched, gA) != GGML_STATUS_SUCCESS) { RS_LOG_ERR("matcha: compute A failed"); ggml_free(cA); return false; }
+  std::vector<float> mu_raw((size_t)80 * L), logw_data(L);
+  ggml_backend_tensor_get(mu, mu_raw.data(), 0, ggml_nbytes(mu));
+  ggml_backend_tensor_get(logw, logw_data.data(), 0, ggml_nbytes(logw));
   ggml_free(cA);
+  std::vector<float> mu_data((size_t)80 * L);  // mu_raw is [80,L] ggml (ci+80*t) -> [80,L] numpy (ci*L+t)
+  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < L; t++) mu_data[ci * L + t] = mu_raw[(size_t)t * 80 + ci];
 
   // length regulator (validated rel 0): durations=ceil(exp(logw)); w=durations*length_scale
   std::vector<float> w(L); double ysum = 0;
@@ -372,33 +403,44 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   std::vector<float> muexp((size_t)80 * T, 0.0f);  // [80,T] numpy
   { int i = 0; for (int t = 0; t < T; t++) { while (i < L - 1 && t >= cum[i]) i++; if (t < ylen) for (int ci = 0; ci < 80; ci++) muexp[ci * T + t] = mu_data[ci * L + i]; } }
 
-  // PHASE B: decoder (mu_exp) -> mel -> vocos -> istft
+  // PHASE B: decoder (mu_exp) -> mel -> vocos -> head  (backend-sched path); iSTFT on host
   cfm_ylen_ = ylen;
-  ggml_init_params ipB{ (size_t)6 * 1024 * 1024 * 1024ull, nullptr, false };
-  ggml_context* cB = ggml_init(ipB);
-  ggml_tensor* muexp_t = ggml_new_tensor_2d(cB, GGML_TYPE_F32, T, 80);  // [T,80] ggml == [80,T] numpy
-  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < T; t++) ((float*)muexp_t->data)[t + (size_t)T * ci] = muexp[ci * T + t];
+  std::vector<float> me((size_t)T * 80);  // muexp in [T,80] ggml layout (t + T*ci)
+  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < T; t++) me[(size_t)t + (size_t)T * ci] = muexp[(size_t)ci * T + t];
 #ifdef MATCHA_PROFILE
   auto pb0 = pf();
 #endif
+  ggml_context* cB = nullptr; ggml_cgraph* gB = nullptr;
+  if (!init_compute_ctx(&cB, &gB, 65536)) return false;
+  pending_.clear();
+  ggml_tensor* muexp_t = inp_f32(cB, T, 80, me.data());
   ggml_tensor* mel = build_cfm(cB, muexp_t, T, st.noise_scale);   // [ylen,80]
   ggml_tensor* head = build_vocos(cB, mel, ylen);                 // [514,ylen]
-  ggml_cgraph* gB = ggml_new_graph_custom(cB, 131072, false);
+  ggml_set_output(head);
   ggml_build_forward_expand(gB, head);
+  ggml_backend_sched_reset(sched);
 #ifdef MATCHA_PROFILE
-  auto p0 = pf(); ggml_graph_compute_with_ctx(cB, gB, 4); auto p1 = pf();
-  st.audio_output = istft((const float*)head->data, ylen); auto p2 = pf();
+  auto p0 = pf();
+#endif
+  if (!ggml_backend_sched_alloc_graph(sched, gB)) { RS_LOG_ERR("matcha: sched alloc B failed"); ggml_free(cB); return false; }
+  flush_inputs();
+  if (ggml_backend_sched_graph_compute(sched, gB) != GGML_STATUS_SUCCESS) { RS_LOG_ERR("matcha: compute B failed"); ggml_free(cB); return false; }
+#ifdef MATCHA_PROFILE
+  auto p1 = pf();
+#endif
+  std::vector<float> head_raw((size_t)514 * ylen);
+  ggml_backend_tensor_get(head, head_raw.data(), 0, ggml_nbytes(head));
+  ggml_free(cB);
+  st.audio_output = istft(head_raw.data(), ylen);
+  st.audio_read_cursor = 0;
+#ifdef MATCHA_PROFILE
+  auto p2 = pf();
   RS_LOG_INFO("matcha PROFILE: phaseA(enc)=%.1fms  decBuild=%.1fms  decCompute=%.1fms  istft=%.1fms",
               std::chrono::duration<double, std::milli>(pb0 - pa0).count(),
               std::chrono::duration<double, std::milli>(p0 - pb0).count(),
               std::chrono::duration<double, std::milli>(p1 - p0).count(),
               std::chrono::duration<double, std::milli>(p2 - p1).count());
-#else
-  ggml_graph_compute_with_ctx(cB, gB, 4);
-  st.audio_output = istft((const float*)head->data, ylen);
 #endif
-  st.audio_read_cursor = 0;
-  ggml_free(cB);
   RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs), ylen=%d", st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate, ylen);
   return true;
 }
