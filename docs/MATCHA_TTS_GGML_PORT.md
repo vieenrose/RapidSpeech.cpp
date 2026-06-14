@@ -77,9 +77,20 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   cos/sin tables are **shared across all 6 layers** (reused the layer-0 baked table → exact). So the
   entire **text → (μ, durations)** path is done.
 - **Length regulator** — expand μ by ceil(exp(logw)·length_scale) durations (control logic). TODO.
-- **CFM decoder** (**2977 nodes — the remaining bulk**) — a 1-D UNet (down/mid/up ResnetBlock1D with
-  time-MLP conditioning + Snake-activation transformer blocks `alpha`/`beta`, InstanceNorm, down/up
-  sample) solved with **3 Euler ODE steps** from `RandomNormalLike` seed noise × `noise_scale`.
+- **CFM decoder** (**2977 nodes — the remaining bulk**) — fully mapped, sub-blocks below. A 1-D UNet
+  `estimator(x_t, μ, t)` → vector field, solved with **3 Euler ODE steps** from `RandomNormalLike`
+  seed × `noise_scale`. Structure (hidden 256):
+  - **time embedding**: SinusoidalPosEmb(t) → `time_mlp` linear_1 (→1024) → SiLU (Sigmoid·Mul) →
+    linear_2 (1024→1024).
+  - **ResnetBlock1D** (`block1`/`block2` = Conv1d k3 → **GroupNorm** (done as reshape→InstanceNorm→
+    per-group affine) → **Mish** `x·tanh(softplus(x))`); time cond via `mlp` (256←1024) added between
+    blocks; `res_conv` k1 skip. Input to first = concat(x_t, μ) → 160 ch.
+  - **BasicTransformerBlock** (`norm1`→ self-attn `attn1` to_q/k/v/out → `norm3`→ FF: `net.0` =
+    SnakeBeta + proj(256→1024), `net.2` = linear(1024→256)). **SnakeBeta confirmed (numpy)**:
+    `x + sin²(exp(log_alpha)·x) / exp(log_beta)` (alpha/beta stored in log space). ggml validator
+    `matcha_snake_validate.cpp` (formula correct; a broadcast-div plumbing segfault on the old gguf-
+    container ggml CPU build remains to resolve — low-risk, the math is verified).
+  - **down/up sample** (Conv k3 stride 2 / transpose), `final_block` + `final_proj` (256→80).
 
 This is genuinely a ~2k-line arch (≈ `openvoice2.cpp`), with the rel-pos attention, the
 Constant-folded norms, and the 3-step CFM ODE solver as the intricate pieces. It is **multi-session
