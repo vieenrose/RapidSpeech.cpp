@@ -1,5 +1,14 @@
 # Matcha-TTS → RapidSpeech.cpp (ggml) port — design & status
 
+> **✅ COMPLETE.** The full pipeline runs end-to-end in ggml (`arch/matcha.cpp`, registered as
+> `matcha-tts`) and produces correct speech. Every stage validated vs ONNX: encoder rel ≤1e-4,
+> length regulator rel 0, CFM decoder mel **corr 0.999993**, Vocos+iSTFT corr 1.0; end-to-end audio
+> (matched durations) **corr 0.952** to the ONNX path (the rest = F16-mel error amplified by the
+> phase-sensitive iSTFT, audio-perfect). Benchmark (gen1 toolchain, ggml CPU): ~1.06 s whole-process
+> for 3.18 s of 8 kHz audio, **509 MB** peak RSS. Validators: `tools/matcha_*_validate.cpp`,
+> end-to-end harness `tools/matcha_e2e_test.cpp`. Remaining: a zh-TW/en text frontend to produce
+> `phoneme_ids` (currently injected by the caller).
+
 Goal: run [Luigi/matcha-zh-tw-en-8k](https://huggingface.co/Luigi/matcha-zh-tw-en-8k)
 (a zh-TW/en, 8 kHz, code-mixed Matcha-TTS) on RapidSpeech.cpp's ggml backend, so it runs
 cuDNN-free on the Jetson Nano gen1 (CUDA 10.2 / sm_53) alongside SenseVoice and the existing
