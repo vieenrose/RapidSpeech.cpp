@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#include <chrono>
 
 static void write_wav(const char* path, const float* x, int n, int sr) {
   std::vector<int16_t> pcm(n);
@@ -33,7 +34,18 @@ int main(int argc, char** argv) {
   ms->phoneme_ids = { 1, 5, 10, 20, 3, 7, 15, 2, 8, 40, 6, 0 };
   ms->noise_scale = 0.0f;
   ms->length_scale = 1.0f;
-  if (!ctx->model->PushText(*state, "", nullptr, nullptr)) { printf("PushText failed\n"); return 1; }
+  // warm-synth timing: PushText is the full synthesis (encoder+length-reg+decoder+vocos+istft)
+  auto clk = [] { return std::chrono::high_resolution_clock::now(); };
+  double best = 1e9;
+  for (int it = 0; it < 4; it++) {
+    auto t0 = clk();
+    if (!ctx->model->PushText(*state, "", nullptr, nullptr)) { printf("PushText failed\n"); return 1; }
+    double el = std::chrono::duration<double, std::milli>(clk() - t0).count();
+    printf("  synth iter%d = %.1f ms\n", it, el);
+    if (it > 0 && el < best) best = el;  // skip iter0 (first-touch), keep best warm
+    ms->audio_read_cursor = 0;  // reset so GetAudioOutput re-reads
+  }
+  printf("warm synth (best of 3) = %.1f ms\n", best);
   float* data = nullptr;
   int n = ctx->model->GetAudioOutput(*state, &data);
   printf("audio samples=%d (%.3fs @8k)\n", n, n / 8000.0f);

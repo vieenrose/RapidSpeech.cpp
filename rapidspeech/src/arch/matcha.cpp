@@ -23,6 +23,8 @@
 #include <cstring>
 #include <vector>
 #include <cstdlib>
+#include <chrono>
+#include <utility>
 
 namespace {
 constexpr float PI = 3.14159265358979323846f;
@@ -240,26 +242,55 @@ ggml_tensor* MatchaModel::build_vocos(ggml_context* c, ggml_tensor* mel, int T) 
   return lin(h, V("head.weight"), V("head.bias"), 514);
 }
 
-// iSTFT (validated corr 1.0): head[514,T] -> waveform
+namespace {
+// in-place iterative radix-2 FFT (n = power of 2). sign=-1 forward, +1 inverse (no 1/N scaling).
+void fft_radix2(std::vector<double>& re, std::vector<double>& im, int n, int sign) {
+  for (int i = 1, j = 0; i < n; i++) {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+  }
+  for (int len = 2; len <= n; len <<= 1) {
+    double ang = sign * 2.0 * PI / len, wr = std::cos(ang), wi = std::sin(ang);
+    for (int i = 0; i < n; i += len) {
+      double cr = 1.0, ci = 0.0;
+      for (int j = 0; j < len / 2; j++) {
+        double a = re[i + j], b = im[i + j];
+        double vr = re[i + j + len / 2] * cr - im[i + j + len / 2] * ci;
+        double vi = re[i + j + len / 2] * ci + im[i + j + len / 2] * cr;
+        re[i + j] = a + vr; im[i + j] = b + vi;
+        re[i + j + len / 2] = a - vr; im[i + j + len / 2] = b - vi;
+        double nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+}
+}  // namespace
+
+// iSTFT (validated corr 1.0): head[514,T] -> waveform.
+// Per frame: build the conjugate-symmetric 512-pt spectrum from mag/phase, irfft via one radix-2
+// IFFT (O(N log N), was O(N^2) DFT — the dominant cost), overlap-add with window-sum normalization.
 std::vector<float> MatchaModel::istft(const float* od, int T) const {
   const int NFFT = hp_.n_fft, HOP = hp_.hop_length, BINS = NFFT / 2 + 1;
   std::vector<float> win(NFFT);
   for (int n = 0; n < NFFT; n++) win[n] = 0.5f - 0.5f * std::cos(2.0 * PI * n / NFFT);
   int Lp = (T - 1) * HOP + NFFT;
-  std::vector<double> out(Lp, 0.0), wsum(Lp, 0.0), frame(NFFT);
-  const double w = 2.0 * PI / NFFT;
+  std::vector<double> out(Lp, 0.0), wsum(Lp, 0.0);
+  std::vector<double> re(NFFT), im(NFFT);
   for (int f = 0; f < T; f++) {
-    for (int n = 0; n < NFFT; n++) {
-      double acc = 0.0;
-      for (int k = 0; k < BINS; k++) {
-        float mlog = od[f * 514 + k]; if (mlog > 9.0f) mlog = 9.0f;
-        double mag = std::exp(mlog), ph = od[f * 514 + BINS + k];
-        double coef = (k == 0 || k == NFFT / 2) ? 1.0 : 2.0, ang = w * k * n;
-        acc += coef * (mag * std::cos(ph) * std::cos(ang) - mag * std::sin(ph) * std::sin(ang));
-      }
-      frame[n] = acc / NFFT;
+    // build full-length conjugate-symmetric spectrum from the one-sided bins
+    for (int k = 0; k < BINS; k++) {
+      float mlog = od[f * 514 + k]; if (mlog > 9.0f) mlog = 9.0f;
+      double mag = std::exp((double)mlog), ph = od[f * 514 + BINS + k];
+      re[k] = mag * std::cos(ph); im[k] = mag * std::sin(ph);
     }
-    for (int n = 0; n < NFFT; n++) { out[f * HOP + n] += frame[n] * win[n]; wsum[f * HOP + n] += (double)win[n] * win[n]; }
+    for (int k = BINS; k < NFFT; k++) { re[k] = re[NFFT - k]; im[k] = -im[NFFT - k]; }  // Hermitian
+    fft_radix2(re, im, NFFT, +1);  // inverse transform; real part / N is the time-domain frame
+    for (int n = 0; n < NFFT; n++) {
+      double v = re[n] / NFFT;
+      out[f * HOP + n] += v * win[n]; wsum[f * HOP + n] += (double)win[n] * win[n];
+    }
   }
   int wavn = Lp - NFFT, start = NFFT / 2;
   std::vector<float> wav(wavn);
@@ -346,8 +377,17 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   ggml_tensor* head = build_vocos(cB, mel, ylen);                 // [514,ylen]
   ggml_cgraph* gB = ggml_new_graph_custom(cB, 131072, false);
   ggml_build_forward_expand(gB, head);
+#ifdef MATCHA_PROFILE
+  auto pf = [] { return std::chrono::high_resolution_clock::now(); };
+  auto p0 = pf(); ggml_graph_compute_with_ctx(cB, gB, 4); auto p1 = pf();
+  st.audio_output = istft((const float*)head->data, ylen); auto p2 = pf();
+  RS_LOG_INFO("matcha PROFILE: decoder+vocos graph=%.1fms  istft=%.1fms",
+              std::chrono::duration<double, std::milli>(p1 - p0).count(),
+              std::chrono::duration<double, std::milli>(p2 - p1).count());
+#else
   ggml_graph_compute_with_ctx(cB, gB, 4);
   st.audio_output = istft((const float*)head->data, ylen);
+#endif
   st.audio_read_cursor = 0;
   ggml_free(cB);
   RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs), ylen=%d", st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate, ylen);
