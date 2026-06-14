@@ -27,11 +27,33 @@ import gguf
 ARCH = "matcha-tts"
 
 
-def load_inits(path):
+def semantic_rename_map(graph, prefix):
+    """ONNX exporters fold Linear/MatMul weights into anonymous `onnx::MatMul_*`
+    initializers. Recover a semantic name from the consuming node's path, e.g.
+    node `/blocks.0/pw1/MatMul` consuming `onnx::MatMul_284` -> `<prefix>.blocks.0.pw1.weight`.
+    Returns {init_name: semantic_name} for every anonymous initializer."""
+    inits = {i.name for i in graph.initializer}
+    ren = {}
+    for nd in graph.node:
+        for inp in nd.input:
+            if inp in inits and inp.startswith("onnx::") and inp not in ren:
+                path = nd.name.strip("/").split("/")
+                if path and path[-1] in ("MatMul", "Gemm", "Conv", "Add", "Mul"):
+                    path = path[:-1]
+                if path:
+                    ren[inp] = f"{prefix}.{'.'.join(path)}.weight"
+    return ren
+
+
+def load_inits(path, prefix):
     m = onnx.load(path)
     meta = {kv.key: kv.value for kv in m.metadata_props}
-    tensors = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
-    return tensors, meta
+    ren = semantic_rename_map(m.graph, prefix)
+    tensors = {}
+    for i in m.graph.initializer:
+        name = ren.get(i.name, i.name)
+        tensors[name] = numpy_helper.to_array(i)
+    return tensors, meta, len(ren)
 
 
 def main(src_dir, dst):
@@ -39,17 +61,13 @@ def main(src_dir, dst):
     vocos = sorted(glob.glob(os.path.join(src_dir, "vocos-*.onnx")))
     if not acoustic or not vocos:
         sys.exit(f"need model-steps-*.onnx and vocos-*.onnx in {src_dir}")
-    a_t, meta = load_inits(acoustic[0])
-    v_t, _ = load_inits(vocos[0])
-    # vocos weights are namespaced `voc.*`; acoustic `model.*` — disjoint, but prefix
-    # the anonymous onnx::* constants per-graph to avoid collisions.
-    def norm(name, ns):
-        return name if (name.startswith("model.") or name.startswith("voc.")) else f"{ns}.{name}"
+    a_t, meta, a_ren = load_inits(acoustic[0], "model")
+    v_t, _, v_ren = load_inits(vocos[0], "voc")
+    print(f"semantic-renamed anonymous weights: acoustic {a_ren}, vocos {v_ren}")
+    # acoustic weights namespaced `model.*`, vocos `voc.*` — disjoint.
     tensors = {}
-    for n, arr in a_t.items():
-        tensors[norm(n, "acoustic")] = arr
-    for n, arr in v_t.items():
-        tensors[norm(n, "vocos")] = arr
+    tensors.update(a_t)
+    tensors.update(v_t)
 
     w = gguf.GGUFWriter(dst, ARCH)
     # hyper-parameters from the acoustic model card

@@ -21,10 +21,19 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
 
 ## Milestones
 1. **onnx→gguf converter** ✅ DONE — `scripts/convert_matcha_onnx_to_gguf.py`. Extracts all
-   385 weights keyed by original ONNX names + the model-card hparams into one gguf;
-   round-trip-validated (gguf bytes == onnx, PASS). Produces `matcha8k.gguf` (~104 MB f32).
-2. **gguf loader + hparams** — map the 385 tensors into a `MatchaModel` (encoder / dur-pred /
-   CFM / vocos sub-modules). TODO.
+   385 weights into one gguf + model-card hparams; round-trip-validated (gguf == onnx, PASS;
+   ~104 MB f32). ONNX folds Linear weights into anonymous `onnx::MatMul_*` initializers, so the
+   converter **traces the graph and gives them semantic names** (97 acoustic + 17 vocos resolved,
+   e.g. `/blocks.0/pw1/MatMul`'s weight → `voc.blocks.0.pw1.weight`) — makes the gguf self-describing.
+2. **Vocos vocoder (ggml) — IN PROGRESS** — `tools/matcha_vocos_validate.cpp` is a standalone CPU
+   validator: loads the gguf vocos weights, builds the ConvNeXt graph (conv_pre → norm_in → 8×
+   {dw-conv → LN → pw1 → GELU → pw2 → ×gamma → residual} → norm_out → head), runs on the reference
+   mel fixture (`scripts/gen_vocos_fixture.py`) and compares the magnitude output to ONNX.
+   **Status: compiles + runs (harness proven), numeric match NOT yet achieved** (rel err ~1.35 —
+   layout/interpretation bugs to debug: per-op ggml `ne` orientation, the head mag/phase split,
+   GELU/eps). Layout reference captured in the source header. Next: dump per-layer intermediates
+   vs ONNX to localize the mismatch, then wire the validated graph + iSTFT (reuse `cosyvoice3_hift`).
+3. **gguf loader + hparams** — map tensors into a `MatchaModel` (encoder / dur-pred / CFM / vocos). TODO.
 3. **Text frontend** — the bundle ships `tokens.txt` + `lexicon.txt` + jieba/espeak data +
    rule FSTs; reuse RapidSpeech's existing TTS frontend plumbing where possible. TODO.
 4. **Forward graph (ggml)** — encoder → duration/length-regulate → CFM ODE loop (3 steps) →
