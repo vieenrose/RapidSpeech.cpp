@@ -25,14 +25,14 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
    ~104 MB f32). ONNX folds Linear weights into anonymous `onnx::MatMul_*` initializers, so the
    converter **traces the graph and gives them semantic names** (97 acoustic + 17 vocos resolved,
    e.g. `/blocks.0/pw1/MatMul`'s weight → `voc.blocks.0.pw1.weight`) — makes the gguf self-describing.
-2. **Vocos vocoder (ggml) — IN PROGRESS** — `tools/matcha_vocos_validate.cpp` is a standalone CPU
-   validator: loads the gguf vocos weights, builds the ConvNeXt graph (conv_pre → norm_in → 8×
-   {dw-conv → LN → pw1 → GELU → pw2 → ×gamma → residual} → norm_out → head), runs on the reference
-   mel fixture (`scripts/gen_vocos_fixture.py`) and compares the magnitude output to ONNX.
-   **Status: compiles + runs (harness proven), numeric match NOT yet achieved** (rel err ~1.35 —
-   layout/interpretation bugs to debug: per-op ggml `ne` orientation, the head mag/phase split,
-   GELU/eps). Layout reference captured in the source header. Next: dump per-layer intermediates
-   vs ONNX to localize the mismatch, then wire the validated graph + iSTFT (reuse `cosyvoice3_hift`).
+2. **Vocos vocoder (ggml) — ✅ DONE & VALIDATED** — `tools/matcha_vocos_validate.cpp` builds the
+   ConvNeXt graph (conv_pre → norm_in → 8× {dw-conv → LN → pw1 → GELU → pw2 → ×gamma → residual}
+   → norm_out → head) and matches the ONNX reference (`scripts/gen_vocos_fixture.py`) to
+   **rel 3e-4 — F16 conv-kernel precision** (conv_pre, block0, and final magnitude all checked).
+   The one bug was an input-layout slip: ggml conv data `[L,IC]` (element `(l,ic)` at `ic*L+l`)
+   equals the ONNX `[80,T]` mel buffer directly — no transpose. Linear weights are numpy `[in,out]`
+   → ggml `ne=[out,in]`, transposed before `mul_mat`. The iSTFT tail (mag/phase → waveform) is
+   separate DSP to wire from `cosyvoice3_hift` (n_fft=512).
 3. **gguf loader + hparams** — map tensors into a `MatchaModel` (encoder / dur-pred / CFM / vocos). TODO.
 3. **Text frontend** — the bundle ships `tokens.txt` + `lexicon.txt` + jieba/espeak data +
    rule FSTs; reuse RapidSpeech's existing TTS frontend plumbing where possible. TODO.

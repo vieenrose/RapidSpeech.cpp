@@ -79,11 +79,13 @@ int main(int argc, char** argv) {
   // conv_pre: [T,80] -> [T,384]
   ggml_tensor* h = ggml_conv_1d(ctx, f16(V("voc.conv_pre.weight")), mel, 1, 3, 1);
   h = ggml_add(ctx, h, ggml_reshape_2d(ctx, V("voc.conv_pre.bias"), 1, C));
+  ggml_tensor* dbg_convpre = ggml_cont(ctx, ggml_transpose(ctx, h));  // [384,T] for compare
   // norm_in over channels: need [C,T]
   h = ggml_cont(ctx, ggml_transpose(ctx, h));                   // [384,T]
   h = ln(h, V("voc.norm_in.weight"), V("voc.norm_in.bias"));
   h = ggml_cont(ctx, ggml_transpose(ctx, h));                   // [T,384]
 
+  ggml_tensor* dbg_block0 = nullptr;
   for (int i = 0; i < NB; i++) {
     std::string b = "voc.blocks." + std::to_string(i) + ".";
     ggml_tensor* res = h;
@@ -97,6 +99,7 @@ int main(int argc, char** argv) {
     x = ggml_mul(ctx, x, V(b + "gamma"));                       // per-channel
     x = ggml_cont(ctx, ggml_transpose(ctx, x));                 // [T,384]
     h = ggml_add(ctx, x, res);
+    if (i == 0) dbg_block0 = ggml_cont(ctx, ggml_transpose(ctx, h)); // [384,T]
   }
   h = ggml_cont(ctx, ggml_transpose(ctx, h));                   // [384,T]
   h = ln(h, V("voc.norm_out.weight"), V("voc.norm_out.bias"));
@@ -104,13 +107,23 @@ int main(int argc, char** argv) {
 
   ggml_cgraph* gf = ggml_new_graph(ctx);
   ggml_build_forward_expand(gf, o);
+  ggml_build_forward_expand(gf, dbg_convpre);
+  ggml_build_forward_expand(gf, dbg_block0);
 
-  std::vector<float> melv = read_f32(argv[2]);  // [80,T] row-major
-  std::vector<float> melT((size_t)T * 80);
-  for (int c = 0; c < 80; c++) for (int tt = 0; tt < T; tt++) melT[tt * 80 + c] = melv[c * T + tt];
-  memcpy(mel->data, melT.data(), melT.size() * 4);
+  // mel tensor is [L=T, IC=80] (ne0=T): element (l,ic) at ic*T+l — exactly the ONNX
+  // [80,T] row-major buffer (ic*T+l), so copy it in directly (no transpose).
+  std::vector<float> melv = read_f32(argv[2]);  // ONNX [1,80,T] row-major
+  memcpy(mel->data, melv.data(), melv.size() * 4);
 
   ggml_graph_compute_with_ctx(ctx, gf, 4);
+
+  // dump intermediates in [C,T] ggml layout (ne0=C, element (c,t) at t*C+c)
+  auto dump = [&](const char* path, ggml_tensor* t) {
+    FILE* f = fopen(path, "wb"); fwrite(t->data, 4, ggml_nelements(t), f); fclose(f);
+    printf("  dumped %s ne=[%lld,%lld]\n", path, (long long)t->ne[0], (long long)t->ne[1]);
+  };
+  dump("/work/gg_convpre.f32", dbg_convpre);
+  dump("/work/gg_block0.f32", dbg_block0);
 
   std::vector<float> ref = read_f32(argv[3]);  // mag [257,T]
   const float* od = (const float*)o->data;     // [514,T] ne0=514
