@@ -3,8 +3,9 @@
 > **✅ COMPLETE + OPTIMIZED.** The full pipeline runs end-to-end in ggml (`arch/matcha.cpp`, registered
 > as `matcha-tts`) and produces correct speech. Every stage validated vs ONNX: encoder rel ≤1e-4,
 > length regulator rel 0, CFM decoder mel **corr 0.999993**, Vocos+iSTFT corr 1.0; end-to-end audio
-> (matched durations) **corr 0.952** to the ONNX path. Benchmark (gen1 toolchain, ggml CPU, 4 threads):
-> **warm synth 239 ms** for 3.18 s of 8 kHz audio (**RTF 0.075**), **493 MB** peak RSS. Validators:
+> (matched durations) **corr 0.952** to the ONNX path. Runs on **CPU or CUDA** (backend-sched). Warm
+> synth for 3.18 s of 8 kHz audio (GB10): **CPU 113 ms** (RTF 0.036, 493 MB) / **CUDA 36 ms** (RTF 0.011,
+> + ~57 s one-time sm_53→sm_121 JIT) — opt into CUDA with `MATCHA_USE_CUDA=1`. Validators:
 > `tools/matcha_*_validate.cpp`, e2e harness `tools/matcha_e2e_test.cpp`. Remaining: a zh-TW/en text
 > frontend to produce `phoneme_ids` (currently caller-injected).
 
@@ -19,18 +20,37 @@ A spec-extract + adversarial-verify Workflow plus direct profiling drove the opt
   ~186 ms** (the genuine UNet×3-ODE + 8 ConvNeXt FLOPs), iSTFT ~1.8 ms. The remaining cost is real
   model compute, reducible only by GPU or fewer ODE steps.
 
-### Why CPU, not CUDA — a structural verdict (verified)
-The optimization research **confirmed CUDA is a dead-end for this model on the Nano gen1**, so closing
-the gap meant optimizing the CPU path:
-- **CUDA graphs are gated on `cc ≥ GGML_CUDA_CC_AMPERE (800)`** in this ggml (`ggml-cuda.cu`); the Nano
-  is **sm_53 (cc 530)**, so cuda-graph capture/replay is unavailable — every kernel is launched
-  individually. For a fine-grained, launch-bound CFM graph (hundreds of small ops × 3 ODE steps) that
-  is exactly the worst case, and it's *why* sherpa-onnx/ORT (which runs the whole acoustic model as one
-  optimized CUDA graph) is faster — a structural advantage ggml-on-sm_53 cannot replicate.
-- On the GB10 dev box the CUDA path additionally JIT-stalls (sm_53 PTX → sm_121 SASS for every kernel).
-- So `rs_context` routes `matcha-tts` to CPU. On the real Nano the iSTFT FFT win still applies (it's
-  architecture-independent), though the ~186 ms decoder compute will be slower on the A57 than on GB10
-  cores — measure on device.
+### CUDA — now supported (backend-sched refactor)
+`PushText` originally used `ggml_graph_compute_with_ctx` (the **CPU-only** legacy compute) with two
+6 GB no-data contexts and raw host `->data` writes, so it could *never* run on a GPU backend. It was
+**refactored to the backend-agnostic `ggml_backend_sched` path** (`init_compute_ctx` no_alloc graph →
+`ggml_set_input` → `ggml_backend_sched_alloc_graph` → flush registered host inputs via
+`ggml_backend_tensor_set` → `ggml_backend_sched_graph_compute` → `ggml_backend_tensor_get`). Host-coupled
+data (masks, sinusoid time-emb, mu_expanded, the mish/affine scalar consts) became **registered inputs**
+(openvoice2 pending-inputs pattern); SnakeBeta `exp(α)`/`exp(−β)` moved **in-graph** (backend-safe).
+
+`matcha-tts` now runs on whatever backend `rs_context` picks. Default stays CPU on the gen1; **opt into
+CUDA with `MATCHA_USE_CUDA=1`**. Measured (GB10, warm, RTF for 3.18 s of audio):
+
+| Path | Warm synth | RTF | Notes |
+|---|---|---|---|
+| old CPU (`graph_compute_with_ctx`) | 239 ms | 0.075 | pre-refactor |
+| **new CPU (sched)** | **113 ms** | **0.036** | **2× faster** — drops the 6 GB per-call ctx for sched buffers |
+| **new CUDA (sched)** | **36 ms** | **0.011** | + **~57 s one-time JIT** (sm_53 PTX→sm_121 on the GB10) |
+
+Audio correct on every path: CPU-sched vs pre-refactor **corr 0.99999**; CUDA vs CPU **corr 0.996** (the
+small decorrelation is CUDA-vs-CPU float reduction order amplified by the phase-sensitive iSTFT).
+
+**Refined Nano-gen1 verdict.** The earlier "CUDA is a dead-end" call was about *the Nano specifically*,
+and that nuance stands: **CUDA graphs are gated on `cc ≥ 800` (Ampere)** in this ggml, and the Nano is
+**sm_53**, so on the Nano every kernel launches individually — a launch-bound CFM graph on weak Maxwell
+may still lose to the A57 CPU (untested on device). The GB10 36 ms shows the *code* works and is fast on
+a big GPU, but the GB10 is Blackwell, not the Nano. Honest split:
+- **The port is now CUDA-capable and validated** (corr 0.996) — no longer CPU-only.
+- **On a real Nano gen1**: no JIT (native sm_53 SASS) so it runs on CUDA immediately, but whether CUDA
+  beats the now-113 ms CPU path is an open hardware question.
+- **On Ampere+ (Orin)**: cuda-graphs *do* engage (cc ≥ 800) — that's where ggml-CUDA Matcha should win.
+- So `rs_context` keeps CPU as the gen1 default (safe, fast, no JIT), with CUDA one env-var away.
 
 ### Future work (documented, not done — would risk the validated numerics for ~10–20 ms)
 - Reduce the 48 `ggml_cont` + 21 `ggml_transpose` at the conv `[T,C]` ↔ transformer `[C,T]` layout
