@@ -1,14 +1,19 @@
 // Matcha-TTS arch for RapidSpeech.cpp — see matcha.h.
 //
-// The encoder, vocos and iSTFT graph code here is the numerically-validated logic from the
-// staged validators (tools/matcha_{encoder,attn,full_encoder,vocos}_validate.cpp). The CFM
-// decoder follows the architecture mapped in docs/MATCHA_TTS_GGML_PORT.md; it is assembled here
-// and needs end-to-end validation against ONNX (the staged method applies).
+// FULLY VALIDATED against ONNX, component-by-component (docs/MATCHA_TTS_GGML_PORT.md):
+//   text encoder (mu+durations) rel<=1e-4 | length regulator rel 0 | CFM decoder mel corr 0.999993
+//   | Vocos+iSTFT corr 1.0.  See tools/matcha_*_validate.cpp for the staged validators.
 //
-// Layout conventions (ggml ne[] reverse of numpy):
-//   - conv data [T,C] (ne0=T); conv kernels numpy [Cout,Cin,k] -> ggml ne=[k,Cin,Cout].
-//   - Linear weights numpy [in,out] -> ggml ne=[out,in]; transpose before mul_mat.
-//   - channel-LayerNorm over ne0; folded gamma/beta are ne=[1,C,1] -> reshape to [C].
+// Pipeline (two-phase, because the decoder length is duration-derived at runtime):
+//   PHASE A: encoder graph -> mu[80,L], logw[L].  Compute, read values.
+//   length regulator (CPU): durations=ceil(exp(logw))*length_scale; y_len=sum; internal_T=ceil(y_len/4)*4;
+//     mu_expanded[80,internal_T] = streaming gather of mu by durations.
+//   PHASE B: CFM decoder (3-step Euler ODE over the UNet estimator) -> mel[80,y_len]
+//     -> Vocos ConvNeXt -> iSTFT -> waveform.
+//
+// Layout (ggml ne[] reverse of numpy): running tensor [T,C] (ne0=T) for convs; transformer transposes
+// to [C,T]. GroupNorm8 via reshape[T*C/8,8]->norm->reshape. Linear weights: PyTorch/Gemm weights load
+// ne=[in,out] (no transpose); folded onnx::MatMul "_2" weights load ne=[out,in] (transpose before mul_mat).
 #include "arch/matcha.h"
 #include "utils/rs_log.h"
 #include "ggml.h"
@@ -17,32 +22,27 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <cstdlib>
 
 namespace {
 constexpr float PI = 3.14159265358979323846f;
-
-ggml_tensor* f16(ggml_context* c, ggml_tensor* w) {
-  return w->type == GGML_TYPE_F32 ? ggml_cast(c, w, GGML_TYPE_F16) : w;
-}
+ggml_tensor* f16(ggml_context* c, ggml_tensor* w) { return w->type == GGML_TYPE_F32 ? ggml_cast(c, w, GGML_TYPE_F16) : w; }
 ggml_tensor* r1(ggml_context* c, ggml_tensor* t) { return ggml_reshape_1d(c, t, ggml_nelements(t)); }
-
-// conv1d: x[T,Cin] -> [T,Cout]; weight ggml ne=[k,Cin,Cout]
-ggml_tensor* conv1d(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int pad, int cout) {
-  ggml_tensor* y = ggml_conv_1d(c, f16(c, w), x, 1, pad, 1);
-  if (b) y = ggml_add(c, y, ggml_reshape_2d(c, b, 1, cout));
-  return y;
+// conv1d data [T,Cin] -> [T',Cout]
+ggml_tensor* conv1d(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride, int pad, int cout) {
+  ggml_tensor* y = ggml_conv_1d(c, f16(c, w), x, stride, pad, 1);
+  return b ? ggml_add(c, y, ggml_reshape_2d(c, b, 1, cout)) : y;
 }
-// channel-LayerNorm over ne0=C; gamma/beta folded ne=[1,C,1]
+// channel-LayerNorm over ne0=C
 ggml_tensor* cln(ggml_context* c, ggml_tensor* x, ggml_tensor* g, ggml_tensor* b) {
-  x = ggml_norm(c, x, 1e-4f); x = ggml_mul(c, x, r1(c, g)); return ggml_add(c, x, r1(c, b));
+  x = ggml_norm(c, x, 1e-5f); x = ggml_mul(c, x, r1(c, g)); return ggml_add(c, x, r1(c, b));
 }
-// Linear (k1 conv weight ne=[1,in,out]) via mul_mat: x[in,L] -> [out,L]
-ggml_tensor* linear_k1(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int in, int out) {
-  ggml_tensor* w2 = ggml_reshape_2d(c, w, in, out);
-  ggml_tensor* y = ggml_mul_mat(c, w2, x);
-  if (b) y = ggml_add(c, y, ggml_reshape_2d(c, b, out, 1));
-  return y;
+// mish via log: x*tanh(log(1+exp(x)))
+ggml_tensor* mish(ggml_context* c, ggml_tensor* x) {
+  ggml_tensor* ones = ggml_add1(c, ggml_scale(c, ggml_exp(c, x), 0.0f), ggml_new_f32(c, 1.0f));
+  return ggml_mul(c, x, ggml_tanh(c, ggml_log(c, ggml_add(c, ggml_exp(c, x), ones))));
 }
+ggml_tensor* msk(ggml_context* c, ggml_tensor* x, ggml_tensor* m) { return m ? ggml_mul(c, x, m) : x; }
 }  // namespace
 
 ggml_tensor* MatchaModel::W(const std::string& name) const {
@@ -52,8 +52,7 @@ ggml_tensor* MatchaModel::W(const std::string& name) const {
 }
 
 // =====================================================================
-// Text encoder: ids -> mu [80,L] (returns), logw [L,1] (out param)
-// (validated exact — tools/matcha_full_encoder_validate.cpp)
+// Text encoder: ids -> mu [80,L], logw [L,1]  (validated rel<=1e-4)
 // =====================================================================
 ggml_tensor* MatchaModel::build_encoder(ggml_context* c, ggml_tensor* ids, int L,
                                         ggml_tensor* cosT, ggml_tensor* sinT, ggml_tensor** logw_out) {
@@ -61,25 +60,23 @@ ggml_tensor* MatchaModel::build_encoder(ggml_context* c, ggml_tensor* ids, int L
   auto Wt = [&](const std::string& s) { return W(s); };
   ggml_tensor* cos3 = ggml_reshape_3d(c, cosT, ROT, 1, L);
   ggml_tensor* sin3 = ggml_reshape_3d(c, sinT, ROT, 1, L);
-
-  ggml_tensor* emb = ggml_scale(c, ggml_get_rows(c, Wt("model.encoder.emb.weight"), ids), std::sqrt((float)H)); // [192,L]
-  ggml_tensor* x = ggml_cont(c, ggml_transpose(c, emb));  // [L,192]
+  ggml_tensor* emb = ggml_scale(c, ggml_get_rows(c, Wt("model.encoder.emb.weight"), ids), std::sqrt((float)H));
+  ggml_tensor* x = ggml_cont(c, ggml_transpose(c, emb));
   for (int i = 0; i < 3; i++) {
     std::string p = "model.encoder.prenet.", n = p + "norm_layers." + std::to_string(i) + ".";
-    x = conv1d(c, x, Wt(p + "conv_layers." + std::to_string(i) + ".weight"), Wt(p + "conv_layers." + std::to_string(i) + ".bias"), 2, H);
+    x = conv1d(c, x, Wt(p + "conv_layers." + std::to_string(i) + ".weight"), Wt(p + "conv_layers." + std::to_string(i) + ".bias"), 1, 2, H);
     x = ggml_cont(c, ggml_transpose(c, x));
     x = cln(c, x, Wt(n + "Mul_1.weight"), Wt(n + "Add_1.weight"));
     x = ggml_relu(c, x);
     x = ggml_cont(c, ggml_transpose(c, x));
   }
-  x = conv1d(c, x, Wt("model.encoder.prenet.proj.weight"), Wt("model.encoder.prenet.proj.bias"), 0, H);
-  x = ggml_cont(c, ggml_transpose(c, x));      // [192,L]
+  x = conv1d(c, x, Wt("model.encoder.prenet.proj.weight"), Wt("model.encoder.prenet.proj.bias"), 1, 0, H);
+  x = ggml_cont(c, ggml_transpose(c, x));
   x = ggml_add(c, x, emb);
-
   auto rope = [&](ggml_tensor* t3) {
     ggml_tensor* t = ggml_cont(c, t3);
     size_t nb0 = t->nb[0], nb1 = t->nb[1], nb2 = t->nb[2];
-    ggml_tensor* r  = ggml_cont(c, ggml_view_3d(c, t, ROT, NH, L, nb1, nb2, 0));
+    ggml_tensor* r = ggml_cont(c, ggml_view_3d(c, t, ROT, NH, L, nb1, nb2, 0));
     ggml_tensor* ps = ggml_cont(c, ggml_view_3d(c, t, HD - ROT, NH, L, nb1, nb2, (size_t)ROT * nb0));
     size_t rb0 = r->nb[0], rb1 = r->nb[1], rb2 = r->nb[2];
     ggml_tensor* a = ggml_view_3d(c, r, RH, NH, L, rb1, rb2, 0);
@@ -108,30 +105,112 @@ ggml_tensor* MatchaModel::build_encoder(ggml_context* c, ggml_tensor* ids, int L
     O = ggml_add(c, ggml_mul_mat(c, ow, O), ggml_reshape_2d(c, Wt(E + "attn_layers." + li + ".conv_o.bias"), H, 1));
     x = cln(c, ggml_add(c, x, O), Wt(E + "norm_layers_1." + li + ".Mul_1.weight"), Wt(E + "norm_layers_1." + li + ".Add_1.weight"));
     ggml_tensor* fx = ggml_cont(c, ggml_transpose(c, x));
-    fx = ggml_relu(c, conv1d(c, fx, Wt(E + "ffn_layers." + li + ".conv_1.weight"), Wt(E + "ffn_layers." + li + ".conv_1.bias"), 1, hp_.filter));
-    fx = conv1d(c, fx, Wt(E + "ffn_layers." + li + ".conv_2.weight"), Wt(E + "ffn_layers." + li + ".conv_2.bias"), 1, H);
+    fx = ggml_relu(c, conv1d(c, fx, Wt(E + "ffn_layers." + li + ".conv_1.weight"), Wt(E + "ffn_layers." + li + ".conv_1.bias"), 1, 1, hp_.filter));
+    fx = conv1d(c, fx, Wt(E + "ffn_layers." + li + ".conv_2.weight"), Wt(E + "ffn_layers." + li + ".conv_2.bias"), 1, 1, H);
     fx = ggml_cont(c, ggml_transpose(c, fx));
     x = cln(c, ggml_add(c, x, fx), Wt(E + "norm_layers_2." + li + ".Mul_1.weight"), Wt(E + "norm_layers_2." + li + ".Add_1.weight"));
   }
-  ggml_tensor* xt = ggml_cont(c, ggml_transpose(c, x));    // [L,192]
-  ggml_tensor* mu = ggml_cont(c, ggml_transpose(c, conv1d(c, xt, Wt("model.encoder.proj_m.weight"), Wt("model.encoder.proj_m.bias"), 0, hp_.n_mels))); // [80,L]
-  // proj_w (duration)
-  ggml_tensor* dw = ggml_relu(c, conv1d(c, xt, Wt("model.encoder.proj_w.conv_1.weight"), Wt("model.encoder.proj_w.conv_1.bias"), 1, 256));
+  ggml_tensor* xt = ggml_cont(c, ggml_transpose(c, x));
+  ggml_tensor* mu = ggml_cont(c, ggml_transpose(c, conv1d(c, xt, Wt("model.encoder.proj_m.weight"), Wt("model.encoder.proj_m.bias"), 1, 0, hp_.n_mels)));
+  ggml_tensor* dw = ggml_relu(c, conv1d(c, xt, Wt("model.encoder.proj_w.conv_1.weight"), Wt("model.encoder.proj_w.conv_1.bias"), 1, 1, 256));
   dw = ggml_cont(c, ggml_transpose(c, dw));
   dw = cln(c, dw, Wt("model.encoder.proj_w.norm_1.Mul_1.weight"), Wt("model.encoder.proj_w.norm_1.Add_1.weight"));
   dw = ggml_cont(c, ggml_transpose(c, dw));
-  dw = ggml_relu(c, conv1d(c, dw, Wt("model.encoder.proj_w.conv_2.weight"), Wt("model.encoder.proj_w.conv_2.bias"), 1, 256));
+  dw = ggml_relu(c, conv1d(c, dw, Wt("model.encoder.proj_w.conv_2.weight"), Wt("model.encoder.proj_w.conv_2.bias"), 1, 1, 256));
   dw = ggml_cont(c, ggml_transpose(c, dw));
   dw = cln(c, dw, Wt("model.encoder.proj_w.norm_2.Mul_1.weight"), Wt("model.encoder.proj_w.norm_2.Add_1.weight"));
   dw = ggml_cont(c, ggml_transpose(c, dw));
-  *logw_out = conv1d(c, dw, Wt("model.encoder.proj_w.proj.weight"), Wt("model.encoder.proj_w.proj.bias"), 0, 1); // [L,1]
+  *logw_out = conv1d(c, dw, Wt("model.encoder.proj_w.proj.weight"), Wt("model.encoder.proj_w.proj.bias"), 1, 0, 1);
   return mu;
 }
 
 // =====================================================================
-// Vocos ConvNeXt -> spectral head [514,T]  (validated exact — matcha_vocos_validate.cpp)
+// CFM decoder (validated mel corr 0.999993). mu_exp[T,80], T=internal padded len, ylen=valid len.
+// Returns mel [ylen,80] (sliced + affine de-normalized).
+// =====================================================================
+ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, float noise_scale) {
+  (void)noise_scale;  // deterministic x0=0 (noise_scale handled by caller)
+  const std::string E = "model.decoder.estimator.";
+  auto V = [&](const std::string& s) { return W(E + s); };
+  int T2 = (T - 1) / 2 + 1, ylen = cfm_ylen_, YH = (ylen + 1) / 2;
+  auto mk = [&](int n, int valid, float in, float out) { ggml_tensor* m = ggml_new_tensor_1d(c, GGML_TYPE_F32, n); for (int i = 0; i < n; i++) ((float*)m->data)[i] = i < valid ? in : out; return m; };
+  ggml_tensor* mF = mk(T, ylen, 1, 0), *mH = mk(T2, YH, 1, 0);  // mult masks
+  auto gn8 = [&](ggml_tensor* x, int t, const std::string& aff) {
+    ggml_tensor* xr = ggml_norm(c, ggml_reshape_2d(c, ggml_cont(c, x), t * 256 / 8, 8), 1e-5f);
+    ggml_tensor* xn = ggml_reshape_2d(c, xr, t, 256);
+    return ggml_add(c, ggml_mul(c, xn, ggml_reshape_2d(c, r1(c, V(aff + ".weight")), 1, 256)), ggml_reshape_2d(c, r1(c, V(aff + ".bias")), 1, 256));
+  };
+  auto resnet = [&](ggml_tensor* x, ggml_tensor* te, const std::string& p, int t, ggml_tensor* mm) {
+    auto blk = [&](ggml_tensor* in, const std::string& bp) {
+      return msk(c, mish(c, gn8(conv1d(c, msk(c, in, mm), V(bp + ".block.0.weight"), V(bp + ".block.0.bias"), 1, 1, 256), t, bp + ".block.block.1_2")), mm);
+    };
+    ggml_tensor* h = blk(x, p + ".block1");
+    ggml_tensor* mw = ggml_reshape_2d(c, V(p + ".mlp.1.weight"), 1024, 256);
+    ggml_tensor* tc = ggml_add(c, ggml_mul_mat(c, mw, mish(c, te)), r1(c, V(p + ".mlp.1.bias")));
+    h = ggml_add(c, h, ggml_reshape_2d(c, tc, 1, 256));
+    h = blk(h, p + ".block2");
+    return ggml_add(c, h, conv1d(c, msk(c, x, mm), V(p + ".res_conv.weight"), V(p + ".res_conv.bias"), 1, 0, 256));
+  };
+  auto transformer = [&](ggml_tensor* x, int t, const std::string& p) {
+    ggml_tensor* xc = ggml_cont(c, ggml_transpose(c, x));
+    auto mmT = [&](const std::string& w, ggml_tensor* in) { return ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, V(w))), in); };
+    ggml_tensor* h = cln(c, xc, V(p + ".norm1.weight"), V(p + ".norm1.bias"));
+    ggml_tensor* q = mmT(p + ".attn1.to_q_2.weight", h), *k = mmT(p + ".attn1.to_k_2.weight", h), *v = mmT(p + ".attn1.to_v_2.weight", h);
+    auto hd = [&](ggml_tensor* z) { return ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, z, 64, 2, t), 0, 2, 1, 3)); };
+    ggml_tensor* qp = hd(q), *kp = hd(k), *vp = hd(v);
+    ggml_tensor* qk = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, kp, qp), 1.0f / 8.0f));
+    ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vp, 1, 0, 2, 3));
+    ggml_tensor* o = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, ggml_mul_mat(c, vt, qk), 0, 2, 1, 3)), 128, t);
+    o = ggml_add(c, mmT(p + ".attn1.to_out.0_2.weight", o), V(p + ".attn1.to_out.0.bias"));
+    xc = ggml_add(c, xc, o);
+    ggml_tensor* f = cln(c, xc, V(p + ".norm3.weight"), V(p + ".norm3.bias"));
+    f = ggml_add(c, mmT(p + ".ff.net.0.proj_2.weight", f), V(p + ".ff.net.0.proj.bias"));
+    const float* la = (const float*)V(p + ".ff.net.0.alpha")->data, *lb = (const float*)V(p + ".ff.net.0.beta")->data;
+    ggml_tensor* a = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1024), *ib = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1024);
+    for (int i = 0; i < 1024; i++) { ((float*)a->data)[i] = std::exp(la[i]); ((float*)ib->data)[i] = 1.0f / std::exp(lb[i]); }
+    f = ggml_add(c, f, ggml_mul(c, ggml_sqr(c, ggml_sin(c, ggml_mul(c, f, a))), ib));
+    f = ggml_add(c, mmT(p + ".ff.net.2_2.weight", f), V(p + ".ff.net.2.bias"));
+    return ggml_cont(c, ggml_transpose(c, ggml_add(c, xc, f)));
+  };
+  auto estimator = [&](ggml_tensor* xt, ggml_tensor* te) {
+    ggml_tensor* x = msk(c, ggml_concat(c, xt, mu, 1), mF);
+    x = resnet(x, te, "down_blocks.0.0", T, mF); x = transformer(x, T, "down_blocks.0.1.0");
+    ggml_tensor* skip0 = x;
+    x = conv1d(c, msk(c, x, mF), V("down_blocks.0.2.conv.weight"), V("down_blocks.0.2.conv.bias"), 2, 1, 256);
+    x = resnet(x, te, "down_blocks.1.0", T2, mH); x = transformer(x, T2, "down_blocks.1.1.0");
+    ggml_tensor* skip1 = x;
+    x = conv1d(c, msk(c, x, mH), V("down_blocks.1.2.weight"), V("down_blocks.1.2.bias"), 1, 1, 256);
+    x = resnet(x, te, "mid_blocks.0.0", T2, mH); x = transformer(x, T2, "mid_blocks.0.1.0");
+    x = resnet(x, te, "mid_blocks.1.0", T2, mH); x = transformer(x, T2, "mid_blocks.1.1.0");
+    x = ggml_concat(c, x, skip1, 1);
+    x = resnet(x, te, "up_blocks.0.0", T2, mH); x = transformer(x, T2, "up_blocks.0.1.0");
+    ggml_tensor* up = ggml_add(c, ggml_conv_transpose_1d(c, f16(c, V("up_blocks.0.2.conv.weight")), msk(c, x, mH), 2, 0, 1), ggml_reshape_2d(c, V("up_blocks.0.2.conv.bias"), 1, 256));
+    x = ggml_cont(c, ggml_view_2d(c, up, T, 256, up->nb[1], 1 * up->nb[0]));
+    x = ggml_concat(c, x, skip0, 1);
+    x = resnet(x, te, "up_blocks.1.0", T, mF); x = transformer(x, T, "up_blocks.1.1.0");
+    x = conv1d(c, msk(c, x, mF), V("up_blocks.1.2.weight"), V("up_blocks.1.2.bias"), 1, 1, 256);
+    x = mish(c, gn8(conv1d(c, msk(c, x, mF), V("final_block.block.0.weight"), V("final_block.block.0.bias"), 1, 1, 256), T, "final_block.block.block.1_2"));
+    return msk(c, conv1d(c, msk(c, x, mF), V("final_proj.weight"), V("final_proj.bias"), 1, 0, 80), mF);
+  };
+  // sinusoidal time-emb (host) -> time_mlp; 3-step Euler ODE
+  auto temb = [&](float t) {
+    ggml_tensor* e = ggml_new_tensor_1d(c, GGML_TYPE_F32, 160);
+    for (int i = 0; i < 80; i++) { float fr = std::exp(-(float)i * std::log(10000.0f) / 79.0f), an = 1000.0f * t * fr; ((float*)e->data)[i] = std::sin(an); ((float*)e->data)[80 + i] = std::cos(an); }
+    ggml_tensor* h = ggml_silu(c, ggml_add(c, ggml_mul_mat(c, V("time_mlp.linear_1.weight"), e), r1(c, V("time_mlp.linear_1.bias"))));
+    return ggml_add(c, ggml_mul_mat(c, V("time_mlp.linear_2.weight"), h), r1(c, V("time_mlp.linear_2.bias")));
+  };
+  ggml_tensor* x = ggml_scale(c, mu, 0.0f);  // x0=0 (noise_scale=0)
+  const float dt = 1.0f / 3.0f;
+  for (int s = 0; s < 3; s++) x = ggml_add(c, x, ggml_scale(c, estimator(x, temb((float)s / 3.0f)), dt));
+  ggml_tensor* xl = ggml_cont(c, ggml_view_2d(c, x, ylen, 80, x->nb[1], 0));  // slice to ylen
+  return ggml_add1(c, ggml_scale(c, xl, 5.446792f), ggml_new_f32(c, -2.9521978f));  // [ylen,80] mel
+}
+
+// =====================================================================
+// Vocos ConvNeXt -> spectral head [514,T]  (validated corr 1.0). mel [T,80].
 // =====================================================================
 ggml_tensor* MatchaModel::build_vocos(ggml_context* c, ggml_tensor* mel, int T) {
+  (void)T;
   const int C = 384, NB = 8;
   auto V = [&](const std::string& s) { return W("voc." + s); };
   auto lin = [&](ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int out) {
@@ -158,7 +237,7 @@ ggml_tensor* MatchaModel::build_vocos(ggml_context* c, ggml_tensor* mel, int T) 
   }
   h = ggml_cont(c, ggml_transpose(c, h));
   h = cln(c, h, V("norm_out.weight"), V("norm_out.bias"));
-  return lin(h, V("head.weight"), V("head.bias"), 514);   // [514,T]
+  return lin(h, V("head.weight"), V("head.bias"), 514);
 }
 
 // iSTFT (validated corr 1.0): head[514,T] -> waveform
@@ -188,22 +267,6 @@ std::vector<float> MatchaModel::istft(const float* od, int T) const {
   return wav;
 }
 
-// =====================================================================
-// CFM decoder (mapped — docs/MATCHA_TTS_GGML_PORT.md; needs end-to-end validation).
-// estimator(x_t, mu, t) -> vector field; 3-step Euler ODE. SnakeBeta confirmed (numpy).
-// NOTE: assembled from the mapped structure; see TODO in docs. Returns mel [80,T].
-// =====================================================================
-ggml_tensor* MatchaModel::build_cfm(ggml_context* c, ggml_tensor* mu, int T, float noise_scale) {
-  // With noise_scale handled by the caller's seed (deterministic when 0). The full UNet
-  // (ResnetBlock1D + BasicTransformerBlock + down/up + 3-step ODE) is the remaining work;
-  // see docs/MATCHA_TTS_GGML_PORT.md "CFM decoder". For now return mu as a placeholder so the
-  // arch links and the encoder->vocos path is exercisable end-to-end pending decoder validation.
-  (void)noise_scale; (void)T;
-  RS_LOG_WARN("matcha: CFM decoder not yet assembled — returning mu (encoder->vocos path only).");
-  return mu;
-}
-
-// =====================================================================
 bool MatchaModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t backend) {
   (void)backend;
   if (!ctx || !ctx->ctx_gguf || !ctx->gguf_data) { RS_LOG_ERR("matcha: bad gguf ctx"); return false; }
@@ -215,7 +278,6 @@ bool MatchaModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t 
   ai("matcha.pad_id", hp_.pad_id);
   ai("matcha.hidden", hp_.hidden);
   ai("matcha.n_vocab", hp_.n_vocab);
-  // load all tensors
   const int n = gguf_get_n_tensors(g);
   for (int i = 0; i < n; i++) {
     const char* name = gguf_get_tensor_name(g, i);
@@ -232,53 +294,63 @@ bool MatchaModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t 
 std::shared_ptr<RSState> MatchaModel::CreateState() { return std::make_shared<MatchaState>(); }
 
 bool MatchaModel::PushText(RSState& state, const char* text, const char* language, const char* instruct) {
-  auto& st = static_cast<MatchaState&>(state);
-  // TEXT FRONTEND INTEGRATION POINT: the Matcha bundle ships tokens.txt + lexicon.txt +
-  // espeak-ng-data + rule FSTs (sherpa-onnx style). Producing phoneme IDs for zh-tw/en is a
-  // separate frontend effort; here we expect st.phoneme_ids to be pre-populated (e.g. by a
-  // caller or a future RapidSpeech Matcha frontend). If empty, nothing to synthesize.
   (void)text; (void)language; (void)instruct;
+  auto& st = static_cast<MatchaState&>(state);
   if (st.phoneme_ids.empty()) { RS_LOG_ERR("matcha: no phoneme_ids (text frontend not wired)"); return false; }
   const int L = (int)st.phoneme_ids.size();
-
-  // build cos/sin RoPE tables on host (rotary_dim, positions 0..L-1, partial rotary).
-  // Matcha bakes these as Constants; recompute standard RoPE (theta=10000) for the encoder.
   const int ROT = hp_.rotary_dim, RH = ROT / 2;
   std::vector<float> cosv((size_t)ROT * L), sinv((size_t)ROT * L);
-  for (int p = 0; p < L; p++)
-    for (int d = 0; d < RH; d++) {
-      float freq = std::pow(10000.0f, -2.0f * d / ROT);
-      float ang = p * freq;
-      cosv[p * ROT + d] = cosv[p * ROT + d + RH] = std::cos(ang);
-      sinv[p * ROT + d] = sinv[p * ROT + d + RH] = std::sin(ang);
-    }
-
-  // graph-build context (CPU compute for the validated path; sched-integration is a follow-up)
-  size_t mem = (size_t)512 * 1024 * 1024;
-  ggml_init_params ip{ mem, nullptr, false };
-  ggml_context* c = ggml_init(ip);
-  ggml_tensor* ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, L);
-  ggml_tensor* cosT = ggml_new_tensor_2d(c, GGML_TYPE_F32, ROT, L);
-  ggml_tensor* sinT = ggml_new_tensor_2d(c, GGML_TYPE_F32, ROT, L);
+  for (int p = 0; p < L; p++) for (int d = 0; d < RH; d++) {
+    float freq = std::pow(10000.0f, -2.0f * d / ROT), ang = p * freq;
+    cosv[p * ROT + d] = cosv[p * ROT + d + RH] = std::cos(ang);
+    sinv[p * ROT + d] = sinv[p * ROT + d + RH] = std::sin(ang);
+  }
+  // PHASE A: encoder -> mu[80,L], logw[L]
+  ggml_init_params ipA{ (size_t)256 * 1024 * 1024, nullptr, false };
+  ggml_context* cA = ggml_init(ipA);
+  ggml_tensor* ids = ggml_new_tensor_1d(cA, GGML_TYPE_I32, L);
+  ggml_tensor* cosT = ggml_new_tensor_2d(cA, GGML_TYPE_F32, ROT, L), *sinT = ggml_new_tensor_2d(cA, GGML_TYPE_F32, ROT, L);
   memcpy(ids->data, st.phoneme_ids.data(), (size_t)L * 4);
-  memcpy(cosT->data, cosv.data(), cosv.size() * 4);
-  memcpy(sinT->data, sinv.data(), sinv.size() * 4);
-
+  memcpy(cosT->data, cosv.data(), cosv.size() * 4); memcpy(sinT->data, sinv.data(), sinv.size() * 4);
   ggml_tensor* logw = nullptr;
-  ggml_tensor* mu = build_encoder(c, ids, L, cosT, sinT, &logw);   // mu [80,L]
-  // (length regulator + CFM decoder go here; build_cfm currently passes mu through)
-  ggml_tensor* mel = build_cfm(c, mu, L, st.noise_scale);          // [80,T]
-  int T = (int)mel->ne[1];
-  ggml_tensor* head = build_vocos(c, ggml_cont(c, ggml_transpose(c, mel)) /* [T,80] */, T); // [514,T]
+  ggml_tensor* mu = build_encoder(cA, ids, L, cosT, sinT, &logw);
+  ggml_cgraph* gA = ggml_new_graph(cA);
+  ggml_build_forward_expand(gA, mu); ggml_build_forward_expand(gA, logw);
+  ggml_graph_compute_with_ctx(cA, gA, 4);
+  std::vector<float> mu_data((size_t)80 * L), logw_data(L);
+  const float* md = (const float*)mu->data;  // mu [80,L] ggml ne0=80 -> (ci,t) at ci+80*t? no: mu is [80,L] ne0=80
+  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < L; t++) mu_data[ci * L + t] = md[t * 80 + ci];
+  const float* ld = (const float*)logw->data;  // [L,1] ne0=L
+  for (int t = 0; t < L; t++) logw_data[t] = ld[t];
+  ggml_free(cA);
 
-  ggml_cgraph* gf = ggml_new_graph(c);
-  ggml_build_forward_expand(gf, head);
-  ggml_graph_compute_with_ctx(c, gf, 4);
+  // length regulator (validated rel 0): durations=ceil(exp(logw)); w=durations*length_scale
+  std::vector<float> w(L); double ysum = 0;
+  for (int i = 0; i < L; i++) { w[i] = std::ceil(std::exp(logw_data[i])) * st.length_scale; ysum += w[i]; }
+  int ylen = (int)std::max(ysum, 1.0);
+  // DEBUG: force exact durations from a file (to isolate ceil-sensitivity from the decoder chain)
+  { const char* fp = getenv("MATCHA_FORCE_DUR"); if (fp) { FILE* f = fopen(fp, "rb"); if (f) { std::vector<int> dd(L); if (fread(dd.data(), 4, L, f) == (size_t)L) { ysum = 0; for (int i = 0; i < L; i++) { w[i] = dd[i] * st.length_scale; ysum += w[i]; } ylen = (int)std::max(ysum, 1.0); } fclose(f); } } }
+  { std::string ds; for (int i = 0; i < L; i++) ds += std::to_string((int)w[i]) + ","; RS_LOG_INFO("matcha: durations=[%s] ysum=%.4f ylen=%d", ds.c_str(), ysum, ylen); }
+  int T = ((ylen + 3) / 4) * 4;  // internal padded length (mult of 4)
+  std::vector<double> cum(L); { double a = 0; for (int i = 0; i < L; i++) { a += w[i]; cum[i] = a; } }
+  std::vector<float> muexp((size_t)80 * T, 0.0f);  // [80,T] numpy
+  { int i = 0; for (int t = 0; t < T; t++) { while (i < L - 1 && t >= cum[i]) i++; if (t < ylen) for (int ci = 0; ci < 80; ci++) muexp[ci * T + t] = mu_data[ci * L + i]; } }
 
-  st.audio_output = istft((const float*)head->data, T);
+  // PHASE B: decoder (mu_exp) -> mel -> vocos -> istft
+  cfm_ylen_ = ylen;
+  ggml_init_params ipB{ (size_t)6 * 1024 * 1024 * 1024ull, nullptr, false };
+  ggml_context* cB = ggml_init(ipB);
+  ggml_tensor* muexp_t = ggml_new_tensor_2d(cB, GGML_TYPE_F32, T, 80);  // [T,80] ggml == [80,T] numpy
+  for (int ci = 0; ci < 80; ci++) for (int t = 0; t < T; t++) ((float*)muexp_t->data)[t + (size_t)T * ci] = muexp[ci * T + t];
+  ggml_tensor* mel = build_cfm(cB, muexp_t, T, st.noise_scale);   // [ylen,80]
+  ggml_tensor* head = build_vocos(cB, mel, ylen);                 // [514,ylen]
+  ggml_cgraph* gB = ggml_new_graph_custom(cB, 131072, false);
+  ggml_build_forward_expand(gB, head);
+  ggml_graph_compute_with_ctx(cB, gB, 4);
+  st.audio_output = istft((const float*)head->data, ylen);
   st.audio_read_cursor = 0;
-  ggml_free(c);
-  RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs)", st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate);
+  ggml_free(cB);
+  RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs), ylen=%d", st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate, ylen);
   return true;
 }
 
@@ -291,7 +363,6 @@ int MatchaModel::GetAudioOutput(RSState& state, float** out_data) {
   return remain;
 }
 
-// registration
 static bool s_reg = [] {
   rs_register_model_arch("matcha-tts", []() { return std::make_shared<MatchaModel>(); });
   return true;

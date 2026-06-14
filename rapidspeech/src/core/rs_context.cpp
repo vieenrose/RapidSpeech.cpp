@@ -227,9 +227,11 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   // openvoice2's CPU preference is a METAL workaround (command-buffer errors
   // on many fine-grained ops); CUDA handles the graph fine — keep GPU there.
 #ifdef RS_USE_CUDA
-  bool prefer_cpu = false;
+  // matcha-tts has a very fine-grained CFM-decoder graph (3-step ODE x UNet); the CPU path is
+  // faster for it and avoids the GB10 sm_53->sm_121 PTX-JIT stall on first use.
+  bool prefer_cpu = (arch == "matcha-tts");
 #else
-  bool prefer_cpu = (arch == "openvoice2");
+  bool prefer_cpu = (arch == "openvoice2" || arch == "matcha-tts");
 #endif
 
   // 3. Hardware detection and backend initialization

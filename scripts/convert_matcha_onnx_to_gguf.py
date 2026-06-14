@@ -63,16 +63,21 @@ def semantic_rename_map(graph, prefix):
             continue
         nd, idx, op = rc
         path = nd.name.strip("/").split("/")
+        dropped = None
         if path and path[-1] in ("MatMul", "Gemm", "Conv", "Add", "Mul", "InstanceNormalization"):
-            path = path[:-1]
+            dropped = path[-1]; path = path[:-1]
         if not path:
             continue
-        # disambiguate multi-weight ops by input role:
-        #   InstanceNorm(x, scale=in1, bias=in2) -> .weight / .bias
-        #   MatMul/Gemm weight (the non-activation input) -> .weight; bias-add input -> .bias
+        # Disambiguate only where two learned weights land on the SAME path:
+        #  - InstanceNorm(scale=in1, bias=in2) -> .weight / .bias (decoder GroupNorm).
+        #  - decoder GroupNorm affine: gamma is consumed by a leaf "Mul" node and beta by a leaf
+        #    "Add" node, both children of the same `block.1` path -> collide; the dropped "Add"
+        #    leaf -> .bias, otherwise .weight.
+        # The encoder LayerNorm beta is consumed by node "Add_1" (a leaf NOT in the drop list, so
+        # it stays in the path) -> no collision, keeps .weight (matches the validated encoder).
         if op == "InstanceNormalization":
             suffix = "weight" if idx == 1 else ("bias" if idx == 2 else f"in{idx}")
-        elif idx >= 2 or op == "Add":
+        elif dropped == "Add":
             suffix = "bias"
         else:
             suffix = "weight"

@@ -62,6 +62,7 @@ private:
   RSModelMeta meta_;
   std::map<std::string, ggml_tensor*> w_;   // weights from gguf_data
   rs_context_t* rsctx_ = nullptr;
+  int cfm_ylen_ = 0;   // valid (length-regulated) mel length for the current synthesis
 
   ggml_tensor* W(const std::string& name) const;
   // forward stages (defined in matcha.cpp); ctx is a graph-build context
