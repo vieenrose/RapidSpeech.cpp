@@ -39,10 +39,11 @@ ggml_tensor* conv1d(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor
 ggml_tensor* cln(ggml_context* c, ggml_tensor* x, ggml_tensor* g, ggml_tensor* b) {
   x = ggml_norm(c, x, 1e-5f); x = ggml_mul(c, x, r1(c, g)); return ggml_add(c, x, r1(c, b));
 }
-// mish via log: x*tanh(log(1+exp(x)))
+// mish = x*tanh(softplus(x)), softplus(x)=log(1+exp(x)). 5 ops, single exp (broadcast-add the
+// scalar 1 via ggml_add1 instead of fabricating a full ones tensor — was 8 ops / two exp).
 ggml_tensor* mish(ggml_context* c, ggml_tensor* x) {
-  ggml_tensor* ones = ggml_add1(c, ggml_scale(c, ggml_exp(c, x), 0.0f), ggml_new_f32(c, 1.0f));
-  return ggml_mul(c, x, ggml_tanh(c, ggml_log(c, ggml_add(c, ggml_exp(c, x), ones))));
+  ggml_tensor* sp = ggml_log(c, ggml_add1(c, ggml_exp(c, x), ggml_new_f32(c, 1.0f)));
+  return ggml_mul(c, x, ggml_tanh(c, sp));
 }
 ggml_tensor* msk(ggml_context* c, ggml_tensor* x, ggml_tensor* m) { return m ? ggml_mul(c, x, m) : x; }
 }  // namespace
@@ -336,6 +337,10 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
     cosv[p * ROT + d] = cosv[p * ROT + d + RH] = std::cos(ang);
     sinv[p * ROT + d] = sinv[p * ROT + d + RH] = std::sin(ang);
   }
+#ifdef MATCHA_PROFILE
+  auto pf = [] { return std::chrono::high_resolution_clock::now(); };
+  auto pa0 = pf();
+#endif
   // PHASE A: encoder -> mu[80,L], logw[L]
   ggml_init_params ipA{ (size_t)256 * 1024 * 1024, nullptr, false };
   ggml_context* cA = ggml_init(ipA);
@@ -373,15 +378,19 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   ggml_context* cB = ggml_init(ipB);
   ggml_tensor* muexp_t = ggml_new_tensor_2d(cB, GGML_TYPE_F32, T, 80);  // [T,80] ggml == [80,T] numpy
   for (int ci = 0; ci < 80; ci++) for (int t = 0; t < T; t++) ((float*)muexp_t->data)[t + (size_t)T * ci] = muexp[ci * T + t];
+#ifdef MATCHA_PROFILE
+  auto pb0 = pf();
+#endif
   ggml_tensor* mel = build_cfm(cB, muexp_t, T, st.noise_scale);   // [ylen,80]
   ggml_tensor* head = build_vocos(cB, mel, ylen);                 // [514,ylen]
   ggml_cgraph* gB = ggml_new_graph_custom(cB, 131072, false);
   ggml_build_forward_expand(gB, head);
 #ifdef MATCHA_PROFILE
-  auto pf = [] { return std::chrono::high_resolution_clock::now(); };
   auto p0 = pf(); ggml_graph_compute_with_ctx(cB, gB, 4); auto p1 = pf();
   st.audio_output = istft((const float*)head->data, ylen); auto p2 = pf();
-  RS_LOG_INFO("matcha PROFILE: decoder+vocos graph=%.1fms  istft=%.1fms",
+  RS_LOG_INFO("matcha PROFILE: phaseA(enc)=%.1fms  decBuild=%.1fms  decCompute=%.1fms  istft=%.1fms",
+              std::chrono::duration<double, std::milli>(pb0 - pa0).count(),
+              std::chrono::duration<double, std::milli>(p0 - pb0).count(),
               std::chrono::duration<double, std::milli>(p1 - p0).count(),
               std::chrono::duration<double, std::milli>(p2 - p1).count());
 #else
