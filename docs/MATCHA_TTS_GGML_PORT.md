@@ -72,9 +72,11 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   theta-match needed). SDPA uses the `openvoice2.cpp` pattern. Attention alone matched **rel 0
   (exact)**. The **6 layers are identical structure** → the encoder transformer is solved (chain the
   validated block ×6).
-- **Remaining encoder glue** (uses already-validated primitives): chain 6 layers; `proj_m` (conv k1
-  192→80 = mel mean μ); `proj_w` duration predictor (conv k3 → norm → ReLU ×2 → proj k1 = logw).
-- **Length regulator** — expand μ by ceil(exp(logw)·length_scale) durations (control logic).
+- **Full text encoder** ✅ VALIDATED (`matcha_full_encoder_validate.cpp`): emb → prenet → **6× RoPE
+  transformer** → `proj_m` (μ, rel 1e-4) + `proj_w` (durations logw, rel 2e-5). Confirmed the RoPE
+  cos/sin tables are **shared across all 6 layers** (reused the layer-0 baked table → exact). So the
+  entire **text → (μ, durations)** path is done.
+- **Length regulator** — expand μ by ceil(exp(logw)·length_scale) durations (control logic). TODO.
 - **CFM decoder** (**2977 nodes — the remaining bulk**) — a 1-D UNet (down/mid/up ResnetBlock1D with
   time-MLP conditioning + Snake-activation transformer blocks `alpha`/`beta`, InstanceNorm, down/up
   sample) solved with **3 Euler ODE steps** from `RandomNormalLike` seed noise × `noise_scale`.
