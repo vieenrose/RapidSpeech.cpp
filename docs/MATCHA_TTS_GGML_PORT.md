@@ -116,9 +116,24 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   - **ResnetBlock1D math validated in numpy** (`scripts/gen_resnet_ref.py`): Conv→GroupNorm8→Mish,
     time-cond add (Linear∘Mish), block2, residual res_conv. GroupNorm8 = reshape `[8,C/8·T]` →
     normalize per group → `·γ+β`; γ/β are the folded `block.block.1_2.{weight,bias}` `[256]`.
-  - So build_cfm is now fully de-risked: complete weights, reference patterns, validated core block.
-    It remains a substantial assembly (UNet down/mid/up + skips + 3-step ODE + length regulator),
-    best done in matcha.cpp and validated end-to-end against ONNX (noise_scale=0 deterministic).
+  - **ResnetBlock1D validated in ggml** (`tools/matcha_resnet_validate.cpp`, rel 2.8e-4) — the
+    core/most-repeated decoder unit. GroupNorm8 in ggml: `x[T,C] → reshape [T·C/8, 8] → ggml_norm →
+    reshape → ·γ+β`. Mish via `x·tanh(log(1+exp(x)))` (this ggml has no `ggml_softplus`).
+
+  **CFM-decoder block specs (both core units now characterised):**
+  - **ResnetBlock1D** ✅ ggml-validated (above). Channel dims per UNet stage: down0 160→256,
+    down1 256→256, mid 256→256, up 512→256 (512 = 256 skip-concat), final 256→256, final_proj 256→80.
+  - **BasicTransformerBlock**: `x += attn1(norm1(x))`; `x += ff(norm3(x))`. norm1/norm3 = LayerNorm
+    [256]. attn1 = self-attn, **2 heads × head_dim 64** (inner 128): to_q/k/v 256→128, SDPA
+    1/√64, to_out 128→256 — same SDPA pattern as the (validated) encoder attention. ff =
+    `net.2(SnakeBeta(net.0.proj(x)))`: proj 256→1024 → SnakeBeta (numpy-validated:
+    `x+sin²(e^α x)/e^β`) → linear 1024→256.
+
+  **Remaining build_cfm assembly** (bounded; both blocks + all primitives validated):
+  sinusoidal time-emb + time_mlp (Linear→SiLU→Linear); length regulator (expand μ by
+  ceil(e^logw·length_scale)); UNet down(×2)/mid(×2)/up(×2 w/ skip-concat) + final; 3-step Euler ODE
+  (unrolled, weights shared). Then wire into `matcha.cpp::build_cfm` and validate end-to-end vs ONNX
+  mel (noise_scale=0). Estimated several more build-debug cycles — assembly, not new research.
 
 This is genuinely a ~2k-line arch (≈ `openvoice2.cpp`), with the rel-pos attention, the
 Constant-folded norms, and the 3-step CFM ODE solver as the intricate pieces. It is **multi-session
