@@ -106,6 +106,20 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   So **the gguf is now complete for build_cfm**; the remaining work is implementing + staged-validating
   the UNet blocks (ResnetBlock1D, BasicTransformerBlock) and the ODE loop inside `MatchaModel::build_cfm`.
 
+  **Key de-risking (this pass):**
+  - **`arch/cosyvoice3_flow.cpp` is a reference CFM/flow-matching decoder in ggml** — it already has
+    `mish()`, `linear`, `conv1d`, `conv1d_grouped`, a sinusoidal time-embedding table, `BuildDiTBlock`
+    (time-conditioned transformer), and `BuildCFMStepGraph`. build_cfm should reuse these patterns.
+  - **ggml has all needed primitives in the full build**: `ggml_softplus`/`mish`/`ggml_log`/`ggml_sin`
+    exist there (the earlier standalone-validator harness was the limited path; the arch compiles
+    against the same ggml as cosyvoice3_flow, so Mish/Snake are not blockers in matcha.cpp).
+  - **ResnetBlock1D math validated in numpy** (`scripts/gen_resnet_ref.py`): Conv→GroupNorm8→Mish,
+    time-cond add (Linear∘Mish), block2, residual res_conv. GroupNorm8 = reshape `[8,C/8·T]` →
+    normalize per group → `·γ+β`; γ/β are the folded `block.block.1_2.{weight,bias}` `[256]`.
+  - So build_cfm is now fully de-risked: complete weights, reference patterns, validated core block.
+    It remains a substantial assembly (UNet down/mid/up + skips + 3-step ODE + length regulator),
+    best done in matcha.cpp and validated end-to-end against ONNX (noise_scale=0 deterministic).
+
 This is genuinely a ~2k-line arch (≈ `openvoice2.cpp`), with the rel-pos attention, the
 Constant-folded norms, and the 3-step CFM ODE solver as the intricate pieces. It is **multi-session
 work** — not completable in one pass without large amounts of unvalidated code. The proven method
