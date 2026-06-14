@@ -1,13 +1,42 @@
 # Matcha-TTS → RapidSpeech.cpp (ggml) port — design & status
 
-> **✅ COMPLETE.** The full pipeline runs end-to-end in ggml (`arch/matcha.cpp`, registered as
-> `matcha-tts`) and produces correct speech. Every stage validated vs ONNX: encoder rel ≤1e-4,
+> **✅ COMPLETE + OPTIMIZED.** The full pipeline runs end-to-end in ggml (`arch/matcha.cpp`, registered
+> as `matcha-tts`) and produces correct speech. Every stage validated vs ONNX: encoder rel ≤1e-4,
 > length regulator rel 0, CFM decoder mel **corr 0.999993**, Vocos+iSTFT corr 1.0; end-to-end audio
-> (matched durations) **corr 0.952** to the ONNX path (the rest = F16-mel error amplified by the
-> phase-sensitive iSTFT, audio-perfect). Benchmark (gen1 toolchain, ggml CPU): ~1.06 s whole-process
-> for 3.18 s of 8 kHz audio, **509 MB** peak RSS. Validators: `tools/matcha_*_validate.cpp`,
-> end-to-end harness `tools/matcha_e2e_test.cpp`. Remaining: a zh-TW/en text frontend to produce
-> `phoneme_ids` (currently injected by the caller).
+> (matched durations) **corr 0.952** to the ONNX path. Benchmark (gen1 toolchain, ggml CPU, 4 threads):
+> **warm synth 239 ms** for 3.18 s of 8 kHz audio (**RTF 0.075**), **493 MB** peak RSS. Validators:
+> `tools/matcha_*_validate.cpp`, e2e harness `tools/matcha_e2e_test.cpp`. Remaining: a zh-TW/en text
+> frontend to produce `phoneme_ids` (currently caller-injected).
+
+## Performance optimization (auto-research)
+A spec-extract + adversarial-verify Workflow plus direct profiling drove the optimization. Findings:
+- **The iSTFT was 75% of runtime** (730 ms of 971 ms) — it was a naive **O(N²) DFT** (NFFT=512,
+  ~198 frames ≈ 26M trig ops). Replaced with a self-contained **radix-2 FFT** (irfft): **730 → 1.8 ms
+  (≈400×)**, audio bit-identical (**corr 1.0000000**). This alone cut warm synth **971 → 242 ms**.
+- `mish` simplified 8→5 ops (single `exp`); marginal but free.
+- **Net: warm synth 971 → 239 ms (4.06×), peak RSS 509 → 493 MB, RTF 0.31 → 0.075, zero quality loss.**
+- Attributed breakdown after: phaseA(encoder) ~12 ms, graph-build ~3.6 ms, **decoder+vocos compute
+  ~186 ms** (the genuine UNet×3-ODE + 8 ConvNeXt FLOPs), iSTFT ~1.8 ms. The remaining cost is real
+  model compute, reducible only by GPU or fewer ODE steps.
+
+### Why CPU, not CUDA — a structural verdict (verified)
+The optimization research **confirmed CUDA is a dead-end for this model on the Nano gen1**, so closing
+the gap meant optimizing the CPU path:
+- **CUDA graphs are gated on `cc ≥ GGML_CUDA_CC_AMPERE (800)`** in this ggml (`ggml-cuda.cu`); the Nano
+  is **sm_53 (cc 530)**, so cuda-graph capture/replay is unavailable — every kernel is launched
+  individually. For a fine-grained, launch-bound CFM graph (hundreds of small ops × 3 ODE steps) that
+  is exactly the worst case, and it's *why* sherpa-onnx/ORT (which runs the whole acoustic model as one
+  optimized CUDA graph) is faster — a structural advantage ggml-on-sm_53 cannot replicate.
+- On the GB10 dev box the CUDA path additionally JIT-stalls (sm_53 PTX → sm_121 SASS for every kernel).
+- So `rs_context` routes `matcha-tts` to CPU. On the real Nano the iSTFT FFT win still applies (it's
+  architecture-independent), though the ~186 ms decoder compute will be slower on the A57 than on GB10
+  cores — measure on device.
+
+### Future work (documented, not done — would risk the validated numerics for ~10–20 ms)
+- Reduce the 48 `ggml_cont` + 21 `ggml_transpose` at the conv `[T,C]` ↔ transformer `[C,T]` layout
+  seams (each is a real memory copy; runtime count is high since they're inside the 18× resnet / 18×
+  transformer loops). Inherent part is unavoidable (convs need `ne0=T`, LayerNorm/matmul prefer
+  `ne0=C`); the redundant `cont(transpose(cont(...)))` chains are the removable part.
 
 Goal: run [Luigi/matcha-zh-tw-en-8k](https://huggingface.co/Luigi/matcha-zh-tw-en-8k)
 (a zh-TW/en, 8 kHz, code-mixed Matcha-TTS) on RapidSpeech.cpp's ggml backend, so it runs
