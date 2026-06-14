@@ -62,11 +62,17 @@ melo8k/openvoice2 TTS. Counterpart to the sherpa-onnx cuDNN-free path (already v
   round-trip exact.
 - **Full Vocos vocoder, mel → waveform** — ConvNeXt network (rel 3e-4 vs ONNX) + iSTFT tail (corr 1.0).
 
-**Remaining — the acoustic model (text → mel), the larger half.** Scope, measured from the graph:
-- **Text encoder** (~1800 nodes): embedding ×√192 → ConvReLUNorm prenet (3× conv k5 + inline
-  LayerNorm-from-Constants) → **6-layer relative-position multi-head transformer** (attention
-  conv_q/k/v/o + rel-pos windows in Constants; inline LayerNorm; FFN conv_1/conv_2) → `proj_m`
-  (→ mel mean μ) and `proj_w` duration predictor (conv→conv→proj).
+**Remaining — the acoustic model (text → mel), the larger half.** Precise architecture (from graph):
+- **Text encoder front** ✅ VALIDATED (`tools/matcha_encoder_validate.cpp`, rel 2e-5): embedding
+  **×√192** → ConvReLUNorm prenet (3× [conv k5 → channel-LayerNorm(folded γ/β) → ReLU] → proj k1 →
+  residual). Folded γ/β are ggml `ne=[1,C,1]` → reshape to `[C]`.
+- **Transformer encoder** (6 layers, post-norm) — TODO. Each layer: **RoPE multi-head attention**
+  (`query_rotary_pe` — NOT windowed rel-pos; conv_q/k/v/o are k1 Linear projections; **4 heads ×
+  head_dim 48**; rotary on the head dim, 24/24 split) → `x = norm_1(x + attn)` → FFN (conv_1 k3
+  192→768 → ReLU → conv_2 k3 768→192) → `x = norm_2(x + ffn)`. norms are channel-LayerNorm w/
+  folded γ/β. The RoPE convention match (ggml_rope mode/base) is the fiddly bit.
+- **Heads**: `proj_m` (conv k1 192→80 = mel mean μ); `proj_w` duration predictor (conv k3 192→256 →
+  norm → ReLU → conv k3 256→256 → norm → ReLU → proj k1 256→1 = logw).
 - **Length regulator** — expand μ by ceil(exp(logw)·length_scale) durations.
 - **CFM decoder** (**2977 nodes**) — a 1-D UNet (down/mid/up ResnetBlock1D with time-MLP
   conditioning + Snake-activation transformer blocks `alpha`/`beta`, InstanceNorm, down/up sample)
