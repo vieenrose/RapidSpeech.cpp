@@ -33,16 +33,22 @@ int main(int argc, char** argv) {
   ggml_init_params ip{ (size_t)64 * 1024 * 1024, nullptr, false }; ggml_context* ctx = ggml_init(ip);
   ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);  // [D,T] ne0=D
   std::string B = "model.decoder.estimator.down_blocks.0.1.0.ff.net.0.";
-  // copy alpha/beta into the compute ctx (avoid cross-context leaf issues), exp them
-  ggml_tensor* alpha = ggml_exp(ctx, ggml_cont(ctx, V(B + "alpha")));   // exp(log_alpha) [D]
-  ggml_tensor* denom = ggml_exp(ctx, ggml_cont(ctx, V(B + "beta")));    // exp(log_beta) [D] (eps 1e-9 negligible)
-  // snakebeta = x + sin(alpha*x)^2 / exp(beta) ; alpha/denom [D] broadcast over T
+  // exp(log_alpha/beta) on host (old ggml's elementwise-on-gguf-leaf is unstable), broadcast to [D,T]
+  const float* la = (const float*)V(B + "alpha")->data;
+  const float* lb = (const float*)V(B + "beta")->data;
+  ggml_tensor* alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
+  ggml_tensor* invb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
+  for (int t = 0; t < T; t++) for (int d = 0; d < D; d++) {
+    ((float*)alpha->data)[t * D + d] = std::exp(la[d]);
+    ((float*)invb->data)[t * D + d] = 1.0f / std::exp(lb[d]);   // avoid ggml_div
+  }
+  // snakebeta = x + sin(alpha*x)^2 * (1/exp(beta))
   ggml_tensor* s = ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, x, alpha)));   // [D,T]
-  ggml_tensor* out = ggml_add(ctx, x, ggml_div(ctx, s, denom));
+  ggml_tensor* out = ggml_add(ctx, x, ggml_mul(ctx, s, invb));
 
-  ggml_cgraph* gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, out);
   std::vector<float> xv = rf(argv[2]);  // [D,T] row-major = ne0=D
   memcpy(x->data, xv.data(), xv.size() * 4);
+  ggml_cgraph* gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, out);
   ggml_graph_compute_with_ctx(ctx, gf, 4);
 
   std::vector<float> ref = rf(argv[3]);
