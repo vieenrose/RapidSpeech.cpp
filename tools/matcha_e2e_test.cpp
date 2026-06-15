@@ -8,6 +8,7 @@
 #include "arch/matcha.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -32,6 +33,19 @@ int main(int argc, char** argv) {
   auto* ms = static_cast<MatchaState*>(state.get());
   // the 12 validated phoneme ids (decoder-isolation fixture); deterministic noise_scale=0
   ms->phoneme_ids = { 1, 5, 10, 20, 3, 7, 15, 2, 8, 40, 6, 0 };
+  // optional: same-utterance rebench — read int32 phoneme IDs from a file (env MATCHA_IDS)
+  if (const char* idp = getenv("MATCHA_IDS")) {
+    FILE* fi = fopen(idp, "rb");
+    if (fi) {
+      fseek(fi, 0, SEEK_END); long sz = ftell(fi); fseek(fi, 0, SEEK_SET);
+      std::vector<int32_t> ids(sz / 4);
+      if (fread(ids.data(), 4, ids.size(), fi) == ids.size() && !ids.empty()) {
+        ms->phoneme_ids.assign(ids.begin(), ids.end());
+        printf("loaded %zu phoneme ids from %s\n", ids.size(), idp);
+      }
+      fclose(fi);
+    }
+  }
   ms->noise_scale = 0.0f;
   ms->length_scale = 1.0f;
   // warm-synth timing: PushText is the full synthesis (encoder+length-reg+decoder+vocos+istft)
