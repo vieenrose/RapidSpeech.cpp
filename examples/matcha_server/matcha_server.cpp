@@ -1,4 +1,7 @@
-// Persistent Matcha-TTS service for RapidSpeech.cpp ggml.
+// Persistent Matcha-TTS service for RapidSpeech.cpp ggml. (Demo / reference.)
+//
+// This is a transport-agnostic demo of the warm-persistent pattern; the production
+// integration wraps this same engine loop as a LiveKit Agents TTS plugin.
 //
 // Loads the matcha gguf and (on RS_CUDA builds, with MATCHA_USE_CUDA=1) the CUDA
 // backend ONCE, JITs the sm_53 kernels once, then serves synthesis requests in a

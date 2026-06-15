@@ -1,4 +1,10 @@
-# matcha-server — persistent Matcha-TTS service (Jetson Nano gen1 / sm_53)
+# matcha-server — persistent Matcha-TTS demo (Jetson Nano gen1 / sm_53)
+
+**Status: demo / reference implementation.** This is the minimal, transport-agnostic
+shape of the warm-persistent Matcha-TTS pattern (a stdin/stdout line protocol). The
+production integration (iPhO 2.0) wraps this same engine as a **LiveKit Agents TTS
+plugin** so it can stream into a room/SIP leg; this demo is the engine-loop reference
+that plugin is built from.
 
 Loads the matcha gguf and the CUDA backend **once**, JITs the sm_53 kernels once,
 then serves synthesis requests in a loop. The launch-bound first-graph cost (PTX-JIT
