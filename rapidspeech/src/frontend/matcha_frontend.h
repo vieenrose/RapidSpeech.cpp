@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class MatchaFrontend {
@@ -41,6 +42,10 @@ public:
   int LexiconSize() const { return (int)lexicon_.size(); }
 
 private:
+  // word (or phrase) -> token ids, recursing into CJK chars / espeak for English.
+  std::vector<int32_t> ConvertWordToIds(const std::string& w) const;
+
   std::unordered_map<std::string, int32_t> token2id_;
-  std::unordered_map<std::string, std::vector<int32_t>> lexicon_;  // word -> token ids
+  std::unordered_map<std::string, std::vector<int32_t>> lexicon_;  // word -> token ids (word2ids_)
+  std::unordered_set<std::string> all_words_;                      // lexicon keys, for phrase matching
 };

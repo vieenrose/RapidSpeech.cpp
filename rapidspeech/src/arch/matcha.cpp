@@ -480,6 +480,32 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
               std::chrono::duration<double, std::milli>(p2 - p1).count());
 #endif
   }  // for each clause
+
+  // Scale down long pauses (sherpa GeneratedAudio::ScaleSilence, silence_scale=0.2):
+  // a run of |x|<=0.01 longer than 0.2 s is a pause; keep only `scale` of its length.
+  // This shrinks the inter-clause/punctuation silences to natural length WITHOUT cutting
+  // any voiced audio (the per-clause synthesis already gave each name/word full duration).
+  {
+    const float scale = 0.2f; const int thr = hp_.sample_rate / 5;  // 0.2 s
+    std::vector<float> out; out.reserve(all_audio.size());
+    int n = (int)all_audio.size(), i = 0, last = -1;
+    auto flush_to = [&](int upto) { for (int k = i; k < upto; k++) out.push_back(all_audio[k]); };
+    for (int p = 0; p < n; p++) {
+      if (std::fabs(all_audio[p]) <= 0.01f) { if (last == -1) last = p; continue; }
+      if (last != -1 && p - last < thr) { last = -1; continue; }
+      if (last != -1) {
+        flush_to(last);                              // voiced up to the pause
+        int keep = (int)((p - last) * scale);
+        for (int k = 0; k < keep; k++) out.push_back(all_audio[last + k]);  // scaled pause
+        i = p; last = -1;
+      }
+    }
+    if (last != -1 && n - last > thr) { flush_to(last); int keep = (int)((n - last) * scale);
+      for (int k = 0; k < keep; k++) out.push_back(all_audio[last + k]); }
+    else { flush_to(n); }
+    all_audio = std::move(out);
+  }
+
   st.phoneme_ids = std::move(full_ids);
   st.audio_output = std::move(all_audio);
   st.audio_read_cursor = 0;

@@ -351,14 +351,19 @@ MATCHA_TOKENS=tokens.txt MATCHA_LEXICON=lexicon.txt \
   ./build/rs-tts-offline -m matcha8k.gguf -t "你好，我是 Amy，很高興為您服務。" -o out.wav
 ```
 
-The frontend reproduces the sherpa-onnx Matcha reference (validated ID-for-ID + ASR):
-- **Chinese**: per-character lexicon lookup (pinyin-with-tone tokens).
+The frontend is a **faithful, byte-identical port** of sherpa-onnx's matcha frontend
+(`matcha-tts-lexicon.cc` + phrase-matcher + text-utils + piper `ProcessPhonemes`) — proven
+by a differential test (222/222 cases, see `tools/matcha_frontend_parity/`):
+- **Normalization** → full-width punctuation to half-width (`，→,`, `：→,`, `。→.`, …).
+- **Chinese**: `SplitUtf8` + greedy **phrase matching** against the lexicon (correct polyphones
+  like 行長/長城/市長), recursing into per-char ids; OOV CJK dropped.
 - **English**: espeak-ng IPA → the model's token set via the diphthong replacement table
-  (`eɪ→A, oʊ→O, aɪ→I`, …; sherpa PR #2853). Build with `-DRS_MATCHA_ESPEAK=ON`
-  (`-DESPEAK_NG_ROOT=<dir>` to point at a vendored espeak-ng); without it, English is skipped.
-- **Punctuation**: full-width `，。！？` map to their tokens, and synthesis is **split per
-  clause** (like sherpa) so an English word embedded between Chinese renders cleanly instead
-  of being buried in one long sequence.
+  (`eɪ→A, oʊ→O, aɪ→I`, …; sherpa PR #2853), with a blank (space) token inserted before a word
+  whenever the previous word was alphabetic. Build with `-DRS_MATCHA_ESPEAK=ON`
+  (`-DESPEAK_NG_ROOT=<dir>`). For byte-identity use **espeak-ng 1.52** (the version the model was
+  built with; 1.51 differs on stress marks). Without espeak, English is skipped.
+- **Synthesis**: clause-split at punctuation + sherpa's `ScaleSilence` (silence_scale=0.2) so an
+  English word embedded between Chinese renders cleanly and inter-clause pauses stay natural.
 
 #### matcha-server — warm-persistent Matcha-TTS demo (`examples/matcha_server/`)
 
