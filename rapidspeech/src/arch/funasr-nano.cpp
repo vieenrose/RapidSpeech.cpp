@@ -595,11 +595,81 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   host_kv_cache_v_.clear();
   n_cached_tokens_ = 0;
 
-  // 3. Build projection graph for prefix + audio
+  const auto &lp = llm_model_->hparams();
+  const int n_layer = lp.n_layer;
+  const int n_head_kv = lp.n_head_kv > 0 ? lp.n_head_kv : lp.n_head;
+  const int head_dim = lp.head_dim;
+  const int kv_dim = head_dim * n_head_kv;
+  const int32_t n_kv_max = total_T + MAX_DECODE_TOKENS;
+
+  std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
+  std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
+  ggml_backend_buffer_t kv_gpu_buf = nullptr;
+  ggml_backend_t kv_backend = nullptr;
+  struct ggml_context *ctx_kv = nullptr;
+
+  {
+    struct ggml_init_params kv_buf_params = {
+        (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
+        true};
+    ctx_kv = ggml_init(kv_buf_params);
+
+    for (int il = 0; il < n_layer; ++il) {
+      gpu_kv_k_vec[il] =
+          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+      gpu_kv_v_vec[il] =
+          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+      ggml_set_name(gpu_kv_k_vec[il],
+                    ("gpu_kv_k_" + std::to_string(il)).c_str());
+      ggml_set_name(gpu_kv_v_vec[il],
+                    ("gpu_kv_v_" + std::to_string(il)).c_str());
+    }
+
+    int n_backends = ggml_backend_sched_get_n_backends(sched);
+    int gpu_idx = n_backends - 1;
+    for (int bi = 0; bi < n_backends; ++bi) {
+      ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+      ggml_backend_dev_t dev = ggml_backend_get_device(b);
+      if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        gpu_idx = bi;
+        break;
+      }
+    }
+    ggml_backend_t gpu_backend =
+        ggml_backend_sched_get_backend(sched, gpu_idx);
+    kv_backend = gpu_backend;
+    RS_LOG_INFO("KV cache allocated on backend %d/%d: %s", gpu_idx,
+                n_backends, ggml_backend_name(gpu_backend));
+
+    kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
+    if (!kv_gpu_buf) {
+      RS_LOG_ERR("DecodeWithLLM: Failed to allocate GPU KV cache buffers");
+      ggml_free(ctx_kv);
+      return false;
+    }
+
+    std::vector<float> zero_kv((size_t)kv_dim * n_kv_max, 0.0f);
+    for (int il = 0; il < n_layer; ++il) {
+      ggml_backend_tensor_set(gpu_kv_k_vec[il], zero_kv.data(), 0,
+                              zero_kv.size() * sizeof(float));
+      ggml_backend_tensor_set(gpu_kv_v_vec[il], zero_kv.data(), 0,
+                              zero_kv.size() * sizeof(float));
+    }
+
+    RS_LOG_INFO("GPU KV cache allocated: %d layers, kv_dim=%d, n_kv_max=%d "
+                "(%.1f MB/layer, total %.1f MB)",
+                n_layer, kv_dim, n_kv_max,
+                (double)kv_dim * n_kv_max * 2 * sizeof(float) / (1024 * 1024),
+                (double)kv_dim * n_kv_max * 2 * n_layer * sizeof(float) /
+                    (1024 * 1024));
+  }
+
+  // 3. Build projection graph for prefix + audio.  The resulting
+  // llm_embeds tensor is passed directly into the LLM prefill graph, so the
+  // projection output never round-trips through host memory.
   struct ggml_init_params proj_params = {512 * ggml_tensor_overhead(), nullptr,
                                          true};
   struct ggml_context *ctx_proj = ggml_init(proj_params);
-  struct ggml_cgraph *gf_proj = ggml_new_graph(ctx_proj);
 
   // 3a. Token embeddings for user_input tokens
   ggml_tensor *inp_prefix_tokens =
@@ -609,6 +679,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, suffix_tokens.size());
   ggml_set_name(inp_suffix_tokens, "input_suffix_tokens");
   ggml_set_input(inp_prefix_tokens);
+  ggml_set_input(inp_suffix_tokens);
   ggml_tensor *prefix_embeds =
       ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_prefix_tokens);
   ggml_tensor *suffix_embeds =
@@ -624,39 +695,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_tensor *llm_embeds =
       ggml_concat(ctx_proj, prefix_embeds, audio_embeds, 1);
   llm_embeds = ggml_concat(ctx_proj, llm_embeds, suffix_embeds, 1);
-  ggml_set_output(llm_embeds);
-  ggml_build_forward_expand(gf_proj, llm_embeds);
-
-  // 4. Allocate and execute projection graph
-  if (!ggml_backend_sched_alloc_graph(sched, gf_proj)) {
-    RS_LOG_ERR("DecodeWithLLM: failed to allocate projection graph");
-    ggml_free(ctx_proj);
-    return false;
-  }
-
-  // Set input data
-  ggml_backend_tensor_copy(sv_state.encoder_out, audio_encoder_out);
-  ggml_backend_tensor_set(inp_prefix_tokens, prefix_tokens.data(), 0,
-                          prefix_tokens.size() * sizeof(int32_t));
-  ggml_backend_tensor_set(inp_suffix_tokens, suffix_tokens.data(), 0,
-                          suffix_tokens.size() * sizeof(int32_t));
-
-  {
-    ImatrixHookGuard hook(sched, &imatrix_cb_);
-    if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
-      RS_LOG_ERR("DecodeWithLLM: projection graph compute failed");
-      ggml_free(ctx_proj);
-      return false;
-    }
-  }
-
-  // Get combined embeddings
-  std::vector<float> llm_embeds_host(ggml_nelements(llm_embeds));
-  ggml_backend_tensor_get(llm_embeds, llm_embeds_host.data(), 0,
-                          ggml_nbytes(llm_embeds));
-
-  ggml_free(ctx_proj);
-  ggml_backend_sched_reset(sched);
 
   // 6. Build positions for LLM
   std::vector<llm_pos> positions(total_T);
@@ -664,43 +702,42 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     positions[i] = i + 2; // Position ids start from 2 (matches Python)
   }
 
-  // 7. Create graph context and input tensor for LLM
-  struct ggml_init_params llm_params = {512 * ggml_tensor_overhead(), nullptr,
-                                        true};
-  struct ggml_context *ctx_llm = ggml_init(llm_params);
-
-  // Create input tensor for LLM graph
-  ggml_tensor *llm_input =
-      ggml_new_tensor_2d(ctx_llm, GGML_TYPE_F32, hparams_.n_llm_embd, total_T);
-  ggml_set_name(llm_input, "llm_input");
-  ggml_set_input(llm_input);
-
   // 8. Use Qwen3 to decode from embeddings
   llm_build_opts opts;
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
-  opts.use_kv_cache = true; // Enable KV extraction for decode loop
+  opts.use_kv_cache = true;
+  opts.n_kv_max = n_kv_max;
+  opts.gpu_kv_k = gpu_kv_k_vec.data();
+  opts.gpu_kv_v = gpu_kv_v_vec.data();
   opts.causal_mask = true;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
-      llm_input, total_T, nullptr, positions.data(), &opts);
+      llm_embeds, total_T, nullptr, positions.data(), &opts);
 
   if (!result) {
     RS_LOG_ERR("Failed to build LLM graph");
-    ggml_free(ctx_llm);
+    ggml_free(ctx_proj);
+    ggml_backend_buffer_free(kv_gpu_buf);
+    ggml_free(ctx_kv);
     return false;
   }
 
   // 9. Allocate and execute LLM graph
+  result->assign_kv_backend(sched, kv_backend, n_layer);
   if (!ggml_backend_sched_alloc_graph(sched, result->get_graph())) {
     RS_LOG_ERR("DecodeWithLLM: failed to allocate LLM prefill graph");
-    ggml_free(ctx_llm);
+    ggml_free(ctx_proj);
+    ggml_backend_buffer_free(kv_gpu_buf);
+    ggml_free(ctx_kv);
     return false;
   }
 
-  // Set input data after graph allocation
-  ggml_backend_tensor_set(llm_input, llm_embeds_host.data(), 0,
-                          llm_embeds_host.size() * sizeof(float));
+  ggml_backend_tensor_copy(sv_state.encoder_out, audio_encoder_out);
+  ggml_backend_tensor_set(inp_prefix_tokens, prefix_tokens.data(), 0,
+                          prefix_tokens.size() * sizeof(int32_t));
+  ggml_backend_tensor_set(inp_suffix_tokens, suffix_tokens.data(), 0,
+                          suffix_tokens.size() * sizeof(int32_t));
 
   // Position ids were built during graph construction, now set the data
   ggml_tensor *positions_tensor = result->get_input_tensor("position_ids");
@@ -737,7 +774,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("DecodeWithLLM: LLM prefill compute failed");
-      ggml_free(ctx_llm);
+      ggml_backend_sched_reset(sched);
+      ggml_free(ctx_proj);
+      ggml_backend_buffer_free(kv_gpu_buf);
+      ggml_free(ctx_kv);
       return false;
     }
   }
@@ -746,7 +786,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_tensor *logits = result->get_logits();
   if (!logits) {
     RS_LOG_ERR("DecodeWithLLM: no logits tensor from LLM prefill");
-    ggml_free(ctx_llm);
+    ggml_backend_sched_reset(sched);
+    ggml_free(ctx_proj);
+    ggml_backend_buffer_free(kv_gpu_buf);
+    ggml_free(ctx_kv);
     return false;
   }
 
@@ -812,54 +855,15 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         eos_token_id, eos_logit, best_prob, best_token);
   }
 
-  // Extract K/V per layer from output tensors and store in host cache
-  const auto &lp = llm_model_->hparams();
-  const int n_layer = lp.n_layer;
-  const int n_head_kv = lp.n_head_kv > 0 ? lp.n_head_kv : lp.n_head;
-  const int head_dim = lp.head_dim;
-  const int kv_dim = head_dim * n_head_kv;
-
-  host_kv_cache_k_.assign(n_layer, std::vector<float>());
-  host_kv_cache_v_.assign(n_layer, std::vector<float>());
   n_cached_tokens_ = total_T;
-
-  for (int il = 0; il < n_layer; ++il) {
-    ggml_tensor *k_out = result->get_kv_output_k(il);
-    ggml_tensor *v_out = result->get_kv_output_v(il);
-    if (k_out && v_out) {
-      // KV output tensors are 3D [head_dim, n_head_kv, n_tokens] (contiguous)
-      // Memory layout is equivalent to 2D [kv_dim, n_tokens] for contiguous
-      // tensors
-      size_t kv_bytes = ggml_nbytes(k_out);
-      size_t kv_size = kv_bytes / sizeof(float);
-      host_kv_cache_k_[il].resize(kv_size);
-      host_kv_cache_v_[il].resize(kv_size);
-      ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
-      ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
-    } else {
-      RS_LOG_ERR("Prefill KV output null for layer %d! k=%p v=%p", il, k_out,
-                 v_out);
-    }
-  }
 
   // Verify KV cache data integrity after prefill
   if (debug_decode) {
-    float k_sum = 0.0f, v_sum = 0.0f;
-    if (!host_kv_cache_k_.empty() && !host_kv_cache_k_[0].empty()) {
-      size_t check_n = 16;
-      if (check_n > host_kv_cache_k_[0].size())
-        check_n = host_kv_cache_k_[0].size();
-      for (size_t i = 0; i < check_n; ++i) {
-        k_sum += host_kv_cache_k_[0][i];
-        v_sum += host_kv_cache_v_[0][i];
-      }
-    }
-    RS_LOG_DEBUG(
-        "Prefill KV cache: layer0 K_sum(16)=%.4f V_sum(16)=%.4f, n_cached=%d",
-        k_sum, v_sum, n_cached_tokens_);
+    RS_LOG_DEBUG("Prefill KV cache is device-resident, n_cached=%d",
+                 n_cached_tokens_);
   }
 
-  ggml_free(ctx_llm);
+  ggml_free(ctx_proj);
   ggml_backend_sched_reset(sched);
 
   // ==========================================
@@ -880,95 +884,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   static constexpr int PENALTY_WINDOW = 64; // only penalize recent tokens
 
   // ==========================================
-  // O3: Allocate persistent GPU-side KV cache buffers
-  // Instead of uploading the entire KV cache every step, we allocate
-  // max-capacity GPU buffers ONCE using ggml_backend_alloc_ctx_tensors
-  // (independent of the scheduler, so they survive sched_reset cycles).
-  // Each step only writes the new 1-column KV via ggml_cpy inside the
-  // compute graph, then uses a view for attention.
-  // ==========================================
-  const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
-  std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
-  std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
-  ggml_backend_buffer_t kv_gpu_buf = nullptr;
-  struct ggml_context *ctx_kv = nullptr;
-
-  {
-    struct ggml_init_params kv_buf_params = {
-        (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
-        true};
-    ctx_kv = ggml_init(kv_buf_params);
-
-    for (int il = 0; il < n_layer; ++il) {
-      gpu_kv_k_vec[il] =
-          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
-      gpu_kv_v_vec[il] =
-          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
-      ggml_set_name(gpu_kv_k_vec[il],
-                    ("gpu_kv_k_" + std::to_string(il)).c_str());
-      ggml_set_name(gpu_kv_v_vec[il],
-                    ("gpu_kv_v_" + std::to_string(il)).c_str());
-    }
-
-    // Allocate KV cache on the fastest available backend.
-    // rs_context appends GPU backends first and CPU last (CPU must be last
-    // for ggml_backend_sched_new), so we scan for the first non-CPU backend
-    // and fall back to the last one (CPU-only build) if none is found.
-    int n_backends = ggml_backend_sched_get_n_backends(sched);
-    int gpu_idx = n_backends - 1;
-    for (int bi = 0; bi < n_backends; ++bi) {
-      ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
-      ggml_backend_dev_t dev = ggml_backend_get_device(b);
-      if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        gpu_idx = bi;
-        break;
-      }
-    }
-    ggml_backend_t gpu_backend =
-        ggml_backend_sched_get_backend(sched, gpu_idx);
-    RS_LOG_INFO("KV cache allocated on backend %d/%d: %s", gpu_idx,
-                n_backends, ggml_backend_name(gpu_backend));
-
-    kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
-    if (!kv_gpu_buf) {
-      RS_LOG_ERR("DecodeWithLLM: Failed to allocate GPU KV cache buffers");
-    }
-
-    // Upload initial KV data from host (prefill results)
-    for (int il = 0; il < n_layer; ++il) {
-      size_t kv_bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
-      ggml_backend_tensor_set(gpu_kv_k_vec[il], host_kv_cache_k_[il].data(), 0,
-                              kv_bytes);
-      ggml_backend_tensor_set(gpu_kv_v_vec[il], host_kv_cache_v_[il].data(), 0,
-                              kv_bytes);
-    }
-
-    RS_LOG_INFO("GPU KV cache allocated: %d layers, kv_dim=%d, n_kv_max=%d "
-                "(%.1f MB/layer, total %.1f MB)",
-                n_layer, kv_dim, n_kv_max,
-                (double)kv_dim * n_kv_max * 2 * sizeof(float) / (1024 * 1024),
-                (double)kv_dim * n_kv_max * 2 * n_layer * sizeof(float) /
-                    (1024 * 1024));
-    // Note: ctx_kv must NOT be freed — the tensor descriptors must persist
-    // for the lifetime of the GPU buffer. We'll free both at the end of decode.
-  }
-
-  // ==========================================
   // Pre-warm gallocr: reserve GPU compute buffer at maximum size.
   //
-  // Each decode step grows n_kv_cache by 1 (causal mask and KV-concat tensors
-  // grow with it).  Without this warmup, ggml_gallocr_needs_realloc() returns
-  // true every single step, triggering ggml_gallocr_reserve() which frees and
-  // re-allocates the GPU scratch buffer via the Metal/CUDA driver.  That is an
-  // expensive syscall that happens MAX_DECODE_TOKENS (512) times per segment.
-  // Over a long session the repeated alloc/free fragments GPU memory so each
-  // reallocation becomes progressively slower — the direct cause of rising RTF.
-  //
-  // By pre-warming with the LARGEST decode graph (n_kv_cache = n_kv_max - 1),
-  // the gallocr records size_max at the maximum values for every tensor.
-  // All subsequent decode steps see tensors whose sizes are <= size_max, so
-  // ggml_gallocr_needs_realloc() stays false and the GPU scratch buffer is
-  // never reallocated inside the loop.
+  // Decode graph shape is fixed at n_kv_max, so one reservation covers all
+  // token steps and ACL graph caching sees stable tensor shapes.
   {
     llm_build_opts warmup_opts;
     warmup_opts.output_mode   = llm_output_mode::OUTPUT_LOGITS;
@@ -977,6 +896,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     warmup_opts.is_decode_step = true;
     warmup_opts.n_kv_cache    = n_kv_max - 1;
     warmup_opts.n_kv_max      = n_kv_max;
+    warmup_opts.fixed_kv_cache_shape = true;
     warmup_opts.causal_mask   = true;
     warmup_opts.gpu_kv_k      = gpu_kv_k_vec.data();
     warmup_opts.gpu_kv_v      = gpu_kv_v_vec.data();
@@ -987,6 +907,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         &dummy_token, 1, nullptr, &warmup_pos, &warmup_opts);
     if (warmup_result) {
       // sched_reserve calls sched_reset internally; gallocr size_max persists.
+      warmup_result->assign_kv_backend(sched, kv_backend, n_layer);
       ggml_backend_sched_reserve(sched, warmup_result->get_graph());
     }
   }
@@ -994,9 +915,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // ==========================================
   // Autoregressive decode loop (with GPU-persistent KV cache)
   // ==========================================
-  std::vector<float> kv_stage_k(kv_dim);
-  std::vector<float> kv_stage_v(kv_dim);
-
   for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
     if (debug_decode) {
@@ -1012,9 +930,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     dec_opts.is_decode_step = true;
     dec_opts.n_kv_cache = n_cached_tokens_;
     dec_opts.n_kv_max = n_kv_max;
+    dec_opts.fixed_kv_cache_shape = true;
     dec_opts.causal_mask = true;
-    // Pass GPU-persistent KV buffers — build_kv_cache_concat will use
-    // views into these buffers instead of creating kv_cached input tensors
     dec_opts.gpu_kv_k = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v = gpu_kv_v_vec.data();
 
@@ -1026,6 +943,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       break;
     }
 
+    dec_result->assign_kv_backend(sched, kv_backend, n_layer);
     if (!ggml_backend_sched_alloc_graph(sched, dec_result->get_graph())) {
       RS_LOG_ERR("Failed to allocate decode graph at step %d", step);
       break;
@@ -1051,9 +969,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       dec_result->set_causal_mask(dec_mask_tensor, 1, n_cached_tokens_);
     }
 
-    // O3: GPU KV buffer already contains the first n_cached columns.
-    // build_kv_cache_concat uses views into the GPU buffer for the
-    // cached portion — no need to upload full KV cache each step!
+    dec_result->set_kv_write_indices(n_cached_tokens_, n_layer);
 
     // Execute decode step
     {
@@ -1124,27 +1040,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       alternating_count++;
     } else {
       alternating_count = 0;
-    }
-
-    // Update host KV cache + GPU KV buffer: append new column
-    for (int il = 0; il < n_layer; ++il) {
-      ggml_tensor *k_out = dec_result->get_kv_output_k(il);
-      ggml_tensor *v_out = dec_result->get_kv_output_v(il);
-      if (k_out && v_out) {
-        const size_t new_col_bytes = (size_t)kv_dim * sizeof(float);
-        const size_t col_offset =
-            (size_t)n_cached_tokens_ * kv_dim * sizeof(float);
-        ggml_backend_tensor_get(k_out, kv_stage_k.data(), col_offset,
-                                new_col_bytes);
-        ggml_backend_tensor_get(v_out, kv_stage_v.data(), col_offset,
-                                new_col_bytes);
-
-        // Write new column to GPU-persistent buffer for next step's view
-        ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(),
-                                col_offset, new_col_bytes);
-        ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(),
-                                col_offset, new_col_bytes);
-      }
     }
 
     n_cached_tokens_++;

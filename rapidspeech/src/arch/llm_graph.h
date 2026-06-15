@@ -169,6 +169,7 @@ struct llm_build_opts {
       false;               // true = decode step (n_tokens=1, concat cached K/V)
   uint32_t n_kv_cache = 0; // Number of cached KV pairs for decode step
   uint32_t n_kv_max = 0;   // Max KV cache capacity (for GPU-persistent buffers)
+  bool fixed_kv_cache_shape = false; // Use n_kv_max-wide decode attention views
 
   // GPU-persistent KV cache buffers (optional, for O3 optimisation)
   // When provided, build_kv_cache_concat will use a view into these
@@ -287,6 +288,9 @@ public:
                         uint32_t n_tokens);
   void set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
                        uint32_t n_kv_cache);
+  void set_kv_write_indices(uint32_t index, uint32_t n_layers);
+  void assign_kv_backend(ggml_backend_sched_t sched, ggml_backend_t backend,
+                         uint32_t n_layers);
 
   // Get input tensor for setting data
   ggml_tensor *get_input_tensor(const char *name) const;

@@ -6,6 +6,17 @@
 #include <cstring>
 #include <stdexcept>
 
+namespace {
+
+ggml_tensor *llm_view_root(ggml_tensor *tensor) {
+  while (tensor && tensor->view_src) {
+    tensor = tensor->view_src;
+  }
+  return tensor;
+}
+
+} // namespace
+
 // ============================================
 // llm_graph_result Implementation
 // ============================================
@@ -127,7 +138,7 @@ void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
 
   // Mask shape: [n_kv, n_tokens], ne[0]=n_kv, ne[1]=n_tokens
   // F32 mask tensor for use with ggml_add(kq_f32, mask_f32).
-  const uint32_t n_kv = n_kv_cache + n_tokens;
+  const uint32_t n_kv = static_cast<uint32_t>(mask->ne[0]);
   const size_t n_elem = (size_t)n_tokens * n_kv;
   std::vector<float> mask_data(n_elem, 0.0f);
 
@@ -145,6 +156,83 @@ void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
 
   ggml_backend_tensor_set(mask, mask_data.data(), 0,
                           mask_data.size() * sizeof(float));
+}
+
+void llm_graph_result::set_kv_write_indices(uint32_t index,
+                                            uint32_t n_layers) {
+  for (uint32_t il = 0; il < n_layers; ++il) {
+    char name[64];
+    snprintf(name, sizeof(name), "kv_write_idx_layer_%u", il);
+    ggml_tensor *idx = get_input_tensor(name);
+    if (!idx || !idx->data) {
+      continue;
+    }
+
+    const int64_t n_idx = ggml_nelements(idx);
+    std::vector<int32_t> rows(n_idx);
+    for (int64_t i = 0; i < n_idx; ++i) {
+      rows[i] = static_cast<int32_t>(index + static_cast<uint32_t>(i));
+    }
+    ggml_backend_tensor_set(idx, rows.data(), 0,
+                            rows.size() * sizeof(int32_t));
+  }
+}
+
+void llm_graph_result::assign_kv_backend(ggml_backend_sched_t sched,
+                                         ggml_backend_t backend,
+                                         uint32_t n_layers) {
+  if (!sched || !backend) {
+    return;
+  }
+
+  for (uint32_t il = 0; il < n_layers; ++il) {
+    if (opts_.gpu_kv_k && opts_.gpu_kv_k[il]) {
+      ggml_backend_sched_set_tensor_backend(sched, opts_.gpu_kv_k[il],
+                                            backend);
+    }
+    if (opts_.gpu_kv_v && opts_.gpu_kv_v[il]) {
+      ggml_backend_sched_set_tensor_backend(sched, opts_.gpu_kv_v[il],
+                                            backend);
+    }
+
+    char name[64];
+    snprintf(name, sizeof(name), "kv_write_idx_layer_%u", il);
+    if (ggml_tensor *idx = get_input_tensor(name)) {
+      ggml_backend_sched_set_tensor_backend(sched, idx, backend);
+    }
+  }
+
+  if (!gf_) {
+    return;
+  }
+  const int n_nodes = ggml_graph_n_nodes(gf_);
+  for (int i = 0; i < n_nodes; ++i) {
+    ggml_tensor *node = ggml_graph_node(gf_, i);
+    if (!node) {
+      continue;
+    }
+    if (node->op != GGML_OP_SET && node->op != GGML_OP_SET_ROWS) {
+      continue;
+    }
+
+    ggml_tensor *view_src = llm_view_root(node->view_src);
+    if (!view_src && node->src[2]) {
+      view_src = llm_view_root(node->src[2]);
+    }
+    if (!view_src) {
+      continue;
+    }
+
+    bool touches_kv = false;
+    for (uint32_t il = 0; il < n_layers && !touches_kv; ++il) {
+      touches_kv =
+          (opts_.gpu_kv_k && view_src == opts_.gpu_kv_k[il]) ||
+          (opts_.gpu_kv_v && view_src == opts_.gpu_kv_v[il]);
+    }
+    if (touches_kv) {
+      ggml_backend_sched_set_tensor_backend(sched, node, backend);
+    }
+  }
 }
 
 // Set position ids
@@ -311,6 +399,58 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                                          llm_kv_cache *kv_cache,
                                          uint32_t n_tokens, int32_t il) {
   (void)kv_cache;
+
+  const bool has_gpu_kv = current_opts_.use_kv_cache &&
+                          current_opts_.gpu_kv_k && current_opts_.gpu_kv_v &&
+                          current_opts_.n_kv_max > 0;
+  if (has_gpu_kv) {
+    ggml_tensor *k_gpu = current_opts_.gpu_kv_k[il];
+    ggml_tensor *v_gpu = current_opts_.gpu_kv_v[il];
+    if (k_gpu && v_gpu) {
+      const int64_t head_dim = k_cur->ne[0];
+      const int64_t n_head_kv = k_cur->ne[1];
+      const int64_t n_cur = k_cur->ne[2];
+      const int64_t kv_dim = head_dim * n_head_kv;
+
+      ggml_tensor *k_cur_2d =
+          ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur), kv_dim, n_cur);
+      ggml_tensor *v_cur_2d =
+          ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur), kv_dim, n_cur);
+
+      if (!current_opts_.is_decode_step) {
+        ggml_tensor *k_after =
+            ggml_set_2d_inplace(ctx, k_gpu, k_cur_2d, k_gpu->nb[1], 0);
+        ggml_tensor *v_after =
+            ggml_set_2d_inplace(ctx, v_gpu, v_cur_2d, v_gpu->nb[1], 0);
+        ggml_tensor *k_view =
+            ggml_view_2d(ctx, k_after, kv_dim, n_cur, k_after->nb[1], 0);
+        ggml_tensor *v_view =
+            ggml_view_2d(ctx, v_after, kv_dim, n_cur, v_after->nb[1], 0);
+        return {ggml_reshape_3d(ctx, k_view, head_dim, n_head_kv, n_cur),
+                ggml_reshape_3d(ctx, v_view, head_dim, n_head_kv, n_cur)};
+      }
+
+      if (current_opts_.fixed_kv_cache_shape) {
+        ggml_tensor *write_idx =
+            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cur);
+        ggml_set_input(write_idx);
+        char idx_name[64];
+        snprintf(idx_name, sizeof(idx_name), "kv_write_idx_layer_%d", il);
+        ggml_set_name(write_idx, idx_name);
+
+        ggml_tensor *k_after = ggml_set_rows(ctx, k_gpu, k_cur_2d, write_idx);
+        ggml_tensor *v_after = ggml_set_rows(ctx, v_gpu, v_cur_2d, write_idx);
+
+        const int64_t n_total = current_opts_.n_kv_max;
+        ggml_tensor *k_view =
+            ggml_view_2d(ctx, k_after, kv_dim, n_total, k_after->nb[1], 0);
+        ggml_tensor *v_view =
+            ggml_view_2d(ctx, v_after, kv_dim, n_total, v_after->nb[1], 0);
+        return {ggml_reshape_3d(ctx, k_view, head_dim, n_head_kv, n_total),
+                ggml_reshape_3d(ctx, v_view, head_dim, n_head_kv, n_total)};
+      }
+    }
+  }
 
   if (current_opts_.is_decode_step && current_opts_.n_kv_cache > 0) {
     // Decode step: concatenate cached K/V with current K/V
