@@ -21,9 +21,10 @@ On a real Jetson Nano gen1 (Maxwell sm_53, CUDA 10.2, ggml-CUDA):
 ## Frontend note
 
 RapidSpeech now ships a built-in Matcha frontend (`frontend/matcha_frontend.{h,cpp}`,
-used by `rs-tts-offline` via `MATCHA_TOKENS` + `MATCHA_LEXICON`) that turns **Chinese**
-text into phoneme IDs from the model's `tokens.txt` + `lexicon.txt` (zh-TW and zh, no
-conversion). **English** segments still need espeak (not yet wired) and are skipped.
+used by `rs-tts-offline` via `MATCHA_TOKENS` + `MATCHA_LEXICON`) that turns **mixed
+Chinese/English** text into phoneme IDs from the model's `tokens.txt` + `lexicon.txt`
+(zh-TW and zh, no conversion; English via espeak-ng + the diphthong replacement table,
+`-DRS_MATCHA_ESPEAK=ON`). Punctuation maps to tokens and synthesis is split per clause.
 
 This **demo service** is intentionally lower-level: it takes pre-computed phoneme-ID
 files, not raw text, so it stays independent of the frontend (drive it from the built-in

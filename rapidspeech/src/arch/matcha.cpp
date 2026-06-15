@@ -357,6 +357,11 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   auto& st = static_cast<MatchaState&>(state);
   // If the caller didn't pre-load phoneme_ids (e.g. via MATCHA_IDS in the demo),
   // run the text frontend: tokens.txt + lexicon.txt from MATCHA_TOKENS/MATCHA_LEXICON.
+  if (const char* idf = getenv("MATCHA_IDS")) {   // test hook: raw int32-LE ids file
+    FILE* f = fopen(idf, "rb");
+    if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+             st.phoneme_ids.resize(sz / 4); if (fread(st.phoneme_ids.data(), 4, st.phoneme_ids.size(), f) != st.phoneme_ids.size()) st.phoneme_ids.clear(); fclose(f); }
+  }
   if (st.phoneme_ids.empty() && text && *text) {
     const char* tok = getenv("MATCHA_TOKENS");
     const char* lex = getenv("MATCHA_LEXICON");
@@ -374,8 +379,23 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
     }
   }
   if (st.phoneme_ids.empty()) { RS_LOG_ERR("matcha: no phoneme_ids (empty text / frontend produced nothing)"); return false; }
-  const int L = (int)st.phoneme_ids.size();
+
+  // Clause-split at punctuation terminator tokens (; : , . ! ?) and synthesize each
+  // clause separately, concatenating the audio — matches sherpa-onnx. An English word
+  // embedded between Chinese (e.g. a name) renders cleanly in a short clause but gets
+  // buried/attenuated inside one long mixed sequence.
+  std::vector<int32_t> full_ids = st.phoneme_ids;
+  std::vector<std::vector<int32_t>> clauses; {
+    std::vector<int32_t> cur;
+    auto is_term = [](int32_t id) { return id == 2 || id == 3 || id == 4 || id == 5 || id == 6 || id == 7; };
+    for (int32_t id : full_ids) { cur.push_back(id); if (is_term(id)) { clauses.push_back(cur); cur.clear(); } }
+    if (!cur.empty()) clauses.push_back(cur);
+    if (clauses.empty()) clauses.push_back(full_ids);
+  }
+  std::vector<float> all_audio;
   const int ROT = hp_.rotary_dim, RH = ROT / 2;
+  for (auto& clause_ids : clauses) {
+  const int L = (int)clause_ids.size();
   std::vector<float> cosv((size_t)ROT * L), sinv((size_t)ROT * L);
   for (int p = 0; p < L; p++) for (int d = 0; d < RH; d++) {
     float freq = std::pow(10000.0f, -2.0f * d / ROT), ang = p * freq;
@@ -392,7 +412,7 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   ggml_context* cA = nullptr; ggml_cgraph* gA = nullptr;
   if (!init_compute_ctx(&cA, &gA, 8192)) return false;
   pending_.clear();
-  ggml_tensor* ids = inp_i32(cA, L, st.phoneme_ids.data());
+  ggml_tensor* ids = inp_i32(cA, L, clause_ids.data());
   ggml_tensor* cosT = inp_f32(cA, ROT, L, cosv.data());
   ggml_tensor* sinT = inp_f32(cA, ROT, L, sinv.data());
   ggml_tensor* logw = nullptr;
@@ -450,8 +470,7 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
   std::vector<float> head_raw((size_t)514 * ylen);
   ggml_backend_tensor_get(head, head_raw.data(), 0, ggml_nbytes(head));
   ggml_free(cB);
-  st.audio_output = istft(head_raw.data(), ylen);
-  st.audio_read_cursor = 0;
+  { auto a = istft(head_raw.data(), ylen); all_audio.insert(all_audio.end(), a.begin(), a.end()); }
 #ifdef MATCHA_PROFILE
   auto p2 = pf();
   RS_LOG_INFO("matcha PROFILE: phaseA(enc)=%.1fms  decBuild=%.1fms  decCompute=%.1fms  istft=%.1fms",
@@ -460,7 +479,12 @@ bool MatchaModel::PushText(RSState& state, const char* text, const char* languag
               std::chrono::duration<double, std::milli>(p1 - p0).count(),
               std::chrono::duration<double, std::milli>(p2 - p1).count());
 #endif
-  RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs), ylen=%d", st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate, ylen);
+  }  // for each clause
+  st.phoneme_ids = std::move(full_ids);
+  st.audio_output = std::move(all_audio);
+  st.audio_read_cursor = 0;
+  RS_LOG_INFO("matcha: synthesized %zu samples (%.2fs) over %zu clause(s)",
+              st.audio_output.size(), st.audio_output.size() / (float)hp_.sample_rate, clauses.size());
   return true;
 }
 

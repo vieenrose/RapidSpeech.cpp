@@ -58,7 +58,7 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 **Text-to-Speech (TTS)**
 - [x] OpenVoice2 (MeloTTS + voice cloning)
 - [x] MeloTTS (VITS acoustic model; 8 kHz zh/en build runs on Jetson Nano gen1)
-- [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, built-in **zh** text frontend, CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/); en/espeak path pending)
+- [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, built-in **zh+en** text frontend (en via espeak, `-DRS_MATCHA_ESPEAK=ON`), CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/))
 - [x] OmniVoice (single-stage non-autoregressive diffusion TTS, multilingual + voice cloning)
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
@@ -340,19 +340,25 @@ scripts/build_jetson_nano_gen1.sh          # -> build-nano/  (CUDA, sm_53)
 scripts/build_jetson_nano_gen1_native.sh
 ```
 
-#### Matcha-TTS from text (built-in zh frontend)
+#### Matcha-TTS from text (built-in zh + en frontend)
 
-`rs-tts-offline` synthesizes Matcha directly from **Chinese** text using the built-in
-frontend (`frontend/matcha_frontend.{h,cpp}`): point it at the model's `tokens.txt` +
-`lexicon.txt` (zh-TW and zh both covered, no conversion) via env vars.
+`rs-tts-offline` synthesizes Matcha directly from **mixed Chinese/English** text using the
+built-in frontend (`frontend/matcha_frontend.{h,cpp}`): point it at the model's `tokens.txt`
++ `lexicon.txt` (zh-TW and zh both covered, no conversion) via env vars.
 
 ```bash
 MATCHA_TOKENS=tokens.txt MATCHA_LEXICON=lexicon.txt \
-  ./build/rs-tts-offline -m matcha8k.gguf -t "你好，歡迎來到本公司。請問您要找哪一位？" -o out.wav
+  ./build/rs-tts-offline -m matcha8k.gguf -t "你好，我是 Amy，很高興為您服務。" -o out.wav
 ```
 
-The frontend reproduces the sherpa-onnx Matcha reference exactly (validated ID-for-ID).
-**English** segments need espeak (not yet wired) and are skipped with a warning.
+The frontend reproduces the sherpa-onnx Matcha reference (validated ID-for-ID + ASR):
+- **Chinese**: per-character lexicon lookup (pinyin-with-tone tokens).
+- **English**: espeak-ng IPA → the model's token set via the diphthong replacement table
+  (`eɪ→A, oʊ→O, aɪ→I`, …; sherpa PR #2853). Build with `-DRS_MATCHA_ESPEAK=ON`
+  (`-DESPEAK_NG_ROOT=<dir>` to point at a vendored espeak-ng); without it, English is skipped.
+- **Punctuation**: full-width `，。！？` map to their tokens, and synthesis is **split per
+  clause** (like sherpa) so an English word embedded between Chinese renders cleanly instead
+  of being buried in one long sequence.
 
 #### matcha-server — warm-persistent Matcha-TTS demo (`examples/matcha_server/`)
 

@@ -15,6 +15,7 @@ option(RS_CANN "Enable CANN acceleration (Huawei)" OFF)
 option(RS_OPENCL "Enable OpenCL acceleration" OFF)
 option(RS_WEBGPU "Enable WebGPU acceleration (Dawn native / emdawnwebgpu for WASM)" OFF)
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
+option(RS_MATCHA_ESPEAK "Enable espeak-ng English path in the Matcha text frontend" OFF)
 option(RS_BUILD_CLI "Build command-line example executables" ON)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
@@ -258,6 +259,26 @@ set_target_properties(rapidspeech-core PROPERTIES
 )
 
 target_link_libraries(rapidspeech-core PRIVATE ggml Threads::Threads)
+
+# --- Matcha English frontend (espeak-ng) ---
+# Optional: drives the English path of the Matcha text frontend. The data dir is
+# espeak's default or ESPEAK_DATA_PATH at runtime. Pass -DESPEAK_NG_ROOT=<dir> to
+# point at a cross-built/vendored espeak-ng (lib + include); else search the system.
+if (RS_MATCHA_ESPEAK)
+    find_library(ESPEAK_NG_LIB NAMES espeak-ng espeak-ng.so.1
+                 HINTS ${ESPEAK_NG_ROOT} ${ESPEAK_NG_ROOT}/lib PATH_SUFFIXES lib)
+    find_path(ESPEAK_NG_INC NAMES espeak-ng/speak_lib.h
+              HINTS ${ESPEAK_NG_ROOT} ${ESPEAK_NG_ROOT}/include PATH_SUFFIXES include)
+    if (ESPEAK_NG_LIB AND ESPEAK_NG_INC)
+        message(STATUS "RapidSpeech: Matcha espeak-ng English path enabled (${ESPEAK_NG_LIB})")
+        target_compile_definitions(rapidspeech-core PRIVATE HAVE_ESPEAK)
+        target_include_directories(rapidspeech-core PRIVATE ${ESPEAK_NG_INC})
+        target_link_libraries(rapidspeech-core PRIVATE ${ESPEAK_NG_LIB})
+    else()
+        message(FATAL_ERROR "RS_MATCHA_ESPEAK=ON but espeak-ng not found "
+                            "(set -DESPEAK_NG_ROOT=<dir> with lib + include).")
+    endif()
+endif()
 
 # --- Hardware Acceleration Logic ---
 

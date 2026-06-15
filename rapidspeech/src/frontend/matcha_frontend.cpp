@@ -6,6 +6,70 @@
 #include <sstream>
 #include <string>
 
+#ifdef HAVE_ESPEAK
+#include <espeak-ng/speak_lib.h>
+#include <cstdlib>
+#endif
+
+namespace {
+
+#ifdef HAVE_ESPEAK
+// English -> espeak-ng IPA phonemes, split into individual UTF-8 codepoints (the
+// matcha-icefall model tokenizes IPA per codepoint: diphthongs like /oʊ/ are o + ʊ,
+// stress marks ˈ ˌ and length ː are their own tokens). Initialized once; the data
+// dir is ESPEAK_DATA_PATH (or espeak's default, e.g. /usr/lib/.../espeak-ng-data).
+bool espeak_ready() {
+  static int state = -1;  // -1 untried, 0 failed, 1 ok
+  if (state < 0) {
+    const char* dp = std::getenv("ESPEAK_DATA_PATH");
+    int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, dp, 0);
+    state = (sr > 0 && espeak_SetVoiceByName("en-us") == EE_OK) ? 1 : 0;
+    if (!state) RS_LOG_ERR("matcha frontend: espeak_Initialize failed (data dir? set ESPEAK_DATA_PATH)");
+  }
+  return state == 1;
+}
+
+// IPA->model-token replacements applied to the joined espeak string BEFORE splitting
+// into codepoints. Mirrors sherpa-onnx matcha-tts-lexicon ApplyReplacements (PR #2853):
+// the matcha-icefall model tokenizes English diphthongs as single tokens (A=eɪ, I=aɪ,
+// O=oʊ/əʊ, Y=ɔɪ, W=aʊ) and uses ʧ/ʤ/ɡ/ɹ/ɛ. Order matters (eɪ->A before e->ɛ).
+const std::pair<const char*, const char*> kReplacements[] = {
+  {"ɝ","ɜɹ"},{"ɚ","əɹ"},
+  {"eɪ","A"},{"aɪ","I"},{"ɔɪ","Y"},{"oʊ","O"},{"əʊ","O"},{"aʊ","W"},
+  {"tʃ","ʧ"},{"dʒ","ʤ"},
+  {"ː",""},
+  {"g","ɡ"},{"r","ɹ"},
+  {"e","ɛ"},
+};
+
+void english_to_codepoints(const std::string& seg, std::vector<std::string>& out) {
+  if (!espeak_ready()) return;
+  // 1) collect the full espeak IPA string (clause by clause).
+  std::string ipa;
+  const char* text = seg.c_str();
+  const void* tp = (const void*)text;
+  while (tp) {
+    const char* ph = espeak_TextToPhonemes(&tp, espeakCHARS_UTF8, espeakPHONEMES_IPA);
+    if (ph) ipa += ph;
+    if (!ph) break;
+  }
+  // 2) apply the diphthong/symbol replacements in order.
+  for (const auto& r : kReplacements) {
+    std::string from = r.first, to = r.second; size_t pos = 0;
+    while ((pos = ipa.find(from, pos)) != std::string::npos) { ipa.replace(pos, from.size(), to); pos += to.size(); }
+  }
+  // 3) split into UTF-8 codepoints (the model's tokens).
+  for (size_t i = 0; i < ipa.size(); ) {
+    unsigned char c = (unsigned char)ipa[i];
+    int len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+    out.emplace_back(ipa, i, len);
+    i += len;
+  }
+}
+#endif
+
+}  // namespace
+
 namespace {
 
 // Decode one UTF-8 char starting at p (< end); advance p past it. Returns the
@@ -31,6 +95,23 @@ inline bool is_ascii_keep(uint32_t cp) {
   char c = (char)cp;
   return std::isalnum((unsigned char)c) || c == ' ' || c == ',' ||
          c == '.' || c == '!' || c == '?';
+}
+
+// Map CJK / full-width sentence punctuation to its half-width token (kept, not dropped):
+// these give clause boundaries the duration predictor needs — without them, an English
+// word embedded between Chinese (e.g. "我是 Amy，") loses its boundary and collapses.
+const char* cjk_punct_token(uint32_t cp) {
+  switch (cp) {
+    case 0x3002: case 0xFF0E:            return ".";   // 。 ．
+    case 0xFF0C: case 0x3001:            return ",";   // ， 、
+    case 0xFF01:                         return "!";   // ！
+    case 0xFF1F:                         return "?";   // ？
+    case 0xFF1A:                         return ":";   // ：
+    case 0xFF1B:                         return ";";   // ；
+    case 0x2026:                         return "…";   // …
+    case 0x2014:                         return "—";   // —
+    default:                             return nullptr;
+  }
 }
 
 std::string strip(const std::string& s) {
@@ -117,13 +198,30 @@ std::vector<int32_t> MatchaFrontend::TextToIds(const std::string& text, int* out
       auto it = token2id_.find(s);
       if (it != token2id_.end()) {
         ids.push_back(it->second);                 // lone punctuation, e.g. "." "," "?"
-      } else {
-        // English -> espeak phonemes. Not yet wired (needs espeak-ng); skip.
-        skipped++;
-        RS_LOG_INFO("matcha frontend: English segment '%s' needs espeak (not wired); skipped", s.c_str());
+        continue;
       }
+#ifdef HAVE_ESPEAK
+      // English -> espeak IPA phonemes -> per-codepoint token ids.
+      std::vector<std::string> phs;
+      english_to_codepoints(s, phs);
+      int hit = 0;
+      for (auto& ph : phs) {
+        auto pit = token2id_.find(ph);
+        if (pit != token2id_.end()) { ids.push_back(pit->second); hit++; }
+      }
+      if (hit == 0) { skipped++; RS_LOG_INFO("matcha frontend: English '%s' produced no tokens (espeak/data?)", s.c_str()); }
+#else
+      // English path needs espeak-ng (build with -DRS_MATCHA_ESPEAK=ON); skip for now.
+      skipped++;
+      RS_LOG_INFO("matcha frontend: English segment '%s' needs espeak (not built in); skipped", s.c_str());
+#endif
+    } else if (const char* pt = cjk_punct_token(cp)) {
+      // CJK / full-width punctuation -> its half-width token (clause boundary).
+      auto it = token2id_.find(pt);
+      if (it != token2id_.end()) ids.push_back(it->second);
+      else skipped++;
     } else {
-      // Boundary char (full-width punctuation, etc.): dropped, as in the reference.
+      // Other boundary char: dropped.
       skipped++;
     }
   }
