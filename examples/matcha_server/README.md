@@ -20,11 +20,14 @@ On a real Jetson Nano gen1 (Maxwell sm_53, CUDA 10.2, ggml-CUDA):
 
 ## Frontend note
 
-The matcha ggml arch has **no text→phoneme frontend** (`matcha.cpp`: "no phoneme_ids
-text frontend not wired"). It is driven by espeak-IPA **phoneme IDs**, produced
-externally by sherpa-onnx's matcha frontend (`--debug=1`). This service therefore
-takes phoneme-ID files, not raw text. RapidSpeech's own `text_frontend.cpp` is a
-MeloTTS pinyin vocab and is **incompatible** with matcha's espeak token set.
+RapidSpeech now ships a built-in Matcha frontend (`frontend/matcha_frontend.{h,cpp}`,
+used by `rs-tts-offline` via `MATCHA_TOKENS` + `MATCHA_LEXICON`) that turns **Chinese**
+text into phoneme IDs from the model's `tokens.txt` + `lexicon.txt` (zh-TW and zh, no
+conversion). **English** segments still need espeak (not yet wired) and are skipped.
+
+This **demo service** is intentionally lower-level: it takes pre-computed phoneme-ID
+files, not raw text, so it stays independent of the frontend (drive it from the built-in
+frontend, from sherpa-onnx's matcha frontend `--debug=1`, or any other source).
 
 ## Protocol
 

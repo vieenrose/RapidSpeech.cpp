@@ -15,6 +15,7 @@
 // to [C,T]. GroupNorm8 via reshape[T*C/8,8]->norm->reshape. Linear weights: PyTorch/Gemm weights load
 // ne=[in,out] (no transpose); folded onnx::MatMul "_2" weights load ne=[out,in] (transpose before mul_mat).
 #include "arch/matcha.h"
+#include "frontend/matcha_frontend.h"
 #include "utils/rs_log.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -352,9 +353,27 @@ bool MatchaModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t 
 std::shared_ptr<RSState> MatchaModel::CreateState() { return std::make_shared<MatchaState>(); }
 
 bool MatchaModel::PushText(RSState& state, const char* text, const char* language, const char* instruct) {
-  (void)text; (void)language; (void)instruct;
+  (void)language; (void)instruct;
   auto& st = static_cast<MatchaState&>(state);
-  if (st.phoneme_ids.empty()) { RS_LOG_ERR("matcha: no phoneme_ids (text frontend not wired)"); return false; }
+  // If the caller didn't pre-load phoneme_ids (e.g. via MATCHA_IDS in the demo),
+  // run the text frontend: tokens.txt + lexicon.txt from MATCHA_TOKENS/MATCHA_LEXICON.
+  if (st.phoneme_ids.empty() && text && *text) {
+    const char* tok = getenv("MATCHA_TOKENS");
+    const char* lex = getenv("MATCHA_LEXICON");
+    if (tok && lex) {
+      static MatchaFrontend fe; static bool fe_ready = false, fe_tried = false;
+      if (!fe_tried) { fe_tried = true; fe_ready = fe.Load(tok, lex); }
+      if (fe_ready) {
+        int skipped = 0;
+        st.phoneme_ids = fe.TextToIds(text, &skipped);
+        RS_LOG_INFO("matcha frontend: \"%s\" -> %d ids (%d skipped)",
+                    text, (int)st.phoneme_ids.size(), skipped);
+      }
+    } else {
+      RS_LOG_ERR("matcha: text given but no frontend (set MATCHA_TOKENS + MATCHA_LEXICON, or pre-fill phoneme_ids)");
+    }
+  }
+  if (st.phoneme_ids.empty()) { RS_LOG_ERR("matcha: no phoneme_ids (empty text / frontend produced nothing)"); return false; }
   const int L = (int)st.phoneme_ids.size();
   const int ROT = hp_.rotary_dim, RH = ROT / 2;
   std::vector<float> cosv((size_t)ROT * L), sinv((size_t)ROT * L);

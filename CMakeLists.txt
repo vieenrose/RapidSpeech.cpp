@@ -184,6 +184,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/bert.cpp
         rapidspeech/src/arch/bert.h
         rapidspeech/src/frontend/text_frontend.cpp
+        rapidspeech/src/frontend/matcha_frontend.cpp
         rapidspeech/src/frontend/whisper_mel.h
         rapidspeech/src/frontend/whisper_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h

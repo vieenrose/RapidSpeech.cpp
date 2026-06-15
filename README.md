@@ -58,7 +58,7 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 **Text-to-Speech (TTS)**
 - [x] OpenVoice2 (MeloTTS + voice cloning)
 - [x] MeloTTS (VITS acoustic model; 8 kHz zh/en build runs on Jetson Nano gen1)
-- [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/))
+- [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, built-in **zh** text frontend, CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/); en/espeak path pending)
 - [x] OmniVoice (single-stage non-autoregressive diffusion TTS, multilingual + voice cloning)
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
@@ -340,6 +340,20 @@ scripts/build_jetson_nano_gen1.sh          # -> build-nano/  (CUDA, sm_53)
 scripts/build_jetson_nano_gen1_native.sh
 ```
 
+#### Matcha-TTS from text (built-in zh frontend)
+
+`rs-tts-offline` synthesizes Matcha directly from **Chinese** text using the built-in
+frontend (`frontend/matcha_frontend.{h,cpp}`): point it at the model's `tokens.txt` +
+`lexicon.txt` (zh-TW and zh both covered, no conversion) via env vars.
+
+```bash
+MATCHA_TOKENS=tokens.txt MATCHA_LEXICON=lexicon.txt \
+  ./build/rs-tts-offline -m matcha8k.gguf -t "你好，歡迎來到本公司。請問您要找哪一位？" -o out.wav
+```
+
+The frontend reproduces the sherpa-onnx Matcha reference exactly (validated ID-for-ID).
+**English** segments need espeak (not yet wired) and are skipped with a warning.
+
 #### matcha-server — warm-persistent Matcha-TTS demo (`examples/matcha_server/`)
 
 A demo of the **warm-persistent** pattern for Maxwell: Matcha is launch-bound on sm_53
@@ -347,9 +361,10 @@ A demo of the **warm-persistent** pattern for Maxwell: Matcha is launch-bound on
 ggml-CUDA backend **once**, warms the kernels once, then serves synthesis requests in a
 loop. Steady-state RTF drops from **~1.0 cold to ~0.18–0.22 warm** on real Nano gen1.
 It speaks a line protocol on stdin (`<phoneme_ids_file> <out.wav> [length_scale]` →
-`OK <wav> <nsamples> <synth_ms>`); the matcha arch has no text frontend, so phoneme IDs
-come from sherpa-onnx's espeak matcha frontend. This demo is the engine loop a production
-LiveKit-Agents TTS plugin is built from. See `examples/matcha_server/README.md`.
+`OK <wav> <nsamples> <synth_ms>`) — it takes pre-computed phoneme-ID files (from the
+built-in frontend or sherpa-onnx's), staying independent of any one frontend. This demo
+is the engine loop a production LiveKit-Agents TTS plugin is built from. See
+`examples/matcha_server/README.md`.
 
 ```bash
 MATCHA_USE_CUDA=1 ./build-nano/matcha-server matcha8k.gguf
