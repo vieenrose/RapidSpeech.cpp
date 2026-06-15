@@ -57,6 +57,8 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 
 **Text-to-Speech (TTS)**
 - [x] OpenVoice2 (MeloTTS + voice cloning)
+- [x] MeloTTS (VITS acoustic model; 8 kHz zh/en build runs on Jetson Nano gen1)
+- [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/))
 - [x] OmniVoice (single-stage non-autoregressive diffusion TTS, multilingual + voice cloning)
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
