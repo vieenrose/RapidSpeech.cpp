@@ -112,6 +112,7 @@ Build artifacts are located in the `build/` directory:
 - `rs-asr-vad-online` — VAD-segmented quasi-streaming ASR command-line tool
 - `rs-tts-offline` — Offline TTS command-line tool
 - `rs-quantize` — Model quantization tool
+- `matcha-server` — warm-persistent Matcha-TTS demo (Jetson Nano gen1 / sm_53; see below)
 
 ### C++ CLI Usage
 
@@ -316,6 +317,41 @@ Parameters:
 Supported quantization types: `q4_0`, `q4_k`, `q5_0`, `q5_k`, `q8_0`, `f16`, `f32`
 
 > ⚠️ **Note**: Q2_K quantization causes unacceptable accuracy loss for FunASR Nano, producing garbled output. Not recommended.
+
+### Jetson Nano gen1 (Maxwell sm_53, CUDA 10.2) — cross-build + warm Matcha demo
+
+The original Jetson Nano (Tegra X1, Maxwell **sm_53**, CUDA **10.2**, gcc 8.3, glibc 2.27)
+is supported through an **x86 → aarch64 cross-build**. CUDA 10.2 / gcc 8.3 cannot compile
+modern ggml-CUDA out of the box, so `scripts/build_jetson_nano_gen1.sh` force-includes a
+small set of compat shims in `scripts/nano_cuda_compat/`:
+
+| Shim | Purpose |
+| --- | --- |
+| `nvcc_compat.h` | `__builtin_assume` → noop, `CUDA_R_16BF` → `CUDA_R_16F`, `CUBLAS_COMPUTE_*` / `CUBLAS_TF32_TENSOR_OP_MATH` back-defines (force-included into every nvcc TU) |
+| `cuda_bf16.h` | minimal `bf16` → `fp16` stub (CUDA 10.2 ships none) |
+| `neon_x4_shim.h` | `vld1q_{s8,u8}_x4` (gcc-9 NEON intrinsics absent in gcc-8.3); host C/C++ TUs only — must **not** enter `.cu` (nvcc can't parse `arm_neon.h`) |
+
+```bash
+# in the aarch64 cross toolchain container (gcc-arm-8.3 + cuda-cross-aarch64-10-2):
+scripts/build_jetson_nano_gen1.sh          # -> build-nano/  (CUDA, sm_53)
+# CPU-only native build on the device:
+scripts/build_jetson_nano_gen1_native.sh
+```
+
+#### matcha-server — warm-persistent Matcha-TTS demo (`examples/matcha_server/`)
+
+A demo of the **warm-persistent** pattern for Maxwell: Matcha is launch-bound on sm_53
+(PTX-JIT + first-graph build dominate a single call), so `matcha-server` loads the gguf +
+ggml-CUDA backend **once**, warms the kernels once, then serves synthesis requests in a
+loop. Steady-state RTF drops from **~1.0 cold to ~0.18–0.22 warm** on real Nano gen1.
+It speaks a line protocol on stdin (`<phoneme_ids_file> <out.wav> [length_scale]` →
+`OK <wav> <nsamples> <synth_ms>`); the matcha arch has no text frontend, so phoneme IDs
+come from sherpa-onnx's espeak matcha frontend. This demo is the engine loop a production
+LiveKit-Agents TTS plugin is built from. See `examples/matcha_server/README.md`.
+
+```bash
+MATCHA_USE_CUDA=1 ./build-nano/matcha-server matcha8k.gguf
+```
 
 ### Python Usage
 
