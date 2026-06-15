@@ -6,7 +6,15 @@ CROSS=$TC/bin/aarch64-linux-gnu-
 SYSROOT=$TC/aarch64-linux-gnu/libc
 CUDA=/usr/local/cuda-10.2
 CT=$CUDA/targets/aarch64-linux
-cd /rs && rm -rf build-nano && mkdir build-nano && cd build-nano
+RS=/rs
+# CUDA-10.2 / gcc-8.3 compat shims (kreier-style) needed to compile modern ggml-CUDA:
+#  - nvcc_compat.h : __builtin_assume->noop, CUDA_R_16BF->CUDA_R_16F, CUBLAS_COMPUTE_*
+#                    back-defines (force-included into every nvcc TU).
+#  - cuda_bf16.h   : minimal bf16->fp16 stub (CUDA 10.2 ships no cuda_bf16.h).
+#  - neon_x4_shim.h: vld1q_{s8,u8}_x4 (gcc-9 intrinsics absent in gcc-8.3), force-included
+#                    into host C/C++ TUs only (must NOT enter .cu — nvcc can't parse arm_neon.h).
+COMPAT=$RS/scripts/nano_cuda_compat
+cd $RS && rm -rf build-nano && mkdir build-nano && cd build-nano
 cmake .. \
   -DRS_CUDA=ON \
   -DCMAKE_BUILD_TYPE=Release \
@@ -22,9 +30,9 @@ cmake .. \
   -DCMAKE_CUDA_ARCHITECTURES=53 \
   -DGGML_CUDA_NO_VMM=ON \
   -DGGML_NATIVE=OFF -DGGML_CPU_GENERIC=OFF -DGGML_CPU_ARM=OFF \
-  -DCMAKE_CUDA_FLAGS="--forward-unknown-to-host-compiler -arch=sm_53 -Xcompiler -fPIC" \
-  -DCMAKE_C_FLAGS="-I$CUDA/include -I$CT/include" \
-  -DCMAKE_CXX_FLAGS="-I$CUDA/include -I$CT/include" \
+  -DCMAKE_CUDA_FLAGS="--forward-unknown-to-host-compiler -arch=sm_53 -Xcompiler -fPIC -I$COMPAT -include $COMPAT/nvcc_compat.h" \
+  -DCMAKE_C_FLAGS="-include $COMPAT/neon_x4_shim.h -I$CUDA/include -I$CT/include" \
+  -DCMAKE_CXX_FLAGS="-include $COMPAT/neon_x4_shim.h -I$CUDA/include -I$CT/include" \
   -DCMAKE_PREFIX_PATH="$CT" \
   -DCMAKE_FIND_ROOT_PATH="$SYSROOT;$CT" \
   -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \

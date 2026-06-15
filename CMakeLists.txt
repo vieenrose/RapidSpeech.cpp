@@ -421,6 +421,9 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
+    add_executable(matcha-server
+            examples/matcha_server/matcha_server.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
@@ -429,6 +432,7 @@ if (RS_BUILD_CLI)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml Threads::Threads)
+    target_link_libraries(matcha-server PRIVATE rapidspeech-core ggml Threads::Threads)
 
 
     if (NOT MSVC)
