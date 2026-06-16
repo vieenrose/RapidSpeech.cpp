@@ -103,3 +103,7 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_te
                                       ggml_backend_t backend, const float *feats,
                                       int n_frames, int feat_dim, std::vector<float> &out,
                                       int *out_dim, int *n_out);
+// Full native transcription: features [n_frames, feat_dim] -> token ids (greedy).
+RS_API bool xasr_debug_transcribe(const std::map<std::string, struct ggml_tensor *> &w,
+                                  ggml_backend_t backend, const float *feats, int n_frames,
+                                  int feat_dim, std::vector<int32_t> &ids);

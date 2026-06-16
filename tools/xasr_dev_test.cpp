@@ -26,6 +26,9 @@ bool xasr_debug_encoder(const std::map<std::string, struct ggml_tensor *> &w,
 bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_tensor *> &w,
                                ggml_backend_t backend, const float *feats, int n_frames,
                                int feat_dim, std::vector<float> &out, int *out_dim, int *n_out);
+bool xasr_debug_transcribe(const std::map<std::string, struct ggml_tensor *> &w,
+                           ggml_backend_t backend, const float *feats, int n_frames,
+                           int feat_dim, std::vector<int32_t> &ids);
 
 static std::vector<float> read_bin(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -39,8 +42,8 @@ static std::vector<float> read_bin(const char *path) {
 
 int main(int argc, char **argv) {
   std::string stage = argc > 1 ? argv[1] : "";
-  if (argc < 7 || (stage != "embed" && stage != "encoder" && stage != "stream")) {
-    fprintf(stderr, "usage: %s <embed|encoder|stream> <model.gguf> <feats.bin> <T|n_frames> <feat_dim> <out.bin>\n", argv[0]);
+  if (argc < 7 || (stage != "embed" && stage != "encoder" && stage != "stream" && stage != "transcribe")) {
+    fprintf(stderr, "usage: %s <embed|encoder|stream|transcribe> <model.gguf> <feats.bin> <T|n_frames> <feat_dim> <out.bin>\n", argv[0]);
     return 1;
   }
   const char *model = argv[2], *featf = argv[3], *outf = argv[6];
@@ -90,6 +93,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (stage == "transcribe") {
+    std::vector<int32_t> ids;
+    if (!xasr_debug_transcribe(w, backend, feats.data(), T, feat_dim, ids)) {
+      fprintf(stderr, "transcribe failed\n"); return 1;
+    }
+    fprintf(stderr, "transcribe: %zu tokens\n", ids.size());
+    FILE *o = fopen(outf, "wb"); fwrite(ids.data(), sizeof(int32_t), ids.size(), o); fclose(o);
+    return 0;
+  }
   std::vector<float> out; int T_out = 0, dim_out = 0;
   bool ok;
   if (stage == "stream")

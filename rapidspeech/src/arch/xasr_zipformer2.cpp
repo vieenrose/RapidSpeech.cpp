@@ -785,6 +785,93 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *>
   return true;
 }
 
+// ---------------------------------------------------------------- decoder/joiner (host)
+// Read a tensor (possibly f16) into an f32 host buffer.
+static std::vector<float> tof32(ggml_tensor *t) {
+  size_t n = ggml_nelements(t);
+  std::vector<float> out(n);
+  if (t->type == GGML_TYPE_F32) {
+    ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+  } else {
+    std::vector<ggml_fp16_t> h(n);
+    ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+    for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(h[i]);
+  }
+  return out;
+}
+
+// Stateless transducer decoder (host): last `ctx` tokens -> decoder_out[512].
+// grouped Conv1d (groups=128, k=2) + relu + decoder_proj. Layouts per converter:
+//   embedding ggml ne=[512,5000]  -> emb[token*512 + d]
+//   decoder.conv.weight ne=[2,4,512]=[k,in,out] -> W[o,i,k]=data[k + 2*i + 8*o]
+//   decoder_proj.weight ne=[in,out]=[512,512] -> dec[o]=sum_i sq[i]*data[i+512*o]
+struct XAsrTransducer {
+  std::vector<float> emb, dconv, dproj_w, dproj_b, jout_w, jout_b;
+  int dim = 512, vocab = 5000, ctx = 2, ipg = 4, opg = 4;
+  void load(const TMap &w) {
+    emb = tof32(w.at("decoder.embedding.weight"));
+    dconv = tof32(w.at("decoder.conv.weight"));
+    dproj_w = tof32(w.at("decoder_proj.weight"));
+    dproj_b = tof32(w.at("decoder_proj.bias"));
+    jout_w = tof32(w.at("joiner.output_linear.weight"));
+    jout_b = tof32(w.at("joiner.output_linear.bias"));
+  }
+  std::vector<float> decode(const std::vector<int32_t> &hyp) const {
+    const int32_t *y = hyp.data() + (hyp.size() - ctx); // last ctx tokens
+    // grouped conv over the 2-token context -> conv[512]
+    std::vector<float> conv(dim);
+    for (int o = 0; o < dim; ++o) {
+      int g = o / opg;
+      float s = 0.f;
+      for (int i = 0; i < ipg; ++i) {
+        int ch = g * ipg + i;
+        for (int k = 0; k < ctx; ++k)
+          s += dconv[k + 2 * i + 8 * o] * emb[(size_t)y[k] * dim + ch];
+      }
+      conv[o] = s > 0.f ? s : 0.f; // relu
+    }
+    std::vector<float> dout(dim);
+    for (int o = 0; o < dim; ++o) {
+      float s = dproj_b[o];
+      for (int i = 0; i < dim; ++i) s += conv[i] * dproj_w[(size_t)i + (size_t)dim * o];
+      dout[o] = s;
+    }
+    return dout;
+  }
+  // joiner: argmax over output_linear(tanh(enc + dec)).
+  // jout_w ggml ne=[in=512, out=5000] -> logit[o]=sum_i act[i]*data[i+512*o]
+  int argmax_token(const float *enc, const std::vector<float> &dec) const {
+    std::vector<float> act(dim);
+    for (int i = 0; i < dim; ++i) act[i] = std::tanh(enc[i] + dec[i]);
+    int best = 0; float bestv = -1e30f;
+    for (int o = 0; o < vocab; ++o) {
+      float s = jout_b[o];
+      for (int i = 0; i < dim; ++i) s += act[i] * jout_w[(size_t)i + (size_t)dim * o];
+      if (s > bestv) { bestv = s; best = o; }
+    }
+    return best;
+  }
+};
+
+// Full native transcription: features -> token ids (greedy transducer).
+RS_API bool xasr_debug_transcribe(const std::map<std::string, ggml_tensor *> &w,
+                                  ggml_backend_t backend, const float *feats,
+                                  int n_frames, int feat_dim, std::vector<int32_t> &ids) {
+  std::vector<float> enc; int out_dim = 0, n_out = 0;
+  if (!xasr_debug_encoder_stream(w, backend, feats, n_frames, feat_dim, enc, &out_dim, &n_out))
+    return false;
+  XAsrTransducer td; td.load(w);
+  const int blank = 0;
+  std::vector<int32_t> hyp(td.ctx, blank);
+  std::vector<float> dout = td.decode(hyp);
+  for (int t = 0; t < n_out; ++t) {
+    int tid = td.argmax_token(enc.data() + (size_t)t * out_dim, dout);
+    if (tid != blank) { hyp.push_back(tid); dout = td.decode(hyp); }
+  }
+  ids.assign(hyp.begin() + td.ctx, hyp.end());
+  return true;
+}
+
 // ---------------------------------------------------------------- registration
 extern void
 rs_register_model_arch(const std::string &arch,
