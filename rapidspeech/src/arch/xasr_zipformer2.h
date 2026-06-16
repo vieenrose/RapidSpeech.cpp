@@ -28,15 +28,24 @@ struct XAsrHParams {
   std::vector<int> query_head_dim; // per stack
   std::vector<int> value_head_dim; // per stack
   std::vector<int> num_heads;      // per stack
-  int decode_chunk_len = 96;
-  int T = 109;
+  std::vector<int> downsampling_factor; // per stack (ds)
+  int decode_chunk_len = 96;       // = chunk shift in input frames
+  int T = 109;                     // encoder input frames per chunk
   int feat_dim = 80;
+  int pos_dim = 48;                // CompactRelPositionalEncoding dim (constant)
   int out_dim = 512;   // encoder_out / joiner_dim
   int joiner_dim = 512;
   int context_size = 2;
   int vocab_size = 5000;
   int sample_rate = 16000;
+  // embed (Conv2dSubsampling + ConvNeXt) output frames per chunk = processed_lens
+  // increment; left-context base for the attention mask.
+  int embed_out_len() const { return (T - 7) / 2 - 3; }
+  int lc_base() const { return left_context.empty() ? 256 : left_context[0]; }
 };
+
+// Fill an XAsrHParams from a loaded GGUF (the xasr.encoder.* / xasr.* KV).
+RS_API bool xasr_read_hparams(struct gguf_context *gg, XAsrHParams &hp);
 
 // Per-request streaming state: the recurrent caches + the running hypothesis.
 struct XAsrState : public RSState {
@@ -95,26 +104,28 @@ RS_API bool xasr_debug_embed(const std::map<std::string, struct ggml_tensor *> &
                              int *dim_out);
 // Same contract, runs embed + full encoder -> encoder_out [out_dim, T_out].
 RS_API bool xasr_debug_encoder(const std::map<std::string, struct ggml_tensor *> &w,
-                               ggml_backend_t backend, const float *feats, int T,
-                               int feat_dim, std::vector<float> &out, int *T_out,
-                               int *dim_out);
+                               ggml_backend_t backend, const XAsrHParams &hp,
+                               const float *feats, int T, int feat_dim,
+                               std::vector<float> &out, int *T_out, int *dim_out);
 // Streaming over a full feature stream [n_frames, feat_dim] -> all encoder_out.
 RS_API bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_tensor *> &w,
-                                      ggml_backend_t backend, const float *feats,
-                                      int n_frames, int feat_dim, std::vector<float> &out,
-                                      int *out_dim, int *n_out);
+                                      ggml_backend_t backend, const XAsrHParams &hp,
+                                      const float *feats, int n_frames, int feat_dim,
+                                      std::vector<float> &out, int *out_dim, int *n_out);
 // Full native transcription: features [n_frames, feat_dim] -> token ids (greedy).
 RS_API bool xasr_debug_transcribe(const std::map<std::string, struct ggml_tensor *> &w,
-                                  ggml_backend_t backend, const float *feats, int n_frames,
-                                  int feat_dim, std::vector<int32_t> &ids);
+                                  ggml_backend_t backend, const XAsrHParams &hp,
+                                  const float *feats, int n_frames, int feat_dim,
+                                  std::vector<int32_t> &ids);
 // Greedy transducer over precomputed encoder_out [out_dim, n_frames].
 RS_API void xasr_greedy_search(const std::map<std::string, struct ggml_tensor *> &w,
                                const float *encoder_out, int n_frames, int out_dim,
                                std::vector<int32_t> &ids);
 // Online streaming demo: persistent caches + decoder, partial per chunk + latency.
 RS_API bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> &w,
-                              ggml_backend_t backend, const float *feats, int n_frames,
-                              int feat_dim, std::vector<int32_t> &ids);
+                              ggml_backend_t backend, const XAsrHParams &hp,
+                              const float *feats, int n_frames, int feat_dim,
+                              std::vector<int32_t> &ids);
 
 // Persistent online streaming recognizer driven by raw 16 kHz mono int16 PCM
 // (online fbank + per-chunk encoder w/ persistent caches + greedy transducer).
@@ -122,7 +133,7 @@ RS_API bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> 
 class RS_API XAsrOnlineStream {
 public:
   XAsrOnlineStream(const std::map<std::string, struct ggml_tensor *> &w,
-                   ggml_backend_t backend);
+                   ggml_backend_t backend, const XAsrHParams &hp);
   ~XAsrOnlineStream();
   void AcceptPcm(const int16_t *pcm, int n); // 16 kHz mono int16
   void InputFinished();                      // flush (pads tail), produce final

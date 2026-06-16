@@ -5,6 +5,7 @@
 //   xasr-dev-test embed <model.gguf> <feats.bin> <T> <feat_dim> <out.bin>
 //
 // feats.bin: row-major float32 [T, feat_dim] (freq fastest), one chunk.
+#include "arch/xasr_zipformer2.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -14,24 +15,6 @@
 #include <map>
 #include <string>
 #include <vector>
-
-bool xasr_debug_embed(const std::map<std::string, struct ggml_tensor *> &w,
-                      ggml_backend_t backend, const float *feats, int T,
-                      int feat_dim, std::vector<float> &out, int *T_out,
-                      int *dim_out);
-bool xasr_debug_encoder(const std::map<std::string, struct ggml_tensor *> &w,
-                        ggml_backend_t backend, const float *feats, int T,
-                        int feat_dim, std::vector<float> &out, int *T_out,
-                        int *dim_out);
-bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_tensor *> &w,
-                               ggml_backend_t backend, const float *feats, int n_frames,
-                               int feat_dim, std::vector<float> &out, int *out_dim, int *n_out);
-bool xasr_debug_transcribe(const std::map<std::string, struct ggml_tensor *> &w,
-                           ggml_backend_t backend, const float *feats, int n_frames,
-                           int feat_dim, std::vector<int32_t> &ids);
-bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> &w,
-                       ggml_backend_t backend, const float *feats, int n_frames,
-                       int feat_dim, std::vector<int32_t> &ids);
 
 static std::vector<float> read_bin(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -58,7 +41,20 @@ int main(int argc, char **argv) {
   gguf_context *gg = gguf_init_from_file(model, gp);
   if (!gg) { fprintf(stderr, "gguf load failed\n"); return 1; }
 
-  ggml_backend_t backend = ggml_backend_cpu_init();
+  // Backend: CPU by default; XASR_GPU=1 picks the first GPU device (via the ggml
+  // backend registry, so no CUDA-specific headers needed here).
+  ggml_backend_t backend = nullptr;
+  if (getenv("XASR_GPU")) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+      ggml_backend_dev_t d = ggml_backend_dev_get(i);
+      if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        backend = ggml_backend_dev_init(d, nullptr);
+        fprintf(stderr, "backend: GPU (%s)\n", ggml_backend_dev_name(d));
+        break;
+      }
+    }
+  }
+  if (!backend) { backend = ggml_backend_cpu_init(); fprintf(stderr, "backend: CPU\n"); }
   ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(data_ctx, backend);
   (void)buf;
 
@@ -97,11 +93,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  XAsrHParams hp; xasr_read_hparams(gg, hp);
   if (stage == "transcribe" || stage == "online") {
     std::vector<int32_t> ids;
     bool ok = (stage == "online")
-                  ? xasr_debug_online(w, backend, feats.data(), T, feat_dim, ids)
-                  : xasr_debug_transcribe(w, backend, feats.data(), T, feat_dim, ids);
+                  ? xasr_debug_online(w, backend, hp, feats.data(), T, feat_dim, ids)
+                  : xasr_debug_transcribe(w, backend, hp, feats.data(), T, feat_dim, ids);
     if (!ok) { fprintf(stderr, "%s failed\n", stage.c_str()); return 1; }
     fprintf(stderr, "%s: %zu tokens\n", stage.c_str(), ids.size());
     FILE *o = fopen(outf, "wb"); fwrite(ids.data(), sizeof(int32_t), ids.size(), o); fclose(o);
@@ -110,9 +107,9 @@ int main(int argc, char **argv) {
   std::vector<float> out; int T_out = 0, dim_out = 0;
   bool ok;
   if (stage == "stream")
-    ok = xasr_debug_encoder_stream(w, backend, feats.data(), T, feat_dim, out, &dim_out, &T_out);
+    ok = xasr_debug_encoder_stream(w, backend, hp, feats.data(), T, feat_dim, out, &dim_out, &T_out);
   else if (stage == "encoder")
-    ok = xasr_debug_encoder(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out);
+    ok = xasr_debug_encoder(w, backend, hp, feats.data(), T, feat_dim, out, &T_out, &dim_out);
   else
     ok = xasr_debug_embed(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out);
   if (!ok) { fprintf(stderr, "%s failed\n", stage.c_str()); return 1; }

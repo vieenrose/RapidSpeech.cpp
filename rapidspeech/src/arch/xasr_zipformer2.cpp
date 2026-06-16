@@ -24,6 +24,29 @@ static std::vector<int> gguf_i32_array(gguf_context *g, const char *key) {
   return out;
 }
 
+// Read encoder/decoder hparams from a loaded GGUF (xasr.* KV). Mirrors Load().
+RS_API bool xasr_read_hparams(gguf_context *g, XAsrHParams &hp) {
+  if (!g) return false;
+  hp.n_stacks = gguf_i32(g, "xasr.encoder.n_stacks");
+  hp.num_layers = gguf_i32_array(g, "xasr.encoder.num_layers");
+  hp.dims = gguf_i32_array(g, "xasr.encoder.dims");
+  hp.cnn_kernels = gguf_i32_array(g, "xasr.encoder.cnn_kernels");
+  hp.left_context = gguf_i32_array(g, "xasr.encoder.left_context");
+  hp.query_head_dim = gguf_i32_array(g, "xasr.encoder.query_head_dim");
+  hp.value_head_dim = gguf_i32_array(g, "xasr.encoder.value_head_dim");
+  hp.num_heads = gguf_i32_array(g, "xasr.encoder.num_heads");
+  hp.downsampling_factor = gguf_i32_array(g, "xasr.encoder.downsampling_factor");
+  hp.decode_chunk_len = gguf_i32(g, "xasr.encoder.decode_chunk_len", 96);
+  hp.T = gguf_i32(g, "xasr.encoder.T", 109);
+  hp.feat_dim = gguf_i32(g, "xasr.encoder.feat_dim", 80);
+  hp.out_dim = gguf_i32(g, "xasr.encoder.out_dim", 512);
+  hp.joiner_dim = gguf_i32(g, "xasr.joiner.dim", 512);
+  hp.context_size = gguf_i32(g, "xasr.decoder.context_size", 2);
+  hp.vocab_size = gguf_i32(g, "xasr.vocab_size", 5000);
+  hp.sample_rate = gguf_i32(g, "xasr.sample_rate", 16000);
+  return !hp.dims.empty() && !hp.downsampling_factor.empty();
+}
+
 // ---------------------------------------------------------------- model
 XAsrZipformer2Model::XAsrZipformer2Model() {
   // Frontend meta must be set in the ctor: RSProcessor reads GetMeta() at
@@ -53,23 +76,7 @@ bool XAsrZipformer2Model::Load(const std::unique_ptr<rs_context_t> &ctx,
     return false;
   }
   gguf_context *g = ctx->ctx_gguf;
-
-  hp_.n_stacks = gguf_i32(g, "xasr.encoder.n_stacks");
-  hp_.num_layers = gguf_i32_array(g, "xasr.encoder.num_layers");
-  hp_.dims = gguf_i32_array(g, "xasr.encoder.dims");
-  hp_.cnn_kernels = gguf_i32_array(g, "xasr.encoder.cnn_kernels");
-  hp_.left_context = gguf_i32_array(g, "xasr.encoder.left_context");
-  hp_.query_head_dim = gguf_i32_array(g, "xasr.encoder.query_head_dim");
-  hp_.value_head_dim = gguf_i32_array(g, "xasr.encoder.value_head_dim");
-  hp_.num_heads = gguf_i32_array(g, "xasr.encoder.num_heads");
-  hp_.decode_chunk_len = gguf_i32(g, "xasr.encoder.decode_chunk_len", 96);
-  hp_.T = gguf_i32(g, "xasr.encoder.T", 109);
-  hp_.feat_dim = gguf_i32(g, "xasr.encoder.feat_dim", 80);
-  hp_.out_dim = gguf_i32(g, "xasr.encoder.out_dim", 512);
-  hp_.joiner_dim = gguf_i32(g, "xasr.joiner.dim", 512);
-  hp_.context_size = gguf_i32(g, "xasr.decoder.context_size", 2);
-  hp_.vocab_size = gguf_i32(g, "xasr.vocab_size", 5000);
-  hp_.sample_rate = gguf_i32(g, "xasr.sample_rate", 16000);
+  xasr_read_hparams(g, hp_);
 
   if ((int)hp_.num_layers.size() != hp_.n_stacks || hp_.dims.empty()) {
     RS_LOG_ERR("XAsr: bad hparams (n_stacks=%d num_layers=%zu dims=%zu)",
@@ -148,7 +155,7 @@ bool XAsrZipformer2Model::Encode(const std::vector<float> &input_frames,
   feats.resize((size_t)(n + 100) * fd, 0.0f);
   ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
   int dim = 0, nout = 0;
-  if (!xasr_debug_encoder_stream(w_, backend, feats.data(), n + 100, fd,
+  if (!xasr_debug_encoder_stream(w_, backend, hp_, feats.data(), n + 100, fd,
                                  st.encoder_out, &dim, &nout)) {
     RS_LOG_ERR("XAsr::Encode streaming encoder failed");
     return false;
@@ -586,8 +593,8 @@ std::vector<float> compute_pos_emb(int seq, int lc, int pos_dim) {
 // One stack (Zipformer2Encoder or DownsampledZipformer2Encoder).
 ggml_tensor *zip_stack(ggml_context *c, Consts &K, Caches &cc, const TMap &w, int stack,
                        int n_layers, ggml_tensor *x, int ds, int nh, int kernel,
-                       int pos_dim, int processed_lens) {
-  int lc = 256 / ds;
+                       int pos_dim, int processed_lens, int lc_base) {
+  int lc = lc_base / ds;
   int pl = processed_lens / ds; // processed frames at this stack's rate
   ggml_tensor *orig = x;
   int Torig = x->ne[1];
@@ -617,14 +624,14 @@ ggml_tensor *build_encoder(ggml_context *c, Consts &K, Caches &cc, const TMap &w
                            const std::vector<int> &nheads,
                            const std::vector<int> &kernels,
                            const std::vector<int> &dsf, int pos_dim,
-                           int processed_lens) {
+                           int processed_lens, int lc_base) {
   ggml_tensor *x = embed_out;
   const char *ns = getenv("XASR_NSTACKS");
   size_t nstacks = ns ? (size_t)atoi(ns) : dims.size();
   std::vector<ggml_tensor *> outs(dims.size());
   for (size_t i = 0; i < dims.size(); ++i) {
     x = convert_channels(c, K, x, dims[i]);
-    x = zip_stack(c, K, cc, w, (int)i, nlayers[i], x, dsf[i], nheads[i], kernels[i], pos_dim, processed_lens);
+    x = zip_stack(c, K, cc, w, (int)i, nlayers[i], x, dsf[i], nheads[i], kernels[i], pos_dim, processed_lens, lc_base);
     outs[i] = x;
     if (ns && i + 1 >= nstacks) return x; // debug early-out (only when env set)
   }
@@ -707,12 +714,11 @@ RS_API bool xasr_debug_embed(const std::map<std::string, ggml_tensor *> &w,
 }
 
 RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
-                               ggml_backend_t backend, const float *feats, int T,
-                               int feat_dim, std::vector<float> &out, int *T_out,
-                               int *dim_out) {
-  // 960ms config
-  std::vector<int> dims{192, 256, 512, 768, 512, 256}, nlayers{2, 2, 4, 5, 4, 2},
-      nheads{4, 4, 4, 8, 4, 4}, kernels{31, 31, 15, 15, 15, 31}, dsf{1, 2, 4, 8, 4, 2};
+                               ggml_backend_t backend, const XAsrHParams &hp,
+                               const float *feats, int T, int feat_dim,
+                               std::vector<float> &out, int *T_out, int *dim_out) {
+  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
+      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
   size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
   ggml_init_params ip{mem, nullptr, true};
   ggml_context *c = ggml_init(ip);
@@ -727,7 +733,7 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
   if (dpfx) { g_dbg = &dbg; g_dump_prefix = dpfx; }
   Caches cc{c};
   ggml_tensor *emb = build_embed(c, K, w, feats4, cache, &cc); // [192, T_emb]
-  ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, 0);
+  ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, hp.pos_dim, 0, hp.lc_base());
   ggml_set_output(y);
   ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
   ggml_build_forward_expand(gf, y);
@@ -765,16 +771,17 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
 // feats: [n_frames, feat_dim] row-major. out: encoder_out [out_dim, n_out_frames]
 // row-major (frame-major). Mirrors what XAsrZipformer2Model::Encode will do.
 RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *> &w,
-                                      ggml_backend_t backend, const float *feats,
-                                      int n_frames, int feat_dim, std::vector<float> &out,
-                                      int *out_dim, int *n_out) {
-  std::vector<int> dims{192, 256, 512, 768, 512, 256}, nlayers{2, 2, 4, 5, 4, 2},
-      nheads{4, 4, 4, 8, 4, 4}, kernels{31, 31, 15, 15, 15, 31}, dsf{1, 2, 4, 8, 4, 2};
-  const int T = 109, shift = 96, outW = (((feat_dim - 1) / 2) - 1) / 2;
+                                      ggml_backend_t backend, const XAsrHParams &hp,
+                                      const float *feats, int n_frames, int feat_dim,
+                                      std::vector<float> &out, int *out_dim, int *n_out) {
+  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
+      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
+  const int T = hp.T, shift = hp.decode_chunk_len, outW = (((feat_dim - 1) / 2) - 1) / 2;
+  const int pl_inc = hp.embed_out_len(), lc_base = hp.lc_base();
   std::vector<std::vector<float>> state; // per-cache host buffers (incl. embed cache)
   int processed_lens = 0, total = 0;
   out.clear();
-  *out_dim = 512;
+  *out_dim = hp.out_dim;
 
   for (int start = 0; start + T <= n_frames; start += shift) {
     size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
@@ -786,7 +793,7 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *>
     ggml_set_input(feats4);
     ggml_tensor *ecache = cc.get(outW, 3, 128); // embed cache = cc.in[0]
     ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, hp.pos_dim, processed_lens, lc_base);
     ggml_set_output(y);
     ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
     ggml_build_forward_expand(gf, y);
@@ -811,7 +818,7 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *>
     // read updated caches into state
     for (size_t i = 0; i < cc.out.size(); ++i)
       ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
-    processed_lens += 48;
+    processed_lens += pl_inc;
     ggml_gallocr_free(alloc);
     ggml_free(c);
   }
@@ -896,10 +903,11 @@ struct XAsrTransducer {
 
 // Full native transcription: features -> token ids (greedy transducer).
 RS_API bool xasr_debug_transcribe(const std::map<std::string, ggml_tensor *> &w,
-                                  ggml_backend_t backend, const float *feats,
-                                  int n_frames, int feat_dim, std::vector<int32_t> &ids) {
+                                  ggml_backend_t backend, const XAsrHParams &hp,
+                                  const float *feats, int n_frames, int feat_dim,
+                                  std::vector<int32_t> &ids) {
   std::vector<float> enc; int out_dim = 0, n_out = 0;
-  if (!xasr_debug_encoder_stream(w, backend, feats, n_frames, feat_dim, enc, &out_dim, &n_out))
+  if (!xasr_debug_encoder_stream(w, backend, hp, feats, n_frames, feat_dim, enc, &out_dim, &n_out))
     return false;
   XAsrTransducer td; td.load(w);
   const int blank = 0;
@@ -933,11 +941,13 @@ RS_API void xasr_greedy_search(const std::map<std::string, ggml_tensor *> &w,
 // each chunk and reports per-chunk latency + first-partial latency. Returns the
 // final token ids. This is the same per-chunk path a live PCM stream would drive.
 RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
-                              ggml_backend_t backend, const float *feats,
-                              int n_frames, int feat_dim, std::vector<int32_t> &ids) {
-  std::vector<int> dims{192, 256, 512, 768, 512, 256}, nlayers{2, 2, 4, 5, 4, 2},
-      nheads{4, 4, 4, 8, 4, 4}, kernels{31, 31, 15, 15, 15, 31}, dsf{1, 2, 4, 8, 4, 2};
-  const int T = 109, shift = 96, outW = (((feat_dim - 1) / 2) - 1) / 2;
+                              ggml_backend_t backend, const XAsrHParams &hp,
+                              const float *feats, int n_frames, int feat_dim,
+                              std::vector<int32_t> &ids) {
+  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
+      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
+  const int T = hp.T, shift = hp.decode_chunk_len, outW = (((feat_dim - 1) / 2) - 1) / 2;
+  const int pl_inc = hp.embed_out_len(), lc_base = hp.lc_base();
   XAsrTransducer td; td.load(w);
   std::vector<std::vector<float>> state;       // persistent caches
   int processed_lens = 0;
@@ -958,7 +968,7 @@ RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
     ggml_set_input(feats4);
     ggml_tensor *ecache = cc.get(outW, 3, 128);
     ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, hp.pos_dim, processed_lens, lc_base);
     ggml_set_output(y);
     ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
     ggml_build_forward_expand(gf, y);
@@ -979,7 +989,7 @@ RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
     ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
     for (size_t i = 0; i < cc.out.size(); ++i)
       ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
-    processed_lens += 48;
+    processed_lens += pl_inc;
     ggml_gallocr_free(alloc); ggml_free(c);
     // --- greedy on this chunk's frames (persistent decoder) ---
     for (int t = 0; t < Tc; ++t) {
@@ -1006,11 +1016,10 @@ RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
 struct XAsrOnlineStream::Impl {
   const TMap &w;
   ggml_backend_t backend;
+  XAsrHParams hp;
   XAsrTransducer td;
   AudioProcessor fbank;
-  std::vector<int> dims{192,256,512,768,512,256}, nlayers{2,2,4,5,4,2},
-      nheads{4,4,4,8,4,4}, kernels{31,31,15,15,15,31}, dsf{1,2,4,8,4,2};
-  static constexpr int T = 109, shift = 96, FD = 80, outW = 19;
+  int T, shift, FD, outW, pl_inc, lc_base;
   std::vector<float> samples;       // accumulated float PCM
   std::vector<float> feats;         // computed fbank [n_frames*FD]
   std::vector<std::vector<float>> caches;
@@ -1027,7 +1036,10 @@ struct XAsrOnlineStream::Impl {
     c.window_type = WindowType::POVEY; c.use_lfr = false; c.use_cmvn = false;
     c.snip_edges = false; return c;
   }
-  Impl(const TMap &w_, ggml_backend_t b) : w(w_), backend(b), fbank(cfg()) {
+  Impl(const TMap &w_, ggml_backend_t b, const XAsrHParams &hp_)
+      : w(w_), backend(b), hp(hp_), fbank(cfg()) {
+    T = hp.T; shift = hp.decode_chunk_len; FD = hp.feat_dim;
+    outW = (((FD - 1) / 2) - 1) / 2; pl_inc = hp.embed_out_len(); lc_base = hp.lc_base();
     td.load(w_); hyp.assign(td.ctx, 0); dout = td.decode(hyp);
   }
 
@@ -1048,7 +1060,8 @@ struct XAsrOnlineStream::Impl {
     ggml_set_input(feats4);
     ggml_tensor *ecache = cc.get(outW, 3, 128);
     ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, hp.dims, hp.num_layers, hp.num_heads,
+                                   hp.cnn_kernels, hp.downsampling_factor, hp.pos_dim, processed_lens, lc_base);
     ggml_set_output(y);
     ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
     ggml_build_forward_expand(gf, y);
@@ -1067,7 +1080,7 @@ struct XAsrOnlineStream::Impl {
     ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
     for (size_t i=0;i<cc.out.size();++i)
       ggml_backend_tensor_get(cc.out[i], caches[i].data(), 0, ggml_nbytes(cc.out[i]));
-    processed_lens += 48;
+    processed_lens += pl_inc;
     ggml_gallocr_free(alloc); ggml_free(c);
     for (int t=0;t<Tc;++t) {
       int tid = td.argmax_token(eo.data()+(size_t)t*od, dout);
@@ -1090,8 +1103,8 @@ struct XAsrOnlineStream::Impl {
   }
 };
 
-XAsrOnlineStream::XAsrOnlineStream(const TMap &w, ggml_backend_t backend)
-    : p_(new Impl(w, backend)) {}
+XAsrOnlineStream::XAsrOnlineStream(const TMap &w, ggml_backend_t backend, const XAsrHParams &hp)
+    : p_(new Impl(w, backend, hp)) {}
 XAsrOnlineStream::~XAsrOnlineStream() { delete p_; }
 void XAsrOnlineStream::AcceptPcm(const int16_t *pcm, int n) {
   if (!p_->have_first_sample && n > 0) { p_->t_first = std::chrono::steady_clock::now(); p_->have_first_sample = true; }

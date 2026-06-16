@@ -94,6 +94,7 @@ struct Model {
   ggml_backend_t backend=nullptr; ggml_backend_buffer_t buf=nullptr;
   std::map<std::string,ggml_tensor*> w;
   std::unordered_map<int,std::string> id2tok;
+  XAsrHParams hp;
 };
 static bool load_model(const char*path, Model &m){
   gguf_init_params gp{true,&m.ctx}; m.gg=gguf_init_from_file(path,gp);
@@ -112,6 +113,7 @@ static bool load_model(const char*path, Model &m){
   int tk=gguf_find_key(m.gg,"tokenizer.ggml.tokens");
   if(tk>=0){ int nt=gguf_get_arr_n(m.gg,tk);
     for(int i=0;i<nt;++i) m.id2tok[i]=gguf_get_arr_str(m.gg,tk,i); }
+  xasr_read_hparams(m.gg, m.hp);
   return true;
 }
 
@@ -167,7 +169,7 @@ int main(int argc,char**argv){
       ok=send_all(c,resp.data(),resp.size()); }
     if(!ok){ close(c); continue; }
 
-    XAsrOnlineStream stream(m.w,m.backend);
+    XAsrOnlineStream stream(m.w,m.backend,m.hp);
     std::string last_partial;
     int op; std::vector<uint8_t> pl;
     while(ws_read(c,op,pl)){

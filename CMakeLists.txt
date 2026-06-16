@@ -457,7 +457,12 @@ if (RS_BUILD_CLI)
     if (RS_XASR_DEV_TEST)
         add_executable(xasr-dev-test tools/xasr_dev_test.cpp)
         target_link_libraries(xasr-dev-test PRIVATE rapidspeech-core ggml)
+        # ggml backend registry (ggml_backend_dev_*) uses std::filesystem -> needs
+        # stdc++fs on gcc-8.
+        target_link_libraries(xasr-dev-test PRIVATE stdc++fs)
         target_include_directories(xasr-dev-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
             ${GGML_PATH}/include ${GGML_PATH}/src)
     endif()
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
