@@ -119,18 +119,35 @@ std::shared_ptr<RSState> XAsrZipformer2Model::CreateState() {
 
 bool XAsrZipformer2Model::Encode(const std::vector<float> &input_frames,
                                  RSState &state, ggml_backend_sched_t sched) {
-  (void)input_frames;
-  (void)state;
-  (void)sched;
-  RS_LOG_ERR("XAsr::Encode not yet implemented (scaffold)");
-  return false;
+  auto &st = static_cast<XAsrState &>(state);
+  int fd = hp_.feat_dim;
+  if (input_frames.empty() || (int)input_frames.size() % fd != 0) {
+    RS_LOG_ERR("XAsr::Encode bad input_frames size");
+    return false;
+  }
+  int n = (int)input_frames.size() / fd;
+  // pad 100 zero frames so the trailing real frames get a full chunk (matches ref).
+  std::vector<float> feats = input_frames;
+  feats.resize((size_t)(n + 100) * fd, 0.0f);
+  ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+  int dim = 0, nout = 0;
+  if (!xasr_debug_encoder_stream(w_, backend, feats.data(), n + 100, fd,
+                                 st.encoder_out, &dim, &nout)) {
+    RS_LOG_ERR("XAsr::Encode streaming encoder failed");
+    return false;
+  }
+  st.enc_T = nout;
+  return true;
 }
 
 bool XAsrZipformer2Model::Decode(RSState &state, ggml_backend_sched_t sched) {
-  (void)state;
   (void)sched;
-  RS_LOG_ERR("XAsr::Decode not yet implemented (scaffold)");
-  return false;
+  auto &st = static_cast<XAsrState &>(state);
+  std::vector<int32_t> ids;
+  xasr_greedy_search(w_, st.encoder_out.data(), st.enc_T, hp_.out_dim, ids);
+  st.hyp.assign(hp_.context_size, GetBlankId());
+  st.hyp.insert(st.hyp.end(), ids.begin(), ids.end());
+  return true;
 }
 
 std::string XAsrZipformer2Model::GetTranscription(RSState &state) {
@@ -870,6 +887,21 @@ RS_API bool xasr_debug_transcribe(const std::map<std::string, ggml_tensor *> &w,
   }
   ids.assign(hyp.begin() + td.ctx, hyp.end());
   return true;
+}
+
+// Greedy transducer over precomputed encoder_out [out_dim, n_frames] (frame-major).
+RS_API void xasr_greedy_search(const std::map<std::string, ggml_tensor *> &w,
+                               const float *encoder_out, int n_frames, int out_dim,
+                               std::vector<int32_t> &ids) {
+  XAsrTransducer td; td.load(w);
+  const int blank = 0;
+  std::vector<int32_t> hyp(td.ctx, blank);
+  std::vector<float> dout = td.decode(hyp);
+  for (int t = 0; t < n_frames; ++t) {
+    int tid = td.argmax_token(encoder_out + (size_t)t * out_dim, dout);
+    if (tid != blank) { hyp.push_back(tid); dout = td.decode(hyp); }
+  }
+  ids.assign(hyp.begin() + td.ctx, hyp.end());
 }
 
 // ---------------------------------------------------------------- registration
