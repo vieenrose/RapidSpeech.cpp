@@ -607,6 +607,14 @@ bool OpenVoice2Model::Load(const std::unique_ptr<rs_context_t>& ctx,
       text_frontend_.Init(nullptr);
       RS_LOG_WARN("OpenVoice2: no symbol table in GGUF, using built-in vocab (IDs may mismatch!)");
     }
+
+    // Load the model's English word→phoneme(+tone) lexicon if provided ($MELO_LEXICON).
+    // Without it the frontend has only a 54-word built-in dict + a letter-by-letter
+    // fallback, so English names ("michael") and most words come out garbled.
+    if (const char* mlex = std::getenv("MELO_LEXICON")) {
+      if (*mlex && text_frontend_.LoadEnglishLexicon(mlex))
+        RS_LOG_INFO("OpenVoice2: English lexicon loaded from %s", mlex);
+    }
   }
 
   // Map all tensors

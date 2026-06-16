@@ -271,6 +271,51 @@ void TextFrontend::InitEnglishLexicon() {
   }
 }
 
+bool TextFrontend::LoadEnglishLexicon(const char* path) {
+  if (!path || !*path) return false;
+  std::ifstream f(path);
+  if (!f) { RS_LOG_ERR("TextFrontend: cannot open English lexicon %s", path); return false; }
+  auto is_int = [](const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char c : s) if (!std::isdigit(c)) return false;
+    return true;
+  };
+  std::string line;
+  size_t n = 0;
+  std::unordered_map<int32_t, int> tone_hist;
+  while (std::getline(f, line)) {
+    std::istringstream is(line);
+    std::string word;
+    if (!(is >> word)) continue;
+    bool ascii = !word.empty();
+    for (unsigned char c : word) if (c >= 0x80) { ascii = false; break; }
+    if (!ascii) continue;                      // Chinese rows -> handled by ChineseG2P
+    std::vector<std::string> toks; std::string t;
+    while (is >> t) toks.push_back(t);
+    // MeloTTS lexicon line: <word> <N phonemes> <N tones>. Leading non-numeric tokens
+    // are phonemes; trailing integers are their tone ids (equal counts).
+    size_t split = 0;
+    while (split < toks.size() && !is_int(toks[split])) split++;
+    if (split == 0 || split * 2 != toks.size()) continue;
+    std::vector<std::string> phs(toks.begin(), toks.begin() + split);
+    std::vector<int32_t> tones; tones.reserve(split);
+    for (size_t i = split; i < toks.size(); i++) {
+      int32_t tv = std::stoi(toks[i]); tones.push_back(tv); tone_hist[tv]++;
+    }
+    std::string lw = to_lower(word);
+    en_lexicon_[lw] = std::move(phs);
+    en_tones_[lw]   = std::move(tones);
+    n++;
+  }
+  // OOV English (rule fallback) gets the most common English tone in the lexicon.
+  int32_t best = 0; int bestc = -1;
+  for (const auto& kv : tone_hist) if (kv.second > bestc) { bestc = kv.second; best = kv.first; }
+  en_default_tone_ = best;
+  RS_LOG_INFO("TextFrontend: loaded %zu English lexicon entries (default tone %d)",
+              n, (int)en_default_tone_);
+  return n > 0;
+}
+
 // =====================================================================
 // G2P methods
 // =====================================================================
@@ -384,8 +429,12 @@ std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
         }
       }
       size_t before = phonemes.size();
-      auto en_phs = EnglishG2P(word);
+      std::vector<int32_t> en_tones;
+      auto en_phs = EnglishG2P(word, &en_tones);
       phonemes.insert(phonemes.end(), en_phs.begin(), en_phs.end());
+      // Carry the English phonemes' OWN tone ids (MeloTTS English tone range), not the
+      // tone-0 padding applied below — tone 0 mis-renders English even with right phonemes.
+      if (out_tones) out_tones->insert(out_tones->end(), en_tones.begin(), en_tones.end());
       // Treat the entire English word as a single logical unit. NOTE: BERT
       // WordPiece may split it into multiple subwords; alignment with BERT
       // for mixed Chinese-English text is approximate.
@@ -423,8 +472,13 @@ std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
   return phonemes;
 }
 
-std::vector<std::string> TextFrontend::EnglishG2P(const std::string& text) const {
+std::vector<std::string> TextFrontend::EnglishG2P(const std::string& text,
+                                                  std::vector<int32_t>* out_tones) const {
   std::vector<std::string> phonemes;
+  auto emit = [&](const std::string& ph, int32_t tone) {
+    phonemes.push_back(ph);
+    if (out_tones) out_tones->push_back(tone);
+  };
   std::istringstream iss(text);
   std::string token;
 
@@ -440,35 +494,31 @@ std::vector<std::string> TextFrontend::EnglishG2P(const std::string& text) const
     }
 
     if (token.empty()) {
-      if (!punct_after.empty()) {
-        for (char c : punct_after) phonemes.push_back(std::string(1, c));
-      }
+      for (char c : punct_after) emit(std::string(1, c), 0);
       continue;
     }
 
     std::string lower = to_lower(token);
     std::vector<std::string> word_phs;
+    std::vector<int32_t> word_tones;
     auto it = en_lexicon_.find(lower);
     if (it != en_lexicon_.end()) {
       word_phs = it->second;
+      auto tit = en_tones_.find(lower);          // model lexicon supplies the tones
+      if (tit != en_tones_.end()) word_tones = tit->second;
     } else {
-      word_phs = EnglishRuleFallback(lower);
+      word_phs = EnglishRuleFallback(lower);     // OOV -> letter rules, default tone
     }
+    if (word_tones.size() != word_phs.size())
+      word_tones.assign(word_phs.size(), en_default_tone_);
+
     // OpenVoice2/MeloTTS English symbols are lowercase ARPABET (hh, ah, l, ow, ...).
     // CMU dict + rule fallback return uppercase, so lowercase before lookup.
-    for (auto& ph : word_phs) {
-      ph = to_lower(ph);
-      phonemes.push_back(ph);
-    }
+    for (size_t i = 0; i < word_phs.size(); i++) emit(to_lower(word_phs[i]), word_tones[i]);
 
-    // Add punctuation
-    for (char c : punct_after) {
-      phonemes.push_back(std::string(1, c));
-    }
-
-    phonemes.push_back("_");  // word boundary (blank token, matches symbol table)
+    for (char c : punct_after) emit(std::string(1, c), 0);
+    emit("_", 0);  // word boundary (blank token, matches symbol table)
   }
-
 
   return phonemes;
 }
@@ -544,8 +594,7 @@ std::vector<int32_t> TextFrontend::TextToPhonemeIds(const std::string& text,
   if (use_zh) {
     phonemes = ChineseG2P(text, tones_ptr, w2p_ptr);
   } else {
-    phonemes = EnglishG2P(text);
-    tones_ptr->assign(phonemes.size(), 0);
+    phonemes = EnglishG2P(text, tones_ptr);   // tones from the model lexicon, not 0
     // Fallback: lump all English phonemes under one logical unit. This is
     // only used when BERT alignment is not needed (en-only path).
     if (!phonemes.empty()) w2p_ptr->push_back((int32_t)phonemes.size());

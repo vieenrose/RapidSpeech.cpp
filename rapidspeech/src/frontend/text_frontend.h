@@ -27,6 +27,13 @@ public:
   /// Each string in the list becomes a phoneme with ID = its index.
   bool InitFromSymbols(const std::vector<std::string>& symbols);
 
+  /// Load the model's English word→phoneme(+tone) lexicon (MeloTTS lexicon.txt:
+  /// "<word> <ph1>..<phN> <tone1>..<toneN>"). Only ASCII (English) entries are kept;
+  /// Chinese rows are handled by the pinyin G2P. Replaces the tiny built-in dict, so
+  /// out-of-the-54-word names (e.g. "michael") get correct ARPABET + English tones
+  /// instead of the toy letter-by-letter fallback (which yields garbage audio).
+  bool LoadEnglishLexicon(const char* path);
+
   /// Convert text to phoneme IDs for the given language.
   /// language: "zh", "en" (default: "zh")
   /// Returns phoneme ID sequence suitable for the TTS text encoder.
@@ -50,14 +57,20 @@ private:
   // Chinese: character → pinyin mapping (simplified)
   std::unordered_map<uint32_t, std::string> char_to_pinyin_;
 
-  // English: word → phoneme sequence (CMU dict subset)
+  // English: word → phoneme sequence + per-phoneme tone ids. The built-in dict has no
+  // tones; the loaded model lexicon (LoadEnglishLexicon) supplies both. English tones in
+  // MeloTTS live in their own range (e.g. 7–9), distinct from the Chinese tones (0–6) —
+  // defaulting English to tone 0 mis-renders it even with correct phonemes.
   std::unordered_map<std::string, std::vector<std::string>> en_lexicon_;
+  std::unordered_map<std::string, std::vector<int32_t>> en_tones_;
+  int32_t en_default_tone_ = 0;   // tone for OOV English (rule fallback); set from lexicon
 
   // Internal methods
   std::vector<std::string> ChineseG2P(const std::string& text,
                                 std::vector<int32_t>* out_tones = nullptr,
                                 std::vector<int32_t>* out_word2ph = nullptr) const;
-  std::vector<std::string> EnglishG2P(const std::string& text) const;
+  std::vector<std::string> EnglishG2P(const std::string& text,
+                                std::vector<int32_t>* out_tones = nullptr) const;
   std::vector<std::string> EnglishRuleFallback(const std::string& word) const;
 
   void InitBuiltinVocab();
