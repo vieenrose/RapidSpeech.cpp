@@ -216,6 +216,27 @@ struct Consts {
     dpending.emplace_back(t, std::move(v));
     return t;
   }
+  // Attention key-padding mask, ALWAYS present (stable graph topology so the CUDA
+  // graph can be captured once and reused). The masked-column count depends on the
+  // running processed_lens, so the *data* is refreshed each chunk via upload_masks();
+  // the tensor address stays fixed. mask[j] = -1e4 for j < (lc - processed_lens/ds).
+  struct MaskSpec { ggml_tensor *t; int kt, lc, ds; };
+  std::vector<MaskSpec> masks;
+  ggml_tensor *mask(int kt, int lc, int ds) {
+    ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kt);
+    ggml_set_input(t);
+    ggml_set_name(t, ("m" + std::to_string(n++)).c_str());
+    masks.push_back({t, kt, lc, ds});
+    return t;
+  }
+  void upload_masks(int processed_lens_global) {
+    for (auto &m : masks) {
+      std::vector<float> v((size_t)m.kt, 0.0f);
+      int nmask = m.lc - processed_lens_global / m.ds;
+      for (int j = 0; j < nmask && j < m.kt; ++j) v[j] = -1e4f;
+      ggml_backend_tensor_set(m.t, v.data(), 0, (size_t)m.kt * sizeof(float));
+    }
+  }
   void upload() {
     for (auto &p : pending)
       ggml_backend_tensor_set(p.first, &p.second, 0, sizeof(float));
@@ -387,7 +408,7 @@ ggml_tensor *rel_to_abs(ggml_context *c, ggml_tensor *ps, int T, int kt) {
 ggml_tensor *attn_weights(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                           const std::string &p, ggml_tensor *src,
                           ggml_tensor *pos_emb, int nh, int qhd, int phd, int lc,
-                          int processed_lens) {
+                          int ds) {
   int T = src->ne[1];
   ggml_tensor *x = linp(c, w.at(p + ".in_proj.weight"), w.at(p + ".in_proj.bias"), src);
   int qd = qhd * nh;
@@ -414,14 +435,11 @@ ggml_tensor *attn_weights(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
   ggml_tensor *sc = ggml_add(c, scores, pabs);
   DBG(p, "sc", sc);
   // key-padding mask: left-context columns [0, lc - processed_lens) are zero-filled
-  // history and must be masked. processed_lens grows across chunks (capped at lc).
-  int nmask = lc - processed_lens;
-  if (nmask < 0) nmask = 0;
-  if (nmask > 0) {
-    std::vector<float> m((size_t)kt, 0.0f);
-    for (int j = 0; j < nmask && j < kt; ++j) m[j] = -1e4f;
-    sc = ggml_add(c, sc, ggml_reshape_3d(c, K.data(m, kt, 1), kt, 1, 1));
-  }
+  // history and must be masked. Registered as an always-present input (see
+  // Consts::mask); its data is refreshed per chunk so the graph topology is stable
+  // and the CUDA graph can be reused across chunks.
+  ggml_tensor *m = K.mask(kt, lc, ds);
+  sc = ggml_add(c, sc, ggml_reshape_3d(c, m, kt, 1, 1));
   return ggml_soft_max(c, sc); // over ne0=kt
 }
 
@@ -510,10 +528,10 @@ ggml_tensor *conv_module(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
 // one zipformer2 layer; src [C,T] -> [C,T].
 ggml_tensor *zip_layer(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                        const std::string &p, ggml_tensor *src, ggml_tensor *pos_emb,
-                       int nh, int qhd, int phd, int vhd, int kernel, int lc, int pl) {
+                       int nh, int qhd, int phd, int vhd, int kernel, int lc, int ds) {
   ggml_tensor *orig = src;
   DBG(p, "src_in", src);
-  ggml_tensor *aw = attn_weights(c, K, cc, w, p + ".self_attn_weights", src, pos_emb, nh, qhd, phd, lc, pl);
+  ggml_tensor *aw = attn_weights(c, K, cc, w, p + ".self_attn_weights", src, pos_emb, nh, qhd, phd, lc, ds);
   DBG(p, "aw", aw);
   ggml_tensor *attn0 = ggml_view_3d(c, aw, aw->ne[0], aw->ne[1], 1, aw->nb[1], aw->nb[2], 0);
   ggml_tensor *f1 = ffn(c, K, w, p + ".feed_forward1", src);
@@ -595,7 +613,7 @@ ggml_tensor *zip_stack(ggml_context *c, Consts &K, Caches &cc, const TMap &w, in
                        int n_layers, ggml_tensor *x, int ds, int nh, int kernel,
                        int pos_dim, int processed_lens, int lc_base) {
   int lc = lc_base / ds;
-  int pl = processed_lens / ds; // processed frames at this stack's rate
+  (void)processed_lens; // mask now data-driven per chunk (see Consts::upload_masks)
   ggml_tensor *orig = x;
   int Torig = x->ne[1];
   if (ds > 1)
@@ -608,7 +626,7 @@ ggml_tensor *zip_stack(ggml_context *c, Consts &K, Caches &cc, const TMap &w, in
   const char *nl = getenv("XASR_NLAYERS");
   int maxL = nl ? atoi(nl) : n_layers;
   for (int L = 0; L < n_layers && L < maxL; ++L)
-    x = zip_layer(c, K, cc, w, base + std::to_string(L), x, pe, nh, 32, 4, 12, kernel, lc, pl);
+    x = zip_layer(c, K, cc, w, base + std::to_string(L), x, pe, nh, 32, 4, 12, kernel, lc, ds);
   if (ds > 1) {
     x = simple_upsample(c, x, ds);
     x = ggml_cont(c, ggml_view_2d(c, x, x->ne[0], Torig, x->nb[1], 0)); // trim
@@ -651,6 +669,77 @@ ggml_tensor *build_encoder(ggml_context *c, Consts &K, Caches &cc, const TMap &w
   full = simple_downsample(c, K, full, 2, w.at("encoder.downsample_output.weights"));
   return linp(c, w.at("encoder_proj.weight"), w.at("encoder_proj.bias"), full);
 }
+
+// Persistent streaming-encoder runner: builds the chunk graph ONCE (stable
+// topology, stable tensor addresses) and reuses it for every chunk. This is the
+// key latency optimisation:
+//   * no per-chunk ggml graph (re)construction or gallocr allocation;
+//   * recurrent caches kept on-device (device->device copy out->in), no host
+//     round-trip;
+//   * because the graph and tensor addresses never change, the CUDA backend
+//     captures it as a CUDA graph on the 2nd chunk and thereafter replays it with
+//     a single cudaGraphLaunch instead of ~5k individual kernel launches.
+// On pre-Ampere GPUs (e.g. Jetson Nano sm_53) CUDA-graph capture auto-disables;
+// the structural savings (no rebuild/alloc, on-device caches) still apply.
+struct EncRunner {
+  ggml_backend_t backend = nullptr;
+  ggml_context *ctx = nullptr;
+  Consts *K = nullptr;
+  Caches *cc = nullptr;
+  ggml_tensor *feats4 = nullptr, *y = nullptr;
+  ggml_cgraph *gf = nullptr;
+  ggml_gallocr_t alloc = nullptr;
+  int T = 0, FD = 0, outW = 0;
+  std::vector<std::vector<float>> chost; // recurrent cache state (host mirror)
+
+  void build(const TMap &w, ggml_backend_t b, const XAsrHParams &hp) {
+    backend = b; T = hp.T; FD = hp.feat_dim; outW = (((FD - 1) / 2) - 1) / 2;
+    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
+    ggml_init_params ip{mem, nullptr, true};
+    ctx = ggml_init(ip);
+    K = new Consts{ctx}; cc = new Caches{ctx};
+    feats4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, FD, T, 1, 1);
+    ggml_set_input(feats4);
+    ggml_tensor *ecache = cc->get(outW, 3, 128);
+    ggml_tensor *emb = build_embed(ctx, *K, w, feats4, ecache, cc);
+    y = build_encoder(ctx, *K, *cc, w, emb, hp.dims, hp.num_layers, hp.num_heads,
+                      hp.cnn_kernels, hp.downsampling_factor, hp.pos_dim, 0, hp.lc_base());
+    ggml_set_output(y);
+    gf = ggml_new_graph_custom(ctx, 200000, false);
+    ggml_build_forward_expand(gf, y);
+    for (ggml_tensor *o : cc->out) ggml_build_forward_expand(gf, o);
+    alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(alloc, gf); // allocate once; addresses now fixed
+    reset();
+  }
+  void reset() { chost.clear(); } // recurrent caches restart at zero next run
+  // Encode one chunk: feats_chunk = [FD*T] row-major (freq fastest); pl_global =
+  // global processed_lens before this chunk. Returns encoder_out frame-major into
+  // eo ([od*Tc]) and sets Tc/od. Recurrent caches advance via chost.
+  void run(const float *feats_chunk, int pl_global, std::vector<float> &eo, int &Tc, int &od) {
+    ggml_backend_tensor_set(feats4, feats_chunk, 0, (size_t)FD * T * sizeof(float));
+    if (chost.empty()) { // first chunk: all caches zero
+      chost.resize(cc->in.size());
+      for (size_t i = 0; i < cc->in.size(); ++i) chost[i].assign(ggml_nelements(cc->in[i]), 0.0f);
+    }
+    for (size_t i = 0; i < cc->in.size(); ++i)
+      ggml_backend_tensor_set(cc->in[i], chost[i].data(), 0, ggml_nbytes(cc->in[i]));
+    K->upload();
+    K->upload_masks(pl_global); // mask data varies per chunk; topology fixed
+    ggml_backend_graph_compute(backend, gf);
+    Tc = (int)y->ne[1]; od = (int)y->ne[0];
+    eo.resize((size_t)od * Tc);
+    ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
+    for (size_t i = 0; i < cc->out.size(); ++i) // read updated caches back
+      ggml_backend_tensor_get(cc->out[i], chost[i].data(), 0, ggml_nbytes(cc->out[i]));
+  }
+  ~EncRunner() {
+    if (alloc) ggml_gallocr_free(alloc);
+    if (ctx) ggml_free(ctx);
+    delete K; delete cc;
+  }
+};
+
 } // namespace
 
 RS_API bool xasr_debug_embed(const std::map<std::string, ggml_tensor *> &w,
@@ -747,6 +836,7 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
     ggml_backend_tensor_set(ci, zc.data(), 0, ggml_nbytes(ci));
   }
   K.upload();
+  K.upload_masks(0); // single chunk-0 pass: processed_lens = 0
   if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
     ggml_gallocr_free(alloc); ggml_free(c); return false;
   }
@@ -774,53 +864,21 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *>
                                       ggml_backend_t backend, const XAsrHParams &hp,
                                       const float *feats, int n_frames, int feat_dim,
                                       std::vector<float> &out, int *out_dim, int *n_out) {
-  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
-      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
-  const int T = hp.T, shift = hp.decode_chunk_len, outW = (((feat_dim - 1) / 2) - 1) / 2;
-  const int pl_inc = hp.embed_out_len(), lc_base = hp.lc_base();
-  std::vector<std::vector<float>> state; // per-cache host buffers (incl. embed cache)
+  const int T = hp.T, shift = hp.decode_chunk_len, feat_dim_ = feat_dim;
+  const int pl_inc = hp.embed_out_len();
   int processed_lens = 0, total = 0;
   out.clear();
   *out_dim = hp.out_dim;
-
+  EncRunner enc; enc.build(w, backend, hp);
+  std::vector<float> eo;
   for (int start = 0; start + T <= n_frames; start += shift) {
-    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
-    ggml_init_params ip{mem, nullptr, true};
-    ggml_context *c = ggml_init(ip);
-    Consts K{c};
-    Caches cc{c};
-    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, feat_dim, T, 1, 1);
-    ggml_set_input(feats4);
-    ggml_tensor *ecache = cc.get(outW, 3, 128); // embed cache = cc.in[0]
-    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, hp.pos_dim, processed_lens, lc_base);
-    ggml_set_output(y);
-    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
-    ggml_build_forward_expand(gf, y);
-    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o); // new caches
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
-    ggml_backend_tensor_set(feats4, feats + (size_t)start * feat_dim, 0, (size_t)feat_dim * T * sizeof(float));
-    if (state.empty()) { // first chunk: all caches zero
-      state.resize(cc.in.size());
-      for (size_t i = 0; i < cc.in.size(); ++i) state[i].assign(ggml_nelements(cc.in[i]), 0.0f);
-    }
-    for (size_t i = 0; i < cc.in.size(); ++i)
-      ggml_backend_tensor_set(cc.in[i], state[i].data(), 0, ggml_nbytes(cc.in[i]));
-    K.upload();
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
-    // append encoder_out frames (y is [out_dim, Tc])
-    int Tc = y->ne[1];
+    int Tc = 0, od = 0;
+    enc.run(feats + (size_t)start * feat_dim_, processed_lens, eo, Tc, od);
     size_t off = out.size();
-    out.resize(off + (size_t)y->ne[0] * Tc);
-    ggml_backend_tensor_get(y, out.data() + off, 0, ggml_nbytes(y));
+    out.resize(off + (size_t)od * Tc);
+    std::copy(eo.begin(), eo.end(), out.begin() + off);
     total += Tc;
-    // read updated caches into state
-    for (size_t i = 0; i < cc.out.size(); ++i)
-      ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
     processed_lens += pl_inc;
-    ggml_gallocr_free(alloc);
-    ggml_free(c);
   }
   *n_out = total;
   return true;
@@ -899,6 +957,83 @@ struct XAsrTransducer {
     }
     return best;
   }
+
+  // Greedy RNN-T over a chunk's encoder frames (enc = [od, Tc], frame-major).
+  // One joiner+argmax per frame; decoder advances only on a non-blank emission.
+  // (Host fallback used by xasr_greedy_search, which has no backend handle.)
+  void greedy_chunk(const float *enc, int Tc, int od,
+                    std::vector<int32_t> &hyp, std::vector<float> &dout) const {
+    for (int t = 0; t < Tc; ++t) {
+      int tid = argmax_token(enc + (size_t)t * od, dout);
+      if (tid != 0) { hyp.push_back(tid); dout = decode(hyp); }
+    }
+  }
+};
+
+// Persistent joiner runner: computes joiner logits for a whole chunk's frames
+// against one decoder state in a single backend matmul, i.e. logits[vocab,Tc] =
+// output_linear * tanh(enc[od,Tc] + dec[od]) + bias. This moves the joiner's
+// 512-dim dot products off the scalar host loop onto the optimised backend
+// (multithreaded mul_mat on CPU, cuBLAS on GPU); the host keeps only the cheap
+// per-frame argmax. enc is uploaded once per chunk; only the decoder vector
+// changes between RNN-T emissions, so the graph/addresses are stable (CUDA-graph
+// reusable). jout_w/jout_b are reused from the loaded (possibly f16) weights;
+// matmul accumulates in F32 to match the host reference.
+struct JoinerRunner {
+  ggml_backend_t backend = nullptr;
+  ggml_context *ctx = nullptr;
+  ggml_tensor *enc = nullptr, *dvec = nullptr, *logits = nullptr;
+  ggml_cgraph *gf = nullptr;
+  ggml_gallocr_t alloc = nullptr;
+  int od = 0, Tc = 0, vocab = 0;
+  std::vector<float> lg; // host logits [vocab*Tc], frame-major (ne0=vocab)
+
+  void build(const TMap &w, ggml_backend_t b, int od_, int Tc_) {
+    backend = b; od = od_; Tc = Tc_;
+    ggml_tensor *jw = w.at("joiner.output_linear.weight"); // [od, vocab]
+    ggml_tensor *jb = w.at("joiner.output_linear.bias");   // [vocab]
+    vocab = (int)jw->ne[1];
+    size_t mem = ggml_tensor_overhead() * 32 + ggml_graph_overhead();
+    ggml_init_params ip{mem, nullptr, true};
+    ctx = ggml_init(ip);
+    enc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, od, Tc); ggml_set_input(enc);
+    dvec = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, od); ggml_set_input(dvec);
+    ggml_tensor *act = ggml_tanh(ctx, ggml_add(ctx, enc, dvec)); // dec broadcast over Tc
+    logits = ggml_mul_mat(ctx, jw, act);                         // [vocab, Tc]
+    ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    logits = ggml_add(ctx, logits, jb);                          // bias broadcast over Tc
+    ggml_set_output(logits);
+    gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, logits);
+    alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(alloc, gf);
+  }
+  // Greedy RNN-T decode over enc[od, Tc_actual] (frame-major). Tc_actual <= Tc.
+  void greedy(const float *enc_chunk, int Tc_actual, const XAsrTransducer &td,
+              std::vector<int32_t> &hyp, std::vector<float> &dout) {
+    int t = 0;
+    while (t < Tc_actual) {
+      ggml_backend_tensor_set(enc, enc_chunk, 0, (size_t)od * Tc_actual * sizeof(float));
+      ggml_backend_tensor_set(dvec, dout.data(), 0, (size_t)od * sizeof(float));
+      ggml_backend_graph_compute(backend, gf);
+      lg.resize((size_t)vocab * Tc);
+      ggml_backend_tensor_get(logits, lg.data(), 0, ggml_nbytes(logits));
+      int emit = -1, tok = 0;
+      for (int f = t; f < Tc_actual && emit < 0; ++f) { // first non-blank frame
+        const float *col = lg.data() + (size_t)f * vocab;
+        int best = 0; float bv = col[0];
+        for (int o = 1; o < vocab; ++o) if (col[o] > bv) { bv = col[o]; best = o; }
+        if (best != 0) { emit = f; tok = best; }
+      }
+      if (emit < 0) break;                       // rest of chunk all blank
+      hyp.push_back(tok); dout = td.decode(hyp); // decoder state changes -> re-run
+      t = emit + 1;
+    }
+  }
+  ~JoinerRunner() {
+    if (alloc) ggml_gallocr_free(alloc);
+    if (ctx) ggml_free(ctx);
+  }
 };
 
 // Full native transcription: features -> token ids (greedy transducer).
@@ -910,13 +1045,10 @@ RS_API bool xasr_debug_transcribe(const std::map<std::string, ggml_tensor *> &w,
   if (!xasr_debug_encoder_stream(w, backend, hp, feats, n_frames, feat_dim, enc, &out_dim, &n_out))
     return false;
   XAsrTransducer td; td.load(w);
-  const int blank = 0;
-  std::vector<int32_t> hyp(td.ctx, blank);
+  std::vector<int32_t> hyp(td.ctx, 0);
   std::vector<float> dout = td.decode(hyp);
-  for (int t = 0; t < n_out; ++t) {
-    int tid = td.argmax_token(enc.data() + (size_t)t * out_dim, dout);
-    if (tid != blank) { hyp.push_back(tid); dout = td.decode(hyp); }
-  }
+  JoinerRunner joiner; joiner.build(w, backend, out_dim, n_out);
+  joiner.greedy(enc.data(), n_out, td, hyp, dout);
   ids.assign(hyp.begin() + td.ctx, hyp.end());
   return true;
 }
@@ -926,13 +1058,9 @@ RS_API void xasr_greedy_search(const std::map<std::string, ggml_tensor *> &w,
                                const float *encoder_out, int n_frames, int out_dim,
                                std::vector<int32_t> &ids) {
   XAsrTransducer td; td.load(w);
-  const int blank = 0;
-  std::vector<int32_t> hyp(td.ctx, blank);
+  std::vector<int32_t> hyp(td.ctx, 0);
   std::vector<float> dout = td.decode(hyp);
-  for (int t = 0; t < n_frames; ++t) {
-    int tid = td.argmax_token(encoder_out + (size_t)t * out_dim, dout);
-    if (tid != blank) { hyp.push_back(tid); dout = td.decode(hyp); }
-  }
+  td.greedy_chunk(encoder_out, n_frames, out_dim, hyp, dout);
   ids.assign(hyp.begin() + td.ctx, hyp.end());
 }
 
@@ -944,67 +1072,41 @@ RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
                               ggml_backend_t backend, const XAsrHParams &hp,
                               const float *feats, int n_frames, int feat_dim,
                               std::vector<int32_t> &ids) {
-  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
-      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
-  const int T = hp.T, shift = hp.decode_chunk_len, outW = (((feat_dim - 1) / 2) - 1) / 2;
-  const int pl_inc = hp.embed_out_len(), lc_base = hp.lc_base();
+  const int T = hp.T, shift = hp.decode_chunk_len;
+  const int pl_inc = hp.embed_out_len();
   XAsrTransducer td; td.load(w);
-  std::vector<std::vector<float>> state;       // persistent caches
+  EncRunner enc; enc.build(w, backend, hp); // build the chunk graph ONCE, reuse it
+  JoinerRunner joiner; joiner.build(w, backend, hp.out_dim, hp.embed_out_len());
   int processed_lens = 0;
   std::vector<int32_t> hyp(td.ctx, 0);          // persistent hypothesis
   std::vector<float> dout = td.decode(hyp);     // persistent decoder_out
+  std::vector<float> eo;
   double first_partial = -1, t_total = 0;
-  double t0_stream = -1; int chunk = 0;
+  int chunk = 0;
   using clk = std::chrono::steady_clock;
 
+  double t_enc = 0, t_dec = 0;
   for (int start = 0; start + T <= n_frames; start += shift, ++chunk) {
     auto t0 = clk::now();
-    // --- per-chunk encoder (persistent caches) ---
-    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
-    ggml_init_params ip{mem, nullptr, true};
-    ggml_context *c = ggml_init(ip);
-    Consts K{c}; Caches cc{c};
-    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, feat_dim, T, 1, 1);
-    ggml_set_input(feats4);
-    ggml_tensor *ecache = cc.get(outW, 3, 128);
-    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, hp.pos_dim, processed_lens, lc_base);
-    ggml_set_output(y);
-    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
-    ggml_build_forward_expand(gf, y);
-    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o);
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
-    ggml_backend_tensor_set(feats4, feats + (size_t)start * feat_dim, 0, (size_t)feat_dim * T * sizeof(float));
-    if (state.empty()) {
-      state.resize(cc.in.size());
-      for (size_t i = 0; i < cc.in.size(); ++i) state[i].assign(ggml_nelements(cc.in[i]), 0.0f);
-    }
-    for (size_t i = 0; i < cc.in.size(); ++i)
-      ggml_backend_tensor_set(cc.in[i], state[i].data(), 0, ggml_nbytes(cc.in[i]));
-    K.upload();
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
-    int Tc = y->ne[1], od = y->ne[0];
-    std::vector<float> eo((size_t)od * Tc);
-    ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
-    for (size_t i = 0; i < cc.out.size(); ++i)
-      ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
+    int Tc = 0, od = 0;
+    enc.run(feats + (size_t)start * feat_dim, processed_lens, eo, Tc, od);
     processed_lens += pl_inc;
-    ggml_gallocr_free(alloc); ggml_free(c);
-    // --- greedy on this chunk's frames (persistent decoder) ---
-    for (int t = 0; t < Tc; ++t) {
-      int tid = td.argmax_token(eo.data() + (size_t)t * od, dout);
-      if (tid != 0) { hyp.push_back(tid); dout = td.decode(hyp); }
-    }
-    double dt = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    auto t1 = clk::now();
+    // --- greedy on this chunk's frames (backend joiner + host argmax) ---
+    joiner.greedy(eo.data(), Tc, td, hyp, dout);
+    auto t2 = clk::now();
+    t_enc += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t_dec += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    double dt = std::chrono::duration<double, std::milli>(t2 - t0).count();
     t_total += dt;
     if (first_partial < 0 && (int)hyp.size() > td.ctx)
       first_partial = (chunk + 1) * (shift * 10.0); // ms of audio consumed to first token
     fprintf(stderr, "  chunk %2d: %.1f ms, partial=%d tokens\n", chunk, dt, (int)hyp.size() - td.ctx);
-    (void)t0_stream;
   }
   fprintf(stderr, "online: %d chunks, avg %.1f ms/chunk (audio %d ms/chunk), first-partial after %.0f ms audio\n",
           chunk, t_total / (chunk ? chunk : 1), shift * 10, first_partial);
+  fprintf(stderr, "  breakdown: encoder %.1f ms/chunk, greedy(decoder+joiner, host) %.1f ms/chunk\n",
+          t_enc / (chunk ? chunk : 1), t_dec / (chunk ? chunk : 1));
   ids.assign(hyp.begin() + td.ctx, hyp.end());
   return true;
 }
@@ -1020,9 +1122,11 @@ struct XAsrOnlineStream::Impl {
   XAsrTransducer td;
   AudioProcessor fbank;
   int T, shift, FD, outW, pl_inc, lc_base;
+  EncRunner enc;                    // persistent encoder graph (built once)
+  JoinerRunner joiner;              // persistent joiner graph (built once)
+  std::vector<float> eo;            // scratch encoder_out for the current chunk
   std::vector<float> samples;       // accumulated float PCM
   std::vector<float> feats;         // computed fbank [n_frames*FD]
-  std::vector<std::vector<float>> caches;
   int processed_lens = 0, chunks_done = 0;
   std::vector<int32_t> hyp;
   std::vector<float> dout;
@@ -1041,10 +1145,12 @@ struct XAsrOnlineStream::Impl {
     T = hp.T; shift = hp.decode_chunk_len; FD = hp.feat_dim;
     outW = (((FD - 1) / 2) - 1) / 2; pl_inc = hp.embed_out_len(); lc_base = hp.lc_base();
     td.load(w_); hyp.assign(td.ctx, 0); dout = td.decode(hyp);
+    enc.build(w_, b, hp_); // persistent encoder graph (built once, reused per chunk)
+    joiner.build(w_, b, hp_.out_dim, hp_.embed_out_len()); // persistent joiner graph
   }
 
   void reset() {
-    samples.clear(); feats.clear(); caches.clear();
+    samples.clear(); feats.clear(); enc.reset();
     processed_lens = 0; chunks_done = 0; finished = false;
     hyp.assign(td.ctx, 0); dout = td.decode(hyp);
     have_first_sample = false; first_partial_s = -1;
@@ -1052,43 +1158,13 @@ struct XAsrOnlineStream::Impl {
 
   // encode one chunk at feats[start*FD ..], greedy-decode its frames.
   void run_chunk(int start) {
-    size_t mem = ggml_tensor_overhead()*200000 + ggml_graph_overhead_custom(200000,false);
-    ggml_init_params ip{mem,nullptr,true};
-    ggml_context *c = ggml_init(ip);
-    Consts K{c}; Caches cc{c};
-    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, FD, T, 1, 1);
-    ggml_set_input(feats4);
-    ggml_tensor *ecache = cc.get(outW, 3, 128);
-    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
-    ggml_tensor *y = build_encoder(c, K, cc, w, emb, hp.dims, hp.num_layers, hp.num_heads,
-                                   hp.cnn_kernels, hp.downsampling_factor, hp.pos_dim, processed_lens, lc_base);
-    ggml_set_output(y);
-    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
-    ggml_build_forward_expand(gf, y);
-    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o);
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(alloc, gf);
-    ggml_backend_tensor_set(feats4, feats.data() + (size_t)start*FD, 0, (size_t)FD*T*sizeof(float));
-    if (caches.empty()) { caches.resize(cc.in.size());
-      for (size_t i=0;i<cc.in.size();++i) caches[i].assign(ggml_nelements(cc.in[i]),0.0f); }
-    for (size_t i=0;i<cc.in.size();++i)
-      ggml_backend_tensor_set(cc.in[i], caches[i].data(), 0, ggml_nbytes(cc.in[i]));
-    K.upload();
-    ggml_backend_graph_compute(backend, gf);
-    int Tc = y->ne[1], od = y->ne[0];
-    std::vector<float> eo((size_t)od*Tc);
-    ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
-    for (size_t i=0;i<cc.out.size();++i)
-      ggml_backend_tensor_get(cc.out[i], caches[i].data(), 0, ggml_nbytes(cc.out[i]));
+    int Tc = 0, od = 0;
+    enc.run(feats.data() + (size_t)start*FD, processed_lens, eo, Tc, od);
     processed_lens += pl_inc;
-    ggml_gallocr_free(alloc); ggml_free(c);
-    for (int t=0;t<Tc;++t) {
-      int tid = td.argmax_token(eo.data()+(size_t)t*od, dout);
-      if (tid!=0) { hyp.push_back(tid); dout = td.decode(hyp);
-        if (first_partial_s < 0 && have_first_sample)
-          first_partial_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t_first).count();
-      }
-    }
+    size_t before = hyp.size();
+    joiner.greedy(eo.data(), Tc, td, hyp, dout); // backend joiner + host argmax
+    if (first_partial_s < 0 && have_first_sample && hyp.size() > before)
+      first_partial_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t_first).count();
   }
 
   // recompute fbank on the current sample buffer (+ optional final 100-frame pad)
