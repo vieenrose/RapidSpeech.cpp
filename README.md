@@ -52,6 +52,7 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 **Automatic Speech Recognition (ASR)**
 - [x] SenseVoice-small
 - [x] FunASR-nano
+- [x] X-ASR zh-en streaming **zipformer2 transducer** (k2-fsa / sherpa-onnx; 80-dim kaldi fbank, streaming chunked encoder + stateless decoder + joiner, greedy search). Numerically matches sherpa-onnx (encoder corr 1.0, token-exact transcription). GGUF: [Luigi/x-asr-zh-en-960ms-zipformer2-gguf](https://huggingface.co/Luigi/x-asr-zh-en-960ms-zipformer2-gguf) (f16 / Q4_K); convert with `scripts/xasr/convert_xasr_to_gguf.py`.
 - [ ] Qwen3-ASR
 - [ ] FireRedASR2
 
