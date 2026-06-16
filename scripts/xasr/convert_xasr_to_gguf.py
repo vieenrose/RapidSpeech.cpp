@@ -121,6 +121,69 @@ def il(s):
     return [int(x) for x in str(s).split(",")]
 
 
+def extract_folded_constants(enc, model_path, ds_per_stack):
+    """Several streaming-export constants are folded into the graph as computed
+    tensors (input-independent), not named weights. Evaluate them once with
+    onnxruntime (zero inputs):
+      - conv_module chunkwise scale: chunkwise_conv -> Mul -> scale operand.
+      - SimpleDownsample weights softmax(bias): ReduceSum <- Mul <- (reshaped src,
+        weights). 6 in graph order = stacks with ds>1 (in order) + output_downsample.
+    Returns {gguf_name -> np.ndarray}."""
+    import onnxruntime as ort
+    g = enc.g
+    name_map = {}  # gguf tensor name -> onnx value name
+
+    for n in g.node:  # chunk scales
+        if n.op_type != "Conv":
+            continue
+        cw = next((i for i in n.input if i.endswith("chunkwise_conv.weight")), None)
+        if cw is None:
+            continue
+        prefix = cw[: -len(".chunkwise_conv.weight")]
+        mul = next((m for m in enc.consumers.get(n.output[0], [])
+                    if m.op_type == "Mul"), None)
+        if mul:
+            sv = next((i for i in mul.input if i != n.output[0]), None)
+            if sv:
+                name_map[prefix + ".chunk_scale"] = sv
+
+    # downsample weights, in ReduceSum graph order
+    ds_stacks = [i for i, ds in enumerate(ds_per_stack) if ds > 1]
+    reduce_sums = [n for n in g.node if n.op_type == "ReduceSum"]
+    ds_names = ([f"encoder.encoders.{i}.downsample.weights" for i in ds_stacks]
+                + ["encoder.downsample_output.weights"])
+    for rs, gn in zip(reduce_sums, ds_names):
+        mul = enc.producer.get(rs.input[0])
+        if mul is None or mul.op_type != "Mul":
+            continue
+        # weight operand = the Mul input NOT produced by a Reshape
+        wv = None
+        for i in mul.input:
+            p = enc.producer.get(i)
+            if not (p and p.op_type == "Reshape"):
+                wv = i
+        name_map[gn] = wv if wv else mul.input[1]
+
+    m = onnx.load(model_path)
+    existing = {o.name for o in m.graph.output}
+    for v in name_map.values():
+        if v not in existing:
+            m.graph.output.append(onnx.helper.make_empty_tensor_value_info(v))
+    tmp = model_path + ".folded.onnx"
+    onnx.save(m, tmp)
+    so = ort.SessionOptions(); so.intra_op_num_threads = 1
+    sess = ort.InferenceSession(tmp, so, providers=["CPUExecutionProvider"])
+    feed = {}
+    for i in sess.get_inputs():
+        shp = [1 if isinstance(s, str) else s for s in i.shape]
+        feed[i.name] = np.zeros(shp, np.int64 if "int64" in i.type else np.float32)
+    names = list(name_map.values())
+    outs = sess.run(names, feed)
+    os.remove(tmp)
+    v2a = dict(zip(names, outs))
+    return {gn: np.squeeze(v2a[v]) for gn, v in name_map.items()}
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -230,6 +293,18 @@ def main():
         wt = enc.arr(src_name)  # ONNX (in,out)
         _store(w, prefix + ".linear_pos.weight", lin(wt), a.f16); n_w += 1
         orphan_mm.discard(src_name)
+
+    # ---- folded constants (chunk scales + downsample weights) via onnxruntime ----
+    DS_PER_STACK = [1, 2, 4, 8, 4, 2]
+    folded = extract_folded_constants(enc, os.path.join(d, a.encoder), DS_PER_STACK)
+    w.add_array("xasr.encoder.downsampling_factor", DS_PER_STACK)
+    w.add_int32("xasr.encoder.output_downsample", 2)
+    for gn, arr in sorted(folded.items()):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if gn.endswith("chunk_scale"):  # [C,T] -> F-order relabel; keep F32
+            _store(w, gn, lin(arr), False); n_w += 1  # elementwise-mul w/ f32 acts
+        else:  # downsample weights: 1-D [ds]
+            _store(w, gn, arr.reshape(-1), a.f16); n_w += 1
 
     # ---- decoder: fully named ----
     # embedding ONNX [vocab,dim] -> ggml ne [dim,vocab] (ne0=dim for ggml_get_rows)
