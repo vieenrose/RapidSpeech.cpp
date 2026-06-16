@@ -153,6 +153,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/keyword_loader.cpp
         rapidspeech/src/arch/kws_decoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
+        rapidspeech/src/arch/xasr_zipformer2.cpp
         rapidspeech/src/arch/silero_vad.cpp
         rapidspeech/src/arch/fireredvad.cpp
         rapidspeech/src/arch/llm_model.h
