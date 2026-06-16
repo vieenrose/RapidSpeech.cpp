@@ -161,6 +161,9 @@ static bool rs_model_quantize(const std::string &fname_inp,
                                      ".*ctc_out_linear\\.weight"});
   }
 
+  // Extra user-supplied skip regexes (e.g. --to-skip for conv weights).
+  for (const auto &s : cli_opts.to_skip) to_skip.push_back(s);
+
   // Build the full options for the underlying quantize call.
   rs_quantize_options opts = cli_opts;
   opts.to_quant = {".*"};
@@ -240,6 +243,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
       cli_opts.nthread = atoi(argv[++i]);
       if (cli_opts.nthread < 1) cli_opts.nthread = 1;
+    } else if (strcmp(argv[i], "--to-skip") == 0 && i + 1 < argc) {
+      cli_opts.to_skip.push_back(argv[++i]); // extra keep-at-source-precision regex
     } else {
       RS_QUANTIZE_LOG_ERROR("Unknown option: %s", argv[i]);
       rs_print_usage(argv[0]);

@@ -111,3 +111,7 @@ RS_API bool xasr_debug_transcribe(const std::map<std::string, struct ggml_tensor
 RS_API void xasr_greedy_search(const std::map<std::string, struct ggml_tensor *> &w,
                                const float *encoder_out, int n_frames, int out_dim,
                                std::vector<int32_t> &ids);
+// Online streaming demo: persistent caches + decoder, partial per chunk + latency.
+RS_API bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> &w,
+                              ggml_backend_t backend, const float *feats, int n_frames,
+                              int feat_dim, std::vector<int32_t> &ids);

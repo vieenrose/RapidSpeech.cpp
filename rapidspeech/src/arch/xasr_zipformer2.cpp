@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
+#include <chrono>
 #include <cmath>
 #include <functional>
 
@@ -825,9 +826,16 @@ static std::vector<float> tof32(ggml_tensor *t) {
   std::vector<float> out(n);
   if (t->type == GGML_TYPE_F32) {
     ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-  } else {
-    std::vector<ggml_fp16_t> h(n);
-    ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+    return out;
+  }
+  // Read raw bytes and dequantize via the type's to_float (handles F16, Q4_K, …).
+  std::vector<char> raw(ggml_nbytes(t));
+  ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+  const ggml_type_traits *tt = ggml_get_type_traits(t->type);
+  if (tt && tt->to_float) {
+    tt->to_float(raw.data(), out.data(), (int64_t)n);
+  } else { // fallback: assume f16
+    const ggml_fp16_t *h = (const ggml_fp16_t *)raw.data();
     for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(h[i]);
   }
   return out;
@@ -918,6 +926,77 @@ RS_API void xasr_greedy_search(const std::map<std::string, ggml_tensor *> &w,
     if (tid != blank) { hyp.push_back(tid); dout = td.decode(hyp); }
   }
   ids.assign(hyp.begin() + td.ctx, hyp.end());
+}
+
+// Online streaming demo: process a feature stream chunk-by-chunk with PERSISTENT
+// caches + decoder state (sherpa OnlineRecognizer style). Emits a partial after
+// each chunk and reports per-chunk latency + first-partial latency. Returns the
+// final token ids. This is the same per-chunk path a live PCM stream would drive.
+RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
+                              ggml_backend_t backend, const float *feats,
+                              int n_frames, int feat_dim, std::vector<int32_t> &ids) {
+  std::vector<int> dims{192, 256, 512, 768, 512, 256}, nlayers{2, 2, 4, 5, 4, 2},
+      nheads{4, 4, 4, 8, 4, 4}, kernels{31, 31, 15, 15, 15, 31}, dsf{1, 2, 4, 8, 4, 2};
+  const int T = 109, shift = 96, outW = (((feat_dim - 1) / 2) - 1) / 2;
+  XAsrTransducer td; td.load(w);
+  std::vector<std::vector<float>> state;       // persistent caches
+  int processed_lens = 0;
+  std::vector<int32_t> hyp(td.ctx, 0);          // persistent hypothesis
+  std::vector<float> dout = td.decode(hyp);     // persistent decoder_out
+  double first_partial = -1, t_total = 0;
+  double t0_stream = -1; int chunk = 0;
+  using clk = std::chrono::steady_clock;
+
+  for (int start = 0; start + T <= n_frames; start += shift, ++chunk) {
+    auto t0 = clk::now();
+    // --- per-chunk encoder (persistent caches) ---
+    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
+    ggml_init_params ip{mem, nullptr, true};
+    ggml_context *c = ggml_init(ip);
+    Consts K{c}; Caches cc{c};
+    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, feat_dim, T, 1, 1);
+    ggml_set_input(feats4);
+    ggml_tensor *ecache = cc.get(outW, 3, 128);
+    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_set_output(y);
+    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
+    ggml_build_forward_expand(gf, y);
+    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
+    ggml_backend_tensor_set(feats4, feats + (size_t)start * feat_dim, 0, (size_t)feat_dim * T * sizeof(float));
+    if (state.empty()) {
+      state.resize(cc.in.size());
+      for (size_t i = 0; i < cc.in.size(); ++i) state[i].assign(ggml_nelements(cc.in[i]), 0.0f);
+    }
+    for (size_t i = 0; i < cc.in.size(); ++i)
+      ggml_backend_tensor_set(cc.in[i], state[i].data(), 0, ggml_nbytes(cc.in[i]));
+    K.upload();
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
+    int Tc = y->ne[1], od = y->ne[0];
+    std::vector<float> eo((size_t)od * Tc);
+    ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
+    for (size_t i = 0; i < cc.out.size(); ++i)
+      ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
+    processed_lens += 48;
+    ggml_gallocr_free(alloc); ggml_free(c);
+    // --- greedy on this chunk's frames (persistent decoder) ---
+    for (int t = 0; t < Tc; ++t) {
+      int tid = td.argmax_token(eo.data() + (size_t)t * od, dout);
+      if (tid != 0) { hyp.push_back(tid); dout = td.decode(hyp); }
+    }
+    double dt = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    t_total += dt;
+    if (first_partial < 0 && (int)hyp.size() > td.ctx)
+      first_partial = (chunk + 1) * (shift * 10.0); // ms of audio consumed to first token
+    fprintf(stderr, "  chunk %2d: %.1f ms, partial=%d tokens\n", chunk, dt, (int)hyp.size() - td.ctx);
+    (void)t0_stream;
+  }
+  fprintf(stderr, "online: %d chunks, avg %.1f ms/chunk (audio %d ms/chunk), first-partial after %.0f ms audio\n",
+          chunk, t_total / (chunk ? chunk : 1), shift * 10, first_partial);
+  ids.assign(hyp.begin() + td.ctx, hyp.end());
+  return true;
 }
 
 // ---------------------------------------------------------------- registration
