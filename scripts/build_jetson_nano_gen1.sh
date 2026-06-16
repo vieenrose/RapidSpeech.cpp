@@ -45,6 +45,7 @@ cmake .. \
   -DCMAKE_CUDA_STANDARD=14 \
   -DCMAKE_CUDA_ARCHITECTURES=53 \
   -DGGML_CUDA_NO_VMM=ON \
+  -DCMAKE_CXX_STANDARD_LIBRARIES="-lstdc++fs" \
   -DGGML_NATIVE=OFF -DGGML_CPU_GENERIC=OFF -DGGML_CPU_ARM=OFF \
   -DCMAKE_CUDA_FLAGS="--forward-unknown-to-host-compiler -arch=sm_53 -Xcompiler -fPIC -I$COMPAT -include $COMPAT/nvcc_compat.h" \
   -DCMAKE_C_FLAGS="-include $COMPAT/neon_x4_shim.h -I$CUDA/include -I$CT/include" \
@@ -58,7 +59,7 @@ cmake .. \
   -DOpenMP_C_LIB_NAMES="gomp" -DOpenMP_CXX_LIB_NAMES="gomp" \
   -DOpenMP_gomp_LIBRARY="$SYSROOT/usr/lib64/libgomp.so" \
   -DCUDAToolkit_INCLUDE_DIRECTORIES=$CT/include \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib/stubs -L$CT/lib -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib -L$CT/lib/stubs -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt"
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib/stubs -L$CT/lib -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt -lstdc++fs" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib -L$CT/lib/stubs -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt -lstdc++fs"
 make -j6
 echo NANO-CUDA-BUILD-OK
