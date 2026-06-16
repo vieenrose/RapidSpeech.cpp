@@ -424,6 +424,10 @@ if (RS_BUILD_CLI)
             examples/asr/rs-asr-vad-online.cpp
     )
 
+    add_executable(rs-xasr-ws-server
+            examples/asr/rs-xasr-ws-server.cpp
+    )
+
     add_executable(rs-tts-offline
             examples/tts/rs-tts-offline.cpp
     )
@@ -458,6 +462,11 @@ if (RS_BUILD_CLI)
     endif()
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
+    target_link_libraries(rs-xasr-ws-server  PRIVATE rapidspeech-core ggml Threads::Threads)
+    target_include_directories(rs-xasr-ws-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include ${GGML_PATH}/src)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)

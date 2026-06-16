@@ -115,3 +115,22 @@ RS_API void xasr_greedy_search(const std::map<std::string, struct ggml_tensor *>
 RS_API bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> &w,
                               ggml_backend_t backend, const float *feats, int n_frames,
                               int feat_dim, std::vector<int32_t> &ids);
+
+// Persistent online streaming recognizer driven by raw 16 kHz mono int16 PCM
+// (online fbank + per-chunk encoder w/ persistent caches + greedy transducer).
+// Backing engine for the WebSocket server (sherpa OnlineRecognizer semantics).
+class RS_API XAsrOnlineStream {
+public:
+  XAsrOnlineStream(const std::map<std::string, struct ggml_tensor *> &w,
+                   ggml_backend_t backend);
+  ~XAsrOnlineStream();
+  void AcceptPcm(const int16_t *pcm, int n); // 16 kHz mono int16
+  void InputFinished();                      // flush (pads tail), produce final
+  const std::vector<int32_t> &Hyp() const;   // full hypothesis incl. leading ctx
+  int ContextSize() const;                   // skip first ContextSize() ids for text
+  void Reset();
+  double FirstPartialLatencySec() const;     // <0 if no token yet
+private:
+  struct Impl;
+  Impl *p_;
+};

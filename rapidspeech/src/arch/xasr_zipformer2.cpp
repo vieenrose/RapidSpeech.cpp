@@ -999,6 +999,113 @@ RS_API bool xasr_debug_online(const std::map<std::string, ggml_tensor *> &w,
   return true;
 }
 
+// ================================================================ online stream
+// Persistent streaming recognizer driven by raw PCM (16 kHz mono), for the
+// WebSocket server. Online fbank + per-chunk encoder (persistent caches) +
+// greedy transducer (persistent decoder). Mirrors sherpa OnlineRecognizer.
+struct XAsrOnlineStream::Impl {
+  const TMap &w;
+  ggml_backend_t backend;
+  XAsrTransducer td;
+  AudioProcessor fbank;
+  std::vector<int> dims{192,256,512,768,512,256}, nlayers{2,2,4,5,4,2},
+      nheads{4,4,4,8,4,4}, kernels{31,31,15,15,15,31}, dsf{1,2,4,8,4,2};
+  static constexpr int T = 109, shift = 96, FD = 80, outW = 19;
+  std::vector<float> samples;       // accumulated float PCM
+  std::vector<float> feats;         // computed fbank [n_frames*FD]
+  std::vector<std::vector<float>> caches;
+  int processed_lens = 0, chunks_done = 0;
+  std::vector<int32_t> hyp;
+  std::vector<float> dout;
+  bool finished = false;
+  std::chrono::steady_clock::time_point t_first{};
+  bool have_first_sample = false;
+  double first_partial_s = -1;
+
+  static STFTConfig cfg() {
+    STFTConfig c; c.sample_rate = 16000; c.n_mels = 80;
+    c.window_type = WindowType::POVEY; c.use_lfr = false; c.use_cmvn = false;
+    c.snip_edges = false; return c;
+  }
+  Impl(const TMap &w_, ggml_backend_t b) : w(w_), backend(b), fbank(cfg()) {
+    td.load(w_); hyp.assign(td.ctx, 0); dout = td.decode(hyp);
+  }
+
+  void reset() {
+    samples.clear(); feats.clear(); caches.clear();
+    processed_lens = 0; chunks_done = 0; finished = false;
+    hyp.assign(td.ctx, 0); dout = td.decode(hyp);
+    have_first_sample = false; first_partial_s = -1;
+  }
+
+  // encode one chunk at feats[start*FD ..], greedy-decode its frames.
+  void run_chunk(int start) {
+    size_t mem = ggml_tensor_overhead()*200000 + ggml_graph_overhead_custom(200000,false);
+    ggml_init_params ip{mem,nullptr,true};
+    ggml_context *c = ggml_init(ip);
+    Consts K{c}; Caches cc{c};
+    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, FD, T, 1, 1);
+    ggml_set_input(feats4);
+    ggml_tensor *ecache = cc.get(outW, 3, 128);
+    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_set_output(y);
+    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
+    ggml_build_forward_expand(gf, y);
+    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(alloc, gf);
+    ggml_backend_tensor_set(feats4, feats.data() + (size_t)start*FD, 0, (size_t)FD*T*sizeof(float));
+    if (caches.empty()) { caches.resize(cc.in.size());
+      for (size_t i=0;i<cc.in.size();++i) caches[i].assign(ggml_nelements(cc.in[i]),0.0f); }
+    for (size_t i=0;i<cc.in.size();++i)
+      ggml_backend_tensor_set(cc.in[i], caches[i].data(), 0, ggml_nbytes(cc.in[i]));
+    K.upload();
+    ggml_backend_graph_compute(backend, gf);
+    int Tc = y->ne[1], od = y->ne[0];
+    std::vector<float> eo((size_t)od*Tc);
+    ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
+    for (size_t i=0;i<cc.out.size();++i)
+      ggml_backend_tensor_get(cc.out[i], caches[i].data(), 0, ggml_nbytes(cc.out[i]));
+    processed_lens += 48;
+    ggml_gallocr_free(alloc); ggml_free(c);
+    for (int t=0;t<Tc;++t) {
+      int tid = td.argmax_token(eo.data()+(size_t)t*od, dout);
+      if (tid!=0) { hyp.push_back(tid); dout = td.decode(hyp);
+        if (first_partial_s < 0 && have_first_sample)
+          first_partial_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t_first).count();
+      }
+    }
+  }
+
+  // recompute fbank on the current sample buffer (+ optional final 100-frame pad)
+  // and run any encoder windows now fully available.
+  void process(bool final_pad) {
+    fbank.Compute(samples, feats); // use_lfr/use_cmvn=false -> raw fbank
+    if (final_pad) feats.resize(feats.size() + (size_t)100*FD, 0.0f);
+    int n = (int)feats.size()/FD;
+    // during streaming leave a 2-frame margin (trailing frames not yet stable)
+    int usable = final_pad ? n : n - 2;
+    while (chunks_done*shift + T <= usable) { run_chunk(chunks_done*shift); ++chunks_done; }
+  }
+};
+
+XAsrOnlineStream::XAsrOnlineStream(const TMap &w, ggml_backend_t backend)
+    : p_(new Impl(w, backend)) {}
+XAsrOnlineStream::~XAsrOnlineStream() { delete p_; }
+void XAsrOnlineStream::AcceptPcm(const int16_t *pcm, int n) {
+  if (!p_->have_first_sample && n > 0) { p_->t_first = std::chrono::steady_clock::now(); p_->have_first_sample = true; }
+  size_t off = p_->samples.size();
+  p_->samples.resize(off + n);
+  for (int i=0;i<n;++i) p_->samples[off+i] = pcm[i] / 32768.0f;
+  p_->process(false);
+}
+void XAsrOnlineStream::InputFinished() { if (!p_->finished) { p_->finished = true; p_->process(true); } }
+const std::vector<int32_t> &XAsrOnlineStream::Hyp() const { return p_->hyp; }
+int XAsrOnlineStream::ContextSize() const { return p_->td.ctx; }
+void XAsrOnlineStream::Reset() { p_->reset(); }
+double XAsrOnlineStream::FirstPartialLatencySec() const { return p_->first_partial_s; }
+
 // ---------------------------------------------------------------- registration
 extern void
 rs_register_model_arch(const std::string &arch,
