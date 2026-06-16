@@ -35,11 +35,14 @@ WASM_EXAMPLES_DIR="$PROJECT_DIR/wasm-examples"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
+: "${RS_WASM_WEBGPU:=ON}"
+: "${RS_WASM_PTHREADS:=ON}"
+
 cmake .. \
     -DCMAKE_TOOLCHAIN_FILE="$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DRS_WASM_WEBGPU=ON \
-    -DRS_WASM_PTHREADS=ON \
+    -DRS_WASM_WEBGPU=${RS_WASM_WEBGPU} \
+    -DRS_WASM_PTHREADS=${RS_WASM_PTHREADS} \
     -G "Unix Makefiles"
 
 make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)

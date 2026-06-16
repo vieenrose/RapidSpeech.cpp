@@ -115,6 +115,12 @@ jobs:
         run: emcc --version
 
       - name: Build WASM
+        env:
+          # emscripten 4.0.7 ships in CI but its emdawnwebgpu port is not yet
+          # stable (`em++: invalid port name: emdawnwebgpu`). Disable the
+          # WebGPU backend in CI for now; local builds still pick it up by
+          # default via build-wasm.sh.
+          RS_WASM_WEBGPU: OFF
         run: bash rapidspeech/wasm/build-wasm.sh
 
       - name: Smoke-check artifacts

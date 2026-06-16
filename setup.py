@@ -95,6 +95,7 @@ class BuildExtension(build_ext):
             extra_cmake_args += f" -DCMAKE_INSTALL_PREFIX={install_dir} "
         extra_cmake_args += " -DRS_ENABLE_PYTHON=ON "
         extra_cmake_args += " -DRS_BUILD_CLI=OFF "
+        extra_cmake_args += " -DRS_BUILD_TESTS=OFF "
 
 
         if "PYTHON_EXECUTABLE" not in cmake_args:
@@ -214,6 +215,31 @@ class BuildExtension(build_ext):
         # headers) into build_lib/rapidspeech/ which is the correct location
         # for the Python package.  No manual copy needed.
 
+    def copy_extensions_to_source(self):
+        # The base class copies only the extension module itself (the
+        # `*.cpython-*.so`) into the source tree.  For editable installs
+        # the pybind extension also needs librapidspeech-core.so and the
+        # ggml shared libraries sitting next to it — its RUNPATH is
+        # $ORIGIN — otherwise `import rapidspeech` fails with
+        # "librapidspeech-core.so: cannot open shared object file".
+        super().copy_extensions_to_source()
+        import shutil
+        build_pkg_dir = Path(self.build_lib) / "rapidspeech"
+        src_pkg_dir = Path(__file__).parent.resolve() / "rapidspeech"
+        if not build_pkg_dir.is_dir() or not src_pkg_dir.is_dir():
+            return
+        for so in list(build_pkg_dir.glob("*.so")) + list(build_pkg_dir.glob("*.so.*")):
+            if "cpython-" in so.name or ".pyd" in so.name:
+                continue
+            dst = src_pkg_dir / so.name
+            if so.is_symlink():
+                target = os.readlink(so)
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                os.symlink(target, dst)
+            else:
+                shutil.copy2(so, dst)
+
 
 
 try:
@@ -265,7 +291,7 @@ setuptools.setup(
     url="https://github.com/RapidAI/RapidSpeech.cpp",
     long_description=read_long_description(),
     long_description_content_type="text/markdown",
-    ext_modules=[cmake_extension("rapidspeech")],
+    ext_modules=[cmake_extension("rapidspeech.rapidspeech")],
     cmdclass={"build_ext": BuildExtension, "bdist_wheel": bdist_wheel},
     zip_safe=False,
     classifiers=[
