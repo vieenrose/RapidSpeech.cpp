@@ -215,6 +215,19 @@ std::vector<int32_t> MatchaFrontend::ConvertWordToIds(const std::string& w) cons
 #ifdef HAVE_ESPEAK
   std::vector<std::string> phs; english_to_codepoints(w, phs);
   for (const auto& ph : phs) { auto it = token2id_.find(ph); if (it != token2id_.end()) ans.push_back(it->second); }
+#else
+  // Built WITHOUT espeak-ng: a non-CJK (English) word has no phoneme path and would be
+  // silently dropped -> the model receives near-empty input and emits garbage/invalid
+  // audio. Warn once so this is diagnosable instead of a mysterious silent failure.
+  if (!w.empty() && (std::isalpha((unsigned char)w[0]) != 0)) {
+    static bool warned = false;
+    if (!warned) {
+      RS_LOG_ERR("matcha frontend: English word '%s' dropped — this build has no espeak-ng "
+                 "(rebuild with -DRS_MATCHA_ESPEAK=ON -DESPEAK_NG_ROOT=<dir>); English text "
+                 "will be silent or garbled until then", w.c_str());
+      warned = true;
+    }
+  }
 #endif
   return ans;
 }

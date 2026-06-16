@@ -14,9 +14,25 @@ RS=/rs
 #  - neon_x4_shim.h: vld1q_{s8,u8}_x4 (gcc-9 intrinsics absent in gcc-8.3), force-included
 #                    into host C/C++ TUs only (must NOT enter .cu — nvcc can't parse arm_neon.h).
 COMPAT=$RS/scripts/nano_cuda_compat
+# espeak-ng (aarch64) for the Matcha English text frontend. Cross-built FIRST by
+# scripts/build_espeak_ng_nano.sh (its OUT default is exactly this path). WITHOUT it the
+# matcha frontend has no English G2P -> English words are dropped and the model emits
+# garbage/invalid audio (the deployed binaries shipped this way). Enable whenever the
+# cross-built lib is present; warn loudly otherwise so the gap is never silent.
+ESPEAK_ROOT=${ESPEAK_ROOT:-$RS/prebuilt/espeak-ng-nano}
+ESPEAK_ARGS=()
+if [ -f "$ESPEAK_ROOT/lib/libespeak-ng.so" ]; then
+  ESPEAK_ARGS=(-DRS_MATCHA_ESPEAK=ON -DESPEAK_NG_ROOT="$ESPEAK_ROOT")
+  echo "matcha English frontend: espeak-ng ENABLED ($ESPEAK_ROOT)"
+else
+  echo "WARNING: $ESPEAK_ROOT/lib/libespeak-ng.so not found — run"
+  echo "         scripts/build_espeak_ng_nano.sh first; building WITHOUT English"
+  echo "         (matcha will speak Chinese only; English text -> garbage)."
+fi
 cd $RS && rm -rf build-nano && mkdir build-nano && cd build-nano
 cmake .. \
   -DRS_CUDA=ON \
+  "${ESPEAK_ARGS[@]}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
   -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
@@ -34,7 +50,7 @@ cmake .. \
   -DCMAKE_C_FLAGS="-include $COMPAT/neon_x4_shim.h -I$CUDA/include -I$CT/include" \
   -DCMAKE_CXX_FLAGS="-include $COMPAT/neon_x4_shim.h -I$CUDA/include -I$CT/include" \
   -DCMAKE_PREFIX_PATH="$CT" \
-  -DCMAKE_FIND_ROOT_PATH="$SYSROOT;$CT" \
+  -DCMAKE_FIND_ROOT_PATH="$SYSROOT;$CT;$ESPEAK_ROOT" \
   -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
   -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
   -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
@@ -42,7 +58,7 @@ cmake .. \
   -DOpenMP_C_LIB_NAMES="gomp" -DOpenMP_CXX_LIB_NAMES="gomp" \
   -DOpenMP_gomp_LIBRARY="$SYSROOT/usr/lib64/libgomp.so" \
   -DCUDAToolkit_INCLUDE_DIRECTORIES=$CT/include \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -L$CT/lib/stubs -L$CT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -L$CT/lib -L$CT/lib/stubs -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt"
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib/stubs -L$CT/lib -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--rpath-link=$CT/lib/stubs -Wl,--rpath-link=$CT/lib -Wl,--rpath-link=$ESPEAK_ROOT/lib -L$CT/lib -L$CT/lib/stubs -L$ESPEAK_ROOT/lib -lcudart -lcublas -lcufft -lcublasLt -lcuda -lpthread -ldl -lrt"
 make -j6
 echo NANO-CUDA-BUILD-OK
