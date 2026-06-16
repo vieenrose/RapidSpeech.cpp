@@ -184,18 +184,38 @@ def main():
     orphan_mm = set(n for n in enc.init if n.startswith("onnx::MatMul"))
 
     # ---- encoder: emit named inits + traced Linear weights ----
+    # ggml ne == the shape passed to _store (the _store reverse and ggml's gguf
+    # loader reverse cancel). So we feed each weight in the exact ne ggml ops
+    # want: Linear [in,out] (ggml_mul_mat needs ne0=in), conv [kw,kh,ic,oc].
+    # _store yields ggml ne = (its input shape) with bytes = input.ravel('C').
+    # To land a desired ggml tensor (ne=G, values V) we pass input of shape G whose
+    # C-ravel equals V flattened in ggml order (ne0-fastest = V.ravel('F')).
+    def reshape_rev(arr):
+        # conv [oc,ic,kh,kw]->ggml[kw,kh,ic,oc] and embedding [vocab,dim]->ggml[dim,vocab]:
+        # ONNX C-order bytes already match ggml's ne0-fastest order, only relabel.
+        return np.reshape(arr, arr.shape[::-1])
+
+    def lin(arr):
+        # Linear weight ONNX (in,out) -> ggml ne=[in,out] with W[k,o]=onnx[k,o]
+        # (ggml_mul_mat(W,x) needs ne0=in). ONNX bytes are out-fastest; ggml wants
+        # in-fastest, so relabel via F-order ravel (a real reorder).
+        return arr.ravel(order="F").reshape(arr.shape)
+
+    conv_layout = reshape_rev
+
     for t in enc.g.initializer:
         name = t.name
         if name.startswith("onnx::"):
             continue  # anonymous; emitted via tracing below
         arr = enc.arr(name)
+        arr = conv_layout(arr) if arr.ndim >= 3 else arr
         _store(w, name, arr, a.f16); n_w += 1
         if name.endswith(".bias"):
             traced = enc.trace_linear_weight(name)
             if traced is not None:
-                src_name, wt = traced
+                src_name, wt = traced  # wt is ONNX (in, out)
                 wname = name[:-len(".bias")] + ".weight"
-                _store(w, wname, wt.T, a.f16); n_w += 1  # (in,out)->(out,in)
+                _store(w, wname, lin(wt), a.f16); n_w += 1
                 orphan_mm.discard(src_name)
 
     # ---- encoder: map remaining anonymous weights (bias-less linear_pos) ----
@@ -207,18 +227,20 @@ def main():
         if near is None:
             continue
         prefix = near[:-len(".in_proj.bias")]  # ...self_attn_weights
-        wt = enc.arr(src_name)  # (in,out)
-        _store(w, prefix + ".linear_pos.weight", wt.T, a.f16); n_w += 1
+        wt = enc.arr(src_name)  # ONNX (in,out)
+        _store(w, prefix + ".linear_pos.weight", lin(wt), a.f16); n_w += 1
         orphan_mm.discard(src_name)
 
     # ---- decoder: fully named ----
-    _store(w, "decoder.embedding.weight", dec.arr("decoder.embedding.weight"), a.f16); n_w += 1
-    _store(w, "decoder.conv.weight", dec.arr("decoder.conv.weight"), a.f16); n_w += 1
-    _store(w, "decoder_proj.weight", dec.gemm_weight("decoder_proj.weight"), a.f16); n_w += 1
+    # embedding ONNX [vocab,dim] -> ggml ne [dim,vocab] (ne0=dim for ggml_get_rows)
+    _store(w, "decoder.embedding.weight", reshape_rev(dec.arr("decoder.embedding.weight")), a.f16); n_w += 1
+    _store(w, "decoder.conv.weight", conv_layout(dec.arr("decoder.conv.weight")), a.f16); n_w += 1
+    # gemm_weight returns PyTorch [out,in]; .T -> ONNX (in,out), then lin()
+    _store(w, "decoder_proj.weight", lin(dec.gemm_weight("decoder_proj.weight").T), a.f16); n_w += 1
     _store(w, "decoder_proj.bias", dec.arr("decoder_proj.bias"), a.f16); n_w += 1
 
     # ---- joiner: fully named ----
-    _store(w, "joiner.output_linear.weight", joi.gemm_weight("output_linear.weight"), a.f16); n_w += 1
+    _store(w, "joiner.output_linear.weight", lin(joi.gemm_weight("output_linear.weight").T), a.f16); n_w += 1
     _store(w, "joiner.output_linear.bias", joi.arr("output_linear.bias"), a.f16); n_w += 1
 
     w.write_header_to_file()

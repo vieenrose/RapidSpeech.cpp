@@ -84,3 +84,12 @@ private:
 
   struct ggml_tensor *W(const std::string &name) const;
 };
+
+// --- dev/parity entrypoints (built by the xasr-dev-test target) ---
+// Run only encoder_embed on one chunk of features [T, feat_dim] (row-major,
+// freq fastest) with a zero left-pad cache, returning [T_out * out_dim] row
+// major. Used to numerically validate against scripts/xasr/dump_reference.py.
+RS_API bool xasr_debug_embed(const std::map<std::string, struct ggml_tensor *> &w,
+                             ggml_backend_t backend, const float *feats, int T,
+                             int feat_dim, std::vector<float> &out, int *T_out,
+                             int *dim_out);

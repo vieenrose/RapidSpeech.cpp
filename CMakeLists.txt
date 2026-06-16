@@ -450,6 +450,12 @@ if (RS_BUILD_CLI)
     add_executable(matcha-tts-server
             examples/matcha_server/matcha_tts_server.cpp
     )
+    if (RS_XASR_DEV_TEST)
+        add_executable(xasr-dev-test tools/xasr_dev_test.cpp)
+        target_link_libraries(xasr-dev-test PRIVATE rapidspeech-core ggml)
+        target_include_directories(xasr-dev-test PRIVATE
+            ${GGML_PATH}/include ${GGML_PATH}/src)
+    endif()
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
