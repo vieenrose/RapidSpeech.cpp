@@ -1,0 +1,23 @@
+# JetPack 4.6 (L4T r32.7 / CUDA 10.2 / sm_53) build image for RapidSpeech.cpp.
+#
+# The base dustynv/l4t-pytorch:r32.7.1 ships nvcc 10.2 but only static cudart and
+# a stub cuBLAS (the real shared libs normally mount from a Jetson via the nvidia
+# runtime). We install the real CUDA-10.2 runtime + cuBLAS from NVIDIA's L4T apt
+# repo, add gcc-8 (gcc-7.5 lacks <charconv>), and bake the cuda_bf16.h stub
+# (CUDA 10.2 has no bf16 header; bf16 is arch-gated out on sm_53).
+#
+# Build:  docker build -t xasr-cuda:r32.7.1 -f scripts/xasr/Dockerfile.jetpack46-cuda .
+# Use it with scripts/build_jetson_nano_gen1_native.sh (or the cmake invocation in
+# docs) and run with `--gpus all`. On a non-Nano dev box (e.g. GB10) force the
+# sm_53 dispatch with RS_FORCE_CC=530 for a correctness check.
+FROM dustynv/l4t-pytorch:r32.7.1
+RUN echo "deb https://repo.download.nvidia.com/jetson/common r32.7 main"  > /etc/apt/sources.list.d/nvl4t.list \
+ && echo "deb https://repo.download.nvidia.com/jetson/t210 r32.7 main"   >> /etc/apt/sources.list.d/nvl4t.list \
+ && apt-key adv --fetch-keys https://repo.download.nvidia.com/jetson/jetson-ota-public.asc \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      gcc-8 g++-8 cuda-cudart-dev-10-2 cuda-libraries-10-2 cuda-libraries-dev-10-2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && INC=/usr/local/cuda-10.2/targets/aarch64-linux/include \
+ && printf '#pragma once\n#include <cuda_fp16.h>\ntypedef __half nv_bfloat16; typedef __half __nv_bfloat16;\ntypedef __half2 nv_bfloat162; typedef __half2 __nv_bfloat162;\n' > "$INC/cuda_bf16.h" \
+ && cp "$INC/cuda_bf16.h" "$INC/cuda_bf16.hpp"
