@@ -688,6 +688,16 @@ if (RS_BUILD_TESTS)
                     rapidspeech/src/frontend/kokoro_g2p_en.cpp)
             endif()
 
+            # AudioProcessor methods are likewise hidden inside
+            # librapidspeech-core (CXX_VISIBILITY_PRESET hidden). Compile the
+            # TU directly into the test binary. fftsg.c's rdft is extern "C"
+            # and stays default-visible in the shared lib, so we don't need
+            # to recompile it here.
+            if (module STREQUAL "audio_frontend")
+                target_sources(${test_target} PRIVATE
+                    rapidspeech/src/frontend/audio_processor.cpp)
+            endif()
+
             add_test(NAME ${test_target} COMMAND ${test_target})
         endif()
     endforeach()
