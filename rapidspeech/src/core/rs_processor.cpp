@@ -15,8 +15,10 @@ RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model,
     config.n_mels = meta.n_mels;
     config.window_type = meta.window_type;
 
-    // SenseVoice specific frontend config
-    config.use_lfr = true;
+    // Frontend options driven by the model meta (defaults match SenseVoice).
+    config.use_lfr = meta.use_lfr;
+    config.use_cmvn = meta.use_cmvn;
+    config.snip_edges = meta.snip_edges;
     config.lfr_m = 7;
     config.lfr_n = 6;
   }

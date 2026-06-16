@@ -124,16 +124,24 @@ void AudioProcessor::ProcessFrame(int frame_idx,
                                   std::vector<float> &output_mel) {
 
   int n_samples = samples.size();
-  int offset = frame_idx * config_.frame_step;
+  // Frame start: snip_edges=true -> aligned; false -> centered (kaldi), with
+  // edge reflection for out-of-range indices.
+  int offset = config_.snip_edges
+                   ? frame_idx * config_.frame_step
+                   : frame_idx * config_.frame_step +
+                         config_.frame_step / 2 - config_.frame_size / 2;
 
-  // 1. Copy and Pad
-  // Use std::fill for zeroing, often faster/cleaner than loop assignment
+  // 1. Copy (with reflection at edges; no-op for snip_edges=true since frames
+  //    are fully inside the signal).
   std::fill(window_buf.begin(), window_buf.end(), 0.0);
-
-  int copy_len = std::min(config_.frame_size, n_samples - offset);
-  if (copy_len > 0) {
-    for (int j = 0; j < copy_len; j++) {
-      window_buf[j] = static_cast<double>(samples[offset + j]);
+  for (int j = 0; j < config_.frame_size; j++) {
+    int idx = offset + j;
+    if (n_samples > 0) {
+      while (idx < 0 || idx >= n_samples) {
+        if (idx < 0) idx = -idx - 1;
+        if (idx >= n_samples) idx = 2 * n_samples - idx - 1;
+      }
+      window_buf[j] = static_cast<double>(samples[idx]);
     }
   }
 
@@ -199,7 +207,10 @@ void AudioProcessor::ComputeFbank(const std::vector<float> &samples,
   if (n_samples < config_.frame_size)
     return;
 
-  int n_frames = (n_samples - config_.frame_size) / config_.frame_step + 1;
+  int n_frames =
+      config_.snip_edges
+          ? (n_samples - config_.frame_size) / config_.frame_step + 1
+          : (n_samples + config_.frame_step / 2) / config_.frame_step;
   output_mel.resize(n_frames * config_.n_mels);
 
   // ==========================================

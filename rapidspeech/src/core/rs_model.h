@@ -31,6 +31,13 @@ struct RSModelMeta {
   // MiMoASR) should set this to WindowType::POVEY so the periodic Hamming
   // doesn't bias the fbank away from the training distribution.
   WindowType window_type = WindowType::HAMMING;
+
+  // Frontend options (defaults preserve SenseVoice/FunASR behavior). Kaldi-style
+  // streaming ASR (zipformer) wants raw fbank: use_lfr=false, use_cmvn=false,
+  // snip_edges=false.
+  bool use_lfr = true;
+  bool use_cmvn = true;
+  bool snip_edges = true;
 };
 
 // --- Core Model Interface ---

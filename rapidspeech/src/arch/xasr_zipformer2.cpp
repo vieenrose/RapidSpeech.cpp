@@ -24,7 +24,19 @@ static std::vector<int> gguf_i32_array(gguf_context *g, const char *key) {
 }
 
 // ---------------------------------------------------------------- model
-XAsrZipformer2Model::XAsrZipformer2Model() {}
+XAsrZipformer2Model::XAsrZipformer2Model() {
+  // Frontend meta must be set in the ctor: RSProcessor reads GetMeta() at
+  // construction, which happens before Load(). zipformer wants raw 80-dim kaldi
+  // fbank (povey window, no LFR / no CMVN, snip_edges=false).
+  meta_.arch_name = "XAsrZipformer2";
+  meta_.audio_sample_rate = 16000;
+  meta_.n_mels = 80;
+  meta_.window_type = WindowType::POVEY;
+  meta_.use_external_frontend = false;
+  meta_.use_lfr = false;
+  meta_.use_cmvn = false;
+  meta_.snip_edges = false;
+}
 XAsrZipformer2Model::~XAsrZipformer2Model() {}
 
 struct ggml_tensor *XAsrZipformer2Model::W(const std::string &name) const {
@@ -102,6 +114,10 @@ bool XAsrZipformer2Model::Load(const std::unique_ptr<rs_context_t> &ctx,
   meta_.vocab_size = hp_.vocab_size;
   meta_.use_external_frontend = false;
   meta_.window_type = WindowType::POVEY;
+  // zipformer wants raw 80-dim kaldi fbank (no LFR / no CMVN), snip_edges=false.
+  meta_.use_lfr = false;
+  meta_.use_cmvn = false;
+  meta_.snip_edges = false;
 
   RS_LOG_INFO("XAsr loaded: %d stacks, %d layers, out_dim=%d, vocab=%d, "
               "%d tensors, %zu tokens",

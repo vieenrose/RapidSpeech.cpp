@@ -22,6 +22,10 @@ struct STFTConfig {
   // SenseVoice / FunASR-Nano; Kaldi-style frontends should set POVEY.
   WindowType window_type = WindowType::HAMMING;
 
+  // Kaldi snip_edges. true (default) = frames fully inside the signal. false =
+  // centered frames with edge reflection and round(n/shift) frame count (icefall).
+  bool snip_edges = true;
+
   // --- SenseVoice Specific (LFR & CMVN) ---
   bool use_lfr = true;
   int lfr_m = 7; // Stack 7 frames
