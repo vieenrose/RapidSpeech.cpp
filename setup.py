@@ -228,7 +228,10 @@ class BuildExtension(build_ext):
         src_pkg_dir = Path(__file__).parent.resolve() / "rapidspeech"
         if not build_pkg_dir.is_dir() or not src_pkg_dir.is_dir():
             return
-        for so in list(build_pkg_dir.glob("*.so")) + list(build_pkg_dir.glob("*.so.*")):
+        for so in (list(build_pkg_dir.glob("*.so")) +
+                   list(build_pkg_dir.glob("*.so.*")) +
+                   list(build_pkg_dir.glob("*.dylib")) +
+                   list(build_pkg_dir.glob("*.dll"))):
             if "cpython-" in so.name or ".pyd" in so.name:
                 continue
             dst = src_pkg_dir / so.name

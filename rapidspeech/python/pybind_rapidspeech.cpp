@@ -331,10 +331,14 @@ public:
             throw std::runtime_error("PCM must be a 1-D float32 array");
         }
         std::vector<rs_vad_segment_t> seg(max_segments);
-        int n = rs_vad_detect_full(vad_,
+        int n;
+        {
+            py::gil_scoped_release nogil;
+            n = rs_vad_detect_full(vad_,
                                    static_cast<float *>(buf.ptr),
                                    static_cast<int>(buf.shape[0]),
                                    seg.data(), max_segments);
+        }
         py::list out;
         for (int i = 0; i < std::min(n, max_segments); ++i) {
             py::dict d;
@@ -492,7 +496,6 @@ PYBIND11_MODULE(rapidspeech, m) {
         .def("detect_full", &RSVad::detect_full,
              py::arg("pcm"),
              py::arg("max_segments") = 1024,
-             py::call_guard<py::gil_scoped_release>(),
              "One-shot offline detection: reset, push the whole clip, "
              "flush any open segment, return segments list.");
 
