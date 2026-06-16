@@ -187,6 +187,27 @@ struct Consts {
   }
 };
 
+// Streaming cache manager: each get() makes a graph input (filled from state),
+// each put() records the updated cache (read back into state). Order is
+// deterministic across chunks so a flat per-chunk state vector lines up.
+struct Caches {
+  ggml_context *ctx;
+  std::vector<ggml_tensor *> in, out;
+  ggml_tensor *get(int64_t a, int64_t b, int64_t c = 1) {
+    ggml_tensor *t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, c);
+    ggml_set_input(t);
+    ggml_set_name(t, ("ci" + std::to_string(in.size())).c_str());
+    in.push_back(t);
+    return t;
+  }
+  void put(ggml_tensor *t) {
+    t = ggml_cont(ctx, t);
+    ggml_set_output(t);
+    ggml_set_name(t, ("co" + std::to_string(out.size())).c_str());
+    out.push_back(t);
+  }
+};
+
 // Swoosh activations: softplus(x - shift) - 0.08*x - offset, with the
 // numerically stable softplus(z) = relu(z) + log1p(exp(-|z|)) (the naive
 // log(1+exp(z)) overflows to inf for large conv pre-activations).
@@ -227,6 +248,7 @@ ggml_tensor *conv2d_b(ggml_context *c, ggml_tensor *w, ggml_tensor *b,
 ggml_tensor *build_embed(ggml_context *c, Consts &K,
                          const std::map<std::string, ggml_tensor *> &w,
                          ggml_tensor *feats4, ggml_tensor *cache,
+                         Caches *cc = nullptr,
                          std::vector<ggml_tensor *> *dbg = nullptr) {
   auto W = [&](const char *n) { return w.at(n); };
   auto stage = [&](ggml_tensor *t, const char *nm) {
@@ -250,6 +272,9 @@ ggml_tensor *build_embed(ggml_context *c, Consts &K,
       ggml_view_4d(c, x, x->ne[0], T1 - 3, x->ne[2], 1, x->nb[1], x->nb[2],
                    x->nb[3], 0);
   ggml_tensor *xc = ggml_concat(c, cache, x, 1); // [outW, T1+3, 128, 1]
+  if (cc) // new embed cache = xc time [T1-3 : T1]
+    cc->put(ggml_view_4d(c, xc, xc->ne[0], 3, xc->ne[2], 1, xc->nb[1], xc->nb[2],
+                         xc->nb[3], (size_t)(T1 - 3) * xc->nb[1]));
   ggml_tensor *d = ggml_conv_2d_dw(c, W("encoder_embed.convnext.depthwise_conv.weight"),
                                    xc, 1, 1, 3, 0, 1, 1);
   d = ggml_add(c, d, ggml_reshape_4d(c, W("encoder_embed.convnext.depthwise_conv.bias"),
@@ -318,18 +343,20 @@ ggml_tensor *rel_to_abs(ggml_context *c, ggml_tensor *ps, int T, int kt) {
 }
 
 // attention weights [kt,T,nh], softmax over ne0 (kt = lc + T).
-ggml_tensor *attn_weights(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *attn_weights(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                           const std::string &p, ggml_tensor *src,
-                          ggml_tensor *pos_emb, int nh, int qhd, int phd, int lc) {
+                          ggml_tensor *pos_emb, int nh, int qhd, int phd, int lc,
+                          int processed_lens) {
   int T = src->ne[1];
   ggml_tensor *x = linp(c, w.at(p + ".in_proj.weight"), w.at(p + ".in_proj.bias"), src);
   int qd = qhd * nh;
   ggml_tensor *q = ggml_view_2d(c, x, qd, T, x->nb[1], 0);
   ggml_tensor *k = ggml_view_2d(c, x, qd, T, x->nb[1], (size_t)qd * x->nb[0]);
   ggml_tensor *pp = ggml_view_2d(c, x, phd * nh, T, x->nb[1], (size_t)2 * qd * x->nb[0]);
-  ggml_tensor *ck = K.zeros(qd, lc);
+  ggml_tensor *ck = cc.get(qd, lc);
   ggml_tensor *kf = ggml_concat(c, ck, ggml_cont(c, k), 1); // [qd, kt]
   int kt = lc + T;
+  cc.put(ggml_view_2d(c, kf, qd, lc, kf->nb[1], (size_t)T * kf->nb[1])); // new cached_key
   ggml_tensor *qh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, ggml_cont(c, q), qhd, nh, T), 0, 2, 1, 3));
   ggml_tensor *kh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, kf, qhd, nh, kt), 0, 2, 1, 3));
   ggml_tensor *scores = ggml_mul_mat(c, kh, qh); // [kt, T, nh]
@@ -346,8 +373,9 @@ ggml_tensor *attn_weights(ggml_context *c, Consts &K, const TMap &w,
   ggml_tensor *sc = ggml_add(c, scores, pabs);
   DBG(p, "sc", sc);
   // key-padding mask: left-context columns [0, lc - processed_lens) are zero-filled
-  // history and must be masked. processed_lens=0 on the first chunk -> mask all lc.
-  int nmask = lc; // TODO: lc - processed_lens once streaming caches are threaded
+  // history and must be masked. processed_lens grows across chunks (capped at lc).
+  int nmask = lc - processed_lens;
+  if (nmask < 0) nmask = 0;
   if (nmask > 0) {
     std::vector<float> m((size_t)kt, 0.0f);
     for (int j = 0; j < nmask && j < kt; ++j) m[j] = -1e4f;
@@ -357,14 +385,16 @@ ggml_tensor *attn_weights(ggml_context *c, Consts &K, const TMap &w,
 }
 
 // self attention: attn[kt,T,nh], returns [C,T].
-ggml_tensor *self_attn(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *self_attn(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                        const std::string &p, ggml_tensor *src,
                        ggml_tensor *attn, int nh, int vhd, int lc) {
+  (void)K;
   int T = src->ne[1];
   ggml_tensor *v = linp(c, w.at(p + ".in_proj.weight"), w.at(p + ".in_proj.bias"), src); // [vhd*nh, T]
-  ggml_tensor *cv = K.zeros(vhd * nh, lc);
+  ggml_tensor *cv = cc.get(vhd * nh, lc);
   ggml_tensor *vf = ggml_concat(c, cv, v, 1); // [vhd*nh, kt]
   int kt = lc + T;
+  cc.put(ggml_view_2d(c, vf, vhd * nh, lc, vf->nb[1], (size_t)T * vf->nb[1])); // new cached_val
   // [vhd*nh,kt] -> [vhd,nh,kt] -> [kt,vhd,nh]
   ggml_tensor *vh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, vf, vhd, nh, kt), 1, 2, 0, 3));
   // out[d,t1,h] = sum_kt vh[kt,d,h]*attn[kt,t1,h] = mul_mat(vh[kt,vhd,nh], attn[kt,T,nh])
@@ -375,9 +405,10 @@ ggml_tensor *self_attn(ggml_context *c, Consts &K, const TMap &w,
 }
 
 // nonlin attention: attn0 = head0 [kt,T,1]; returns [C,T].
-ggml_tensor *nonlin_attn(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *nonlin_attn(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                          const std::string &p, ggml_tensor *src,
                          ggml_tensor *attn0, int nh, int lc) {
+  (void)K;
   int T = src->ne[1];
   ggml_tensor *x = linp(c, w.at(p + ".in_proj.weight"), w.at(p + ".in_proj.bias"), src); // [3*hidden, T]
   int hidden = x->ne[0] / 3;
@@ -386,10 +417,10 @@ ggml_tensor *nonlin_attn(ggml_context *c, Consts &K, const TMap &w,
   ggml_tensor *y = ggml_cont(c, ggml_view_2d(c, x, hidden, T, x->nb[1], (size_t)2 * hidden * x->nb[0]));
   ggml_tensor *xs = ggml_mul(c, xx, ggml_tanh(c, s)); // [hidden,T]
   int hd = hidden / nh;
-  // [hidden,T]->[hd,nh,T]->[kt,hd,nh] with cache
-  ggml_tensor *cx = K.zeros(hidden, lc);
+  ggml_tensor *cx = cc.get(hidden, lc);
   ggml_tensor *xf = ggml_concat(c, cx, xs, 1); // [hidden, kt]
   int kt = lc + T;
+  cc.put(ggml_view_2d(c, xf, hidden, lc, xf->nb[1], (size_t)T * xf->nb[1])); // new cached_nonlin
   ggml_tensor *vh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, xf, hd, nh, kt), 1, 2, 0, 3)); // [kt,hd,nh]
   // attn0[kt,T,1] (batch 1) must lead so its batch broadcasts over vh's nh.
   ggml_tensor *out = ggml_mul_mat(c, attn0, vh); // -> [T, hd, nh]
@@ -400,7 +431,7 @@ ggml_tensor *nonlin_attn(ggml_context *c, Consts &K, const TMap &w,
 }
 
 // convolution module, returns [C,T].
-ggml_tensor *conv_module(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *conv_module(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                          const std::string &p, ggml_tensor *src, int kernel, int lc) {
   (void)lc;
   int C = src->ne[0], T = src->ne[1];
@@ -422,8 +453,9 @@ ggml_tensor *conv_module(ggml_context *c, Consts &K, const TMap &w,
     r = ggml_reshape_2d(c, r, im->ne[1], C); // [OL, C]
     return ggml_cont(c, ggml_transpose(c, r)); // [C, OL]
   };
-  ggml_tensor *cache = K.zeros(C, lp);
+  ggml_tensor *cache = cc.get(C, lp);
   ggml_tensor *xcat = ggml_concat(c, cache, xs, 1); // [C, lp+T]
+  cc.put(ggml_view_2d(c, xcat, C, lp, xcat->nb[1], (size_t)T * xcat->nb[1])); // new cached_conv
   ggml_tensor *causal = dwconv(w.at(dp + ".causal_conv.weight"), xcat, 0); // [C,T]
   causal = ggml_add(c, causal, ggml_reshape_2d(c, w.at(dp + ".causal_conv.bias"), C, 1));
   ggml_tensor *chunk = dwconv(w.at(dp + ".chunkwise_conv.weight"), xs, kernel / 2); // [C,T]
@@ -435,26 +467,26 @@ ggml_tensor *conv_module(ggml_context *c, Consts &K, const TMap &w,
 }
 
 // one zipformer2 layer; src [C,T] -> [C,T].
-ggml_tensor *zip_layer(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *zip_layer(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                        const std::string &p, ggml_tensor *src, ggml_tensor *pos_emb,
-                       int nh, int qhd, int phd, int vhd, int kernel, int lc) {
+                       int nh, int qhd, int phd, int vhd, int kernel, int lc, int pl) {
   ggml_tensor *orig = src;
   DBG(p, "src_in", src);
-  ggml_tensor *aw = attn_weights(c, K, w, p + ".self_attn_weights", src, pos_emb, nh, qhd, phd, lc);
+  ggml_tensor *aw = attn_weights(c, K, cc, w, p + ".self_attn_weights", src, pos_emb, nh, qhd, phd, lc, pl);
   DBG(p, "aw", aw);
   ggml_tensor *attn0 = ggml_view_3d(c, aw, aw->ne[0], aw->ne[1], 1, aw->nb[1], aw->nb[2], 0);
   ggml_tensor *f1 = ffn(c, K, w, p + ".feed_forward1", src);
   DBG(p, "ffn1", f1); src = ggml_add(c, src, f1);
-  ggml_tensor *na = nonlin_attn(c, K, w, p + ".nonlin_attention", src, attn0, nh, lc);
+  ggml_tensor *na = nonlin_attn(c, K, cc, w, p + ".nonlin_attention", src, attn0, nh, lc);
   DBG(p, "na", na); src = ggml_add(c, src, na);
-  ggml_tensor *sa1 = self_attn(c, K, w, p + ".self_attn1", src, aw, nh, vhd, lc);
+  ggml_tensor *sa1 = self_attn(c, K, cc, w, p + ".self_attn1", src, aw, nh, vhd, lc);
   DBG(p, "sa1", sa1); src = ggml_add(c, src, sa1);
-  ggml_tensor *cv1 = conv_module(c, K, w, p + ".conv_module1", src, kernel, lc);
+  ggml_tensor *cv1 = conv_module(c, K, cc, w, p + ".conv_module1", src, kernel, lc);
   DBG(p, "cv1", cv1); src = ggml_add(c, src, cv1);
   src = ggml_add(c, src, ffn(c, K, w, p + ".feed_forward2", src));
   src = bypass(c, w.at(p + ".bypass_mid.bypass_scale"), orig, src);
-  src = ggml_add(c, src, self_attn(c, K, w, p + ".self_attn2", src, aw, nh, vhd, lc));
-  src = ggml_add(c, src, conv_module(c, K, w, p + ".conv_module2", src, kernel, lc));
+  src = ggml_add(c, src, self_attn(c, K, cc, w, p + ".self_attn2", src, aw, nh, vhd, lc));
+  src = ggml_add(c, src, conv_module(c, K, cc, w, p + ".conv_module2", src, kernel, lc));
   src = ggml_add(c, src, ffn(c, K, w, p + ".feed_forward3", src));
   src = bias_norm(c, src, w.at(p + ".norm.bias"), w.at(p + ".norm.log_scale"));
   src = bypass(c, w.at(p + ".bypass.bypass_scale"), orig, src);
@@ -518,10 +550,11 @@ std::vector<float> compute_pos_emb(int seq, int lc, int pos_dim) {
 }
 
 // One stack (Zipformer2Encoder or DownsampledZipformer2Encoder).
-ggml_tensor *zip_stack(ggml_context *c, Consts &K, const TMap &w, int stack,
+ggml_tensor *zip_stack(ggml_context *c, Consts &K, Caches &cc, const TMap &w, int stack,
                        int n_layers, ggml_tensor *x, int ds, int nh, int kernel,
-                       int pos_dim) {
+                       int pos_dim, int processed_lens) {
   int lc = 256 / ds;
+  int pl = processed_lens / ds; // processed frames at this stack's rate
   ggml_tensor *orig = x;
   int Torig = x->ne[1];
   if (ds > 1)
@@ -534,7 +567,7 @@ ggml_tensor *zip_stack(ggml_context *c, Consts &K, const TMap &w, int stack,
   const char *nl = getenv("XASR_NLAYERS");
   int maxL = nl ? atoi(nl) : n_layers;
   for (int L = 0; L < n_layers && L < maxL; ++L)
-    x = zip_layer(c, K, w, base + std::to_string(L), x, pe, nh, 32, 4, 12, kernel, lc);
+    x = zip_layer(c, K, cc, w, base + std::to_string(L), x, pe, nh, 32, 4, 12, kernel, lc, pl);
   if (ds > 1) {
     x = simple_upsample(c, x, ds);
     x = ggml_cont(c, ggml_view_2d(c, x, x->ne[0], Torig, x->nb[1], 0)); // trim
@@ -544,19 +577,20 @@ ggml_tensor *zip_stack(ggml_context *c, Consts &K, const TMap &w, int stack,
 }
 
 // Full encoder: embed_out [192,T] -> encoder_out [out_dim, T/2].
-ggml_tensor *build_encoder(ggml_context *c, Consts &K, const TMap &w,
+ggml_tensor *build_encoder(ggml_context *c, Consts &K, Caches &cc, const TMap &w,
                            ggml_tensor *embed_out, const std::vector<int> &dims,
                            const std::vector<int> &nlayers,
                            const std::vector<int> &nheads,
                            const std::vector<int> &kernels,
-                           const std::vector<int> &dsf, int pos_dim) {
+                           const std::vector<int> &dsf, int pos_dim,
+                           int processed_lens) {
   ggml_tensor *x = embed_out;
   const char *ns = getenv("XASR_NSTACKS");
   size_t nstacks = ns ? (size_t)atoi(ns) : dims.size();
   std::vector<ggml_tensor *> outs(dims.size());
   for (size_t i = 0; i < dims.size(); ++i) {
     x = convert_channels(c, K, x, dims[i]);
-    x = zip_stack(c, K, w, (int)i, nlayers[i], x, dsf[i], nheads[i], kernels[i], pos_dim);
+    x = zip_stack(c, K, cc, w, (int)i, nlayers[i], x, dsf[i], nheads[i], kernels[i], pos_dim, processed_lens);
     outs[i] = x;
     if (ns && i + 1 >= nstacks) return x; // debug early-out (only when env set)
   }
@@ -597,7 +631,7 @@ RS_API bool xasr_debug_embed(const std::map<std::string, ggml_tensor *> &w,
 
   std::vector<ggml_tensor *> dbg;
   bool do_dbg = getenv("XASR_EMBED_DBG") != nullptr;
-  ggml_tensor *y = build_embed(c, K, w, feats4, cache, do_dbg ? &dbg : nullptr);
+  ggml_tensor *y = build_embed(c, K, w, feats4, cache, nullptr, do_dbg ? &dbg : nullptr);
   ggml_set_output(y);
 
   ggml_cgraph *gf = ggml_new_graph(c);
@@ -657,8 +691,9 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
   std::vector<std::pair<std::string, ggml_tensor *>> dbg;
   const char *dpfx = getenv("XASR_DUMP");
   if (dpfx) { g_dbg = &dbg; g_dump_prefix = dpfx; }
-  ggml_tensor *emb = build_embed(c, K, w, feats4, cache); // [192, T_emb]
-  ggml_tensor *y = build_encoder(c, K, w, emb, dims, nlayers, nheads, kernels, dsf, 48);
+  Caches cc{c};
+  ggml_tensor *emb = build_embed(c, K, w, feats4, cache, &cc); // [192, T_emb]
+  ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, 0);
   ggml_set_output(y);
   ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
   ggml_build_forward_expand(gf, y);
@@ -667,6 +702,10 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
   ggml_backend_tensor_set(feats4, feats, 0, (size_t)feat_dim * T * sizeof(float));
   std::vector<float> z((size_t)outW * 3 * 128, 0.0f);
   ggml_backend_tensor_set(cache, z.data(), 0, z.size() * sizeof(float));
+  for (ggml_tensor *ci : cc.in) { // chunk-0 caches are all zero
+    std::vector<float> zc(ggml_nelements(ci), 0.0f);
+    ggml_backend_tensor_set(ci, zc.data(), 0, ggml_nbytes(ci));
+  }
   K.upload();
   if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
     ggml_gallocr_free(alloc); ggml_free(c); return false;
@@ -685,6 +724,64 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, ggml_tensor *> &w,
   out.resize(ggml_nelements(y));
   ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
   ggml_gallocr_free(alloc); ggml_free(c);
+  return true;
+}
+
+// Streaming encoder over a full feature stream (threads caches + processed_lens).
+// feats: [n_frames, feat_dim] row-major. out: encoder_out [out_dim, n_out_frames]
+// row-major (frame-major). Mirrors what XAsrZipformer2Model::Encode will do.
+RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *> &w,
+                                      ggml_backend_t backend, const float *feats,
+                                      int n_frames, int feat_dim, std::vector<float> &out,
+                                      int *out_dim, int *n_out) {
+  std::vector<int> dims{192, 256, 512, 768, 512, 256}, nlayers{2, 2, 4, 5, 4, 2},
+      nheads{4, 4, 4, 8, 4, 4}, kernels{31, 31, 15, 15, 15, 31}, dsf{1, 2, 4, 8, 4, 2};
+  const int T = 109, shift = 96, outW = (((feat_dim - 1) / 2) - 1) / 2;
+  std::vector<std::vector<float>> state; // per-cache host buffers (incl. embed cache)
+  int processed_lens = 0, total = 0;
+  out.clear();
+  *out_dim = 512;
+
+  for (int start = 0; start + T <= n_frames; start += shift) {
+    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
+    ggml_init_params ip{mem, nullptr, true};
+    ggml_context *c = ggml_init(ip);
+    Consts K{c};
+    Caches cc{c};
+    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, feat_dim, T, 1, 1);
+    ggml_set_input(feats4);
+    ggml_tensor *ecache = cc.get(outW, 3, 128); // embed cache = cc.in[0]
+    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels, dsf, 48, processed_lens);
+    ggml_set_output(y);
+    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
+    ggml_build_forward_expand(gf, y);
+    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o); // new caches
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
+    ggml_backend_tensor_set(feats4, feats + (size_t)start * feat_dim, 0, (size_t)feat_dim * T * sizeof(float));
+    if (state.empty()) { // first chunk: all caches zero
+      state.resize(cc.in.size());
+      for (size_t i = 0; i < cc.in.size(); ++i) state[i].assign(ggml_nelements(cc.in[i]), 0.0f);
+    }
+    for (size_t i = 0; i < cc.in.size(); ++i)
+      ggml_backend_tensor_set(cc.in[i], state[i].data(), 0, ggml_nbytes(cc.in[i]));
+    K.upload();
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_gallocr_free(alloc); ggml_free(c); return false; }
+    // append encoder_out frames (y is [out_dim, Tc])
+    int Tc = y->ne[1];
+    size_t off = out.size();
+    out.resize(off + (size_t)y->ne[0] * Tc);
+    ggml_backend_tensor_get(y, out.data() + off, 0, ggml_nbytes(y));
+    total += Tc;
+    // read updated caches into state
+    for (size_t i = 0; i < cc.out.size(); ++i)
+      ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
+    processed_lens += 48;
+    ggml_gallocr_free(alloc);
+    ggml_free(c);
+  }
+  *n_out = total;
   return true;
 }
 

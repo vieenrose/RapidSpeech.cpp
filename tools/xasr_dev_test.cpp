@@ -23,6 +23,9 @@ bool xasr_debug_encoder(const std::map<std::string, struct ggml_tensor *> &w,
                         ggml_backend_t backend, const float *feats, int T,
                         int feat_dim, std::vector<float> &out, int *T_out,
                         int *dim_out);
+bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_tensor *> &w,
+                               ggml_backend_t backend, const float *feats, int n_frames,
+                               int feat_dim, std::vector<float> &out, int *out_dim, int *n_out);
 
 static std::vector<float> read_bin(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -36,8 +39,8 @@ static std::vector<float> read_bin(const char *path) {
 
 int main(int argc, char **argv) {
   std::string stage = argc > 1 ? argv[1] : "";
-  if (argc < 7 || (stage != "embed" && stage != "encoder")) {
-    fprintf(stderr, "usage: %s <embed|encoder> <model.gguf> <feats.bin> <T> <feat_dim> <out.bin>\n", argv[0]);
+  if (argc < 7 || (stage != "embed" && stage != "encoder" && stage != "stream")) {
+    fprintf(stderr, "usage: %s <embed|encoder|stream> <model.gguf> <feats.bin> <T|n_frames> <feat_dim> <out.bin>\n", argv[0]);
     return 1;
   }
   const char *model = argv[2], *featf = argv[3], *outf = argv[6];
@@ -88,9 +91,13 @@ int main(int argc, char **argv) {
   }
 
   std::vector<float> out; int T_out = 0, dim_out = 0;
-  bool ok = (stage == "encoder")
-                ? xasr_debug_encoder(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out)
-                : xasr_debug_embed(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out);
+  bool ok;
+  if (stage == "stream")
+    ok = xasr_debug_encoder_stream(w, backend, feats.data(), T, feat_dim, out, &dim_out, &T_out);
+  else if (stage == "encoder")
+    ok = xasr_debug_encoder(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out);
+  else
+    ok = xasr_debug_embed(w, backend, feats.data(), T, feat_dim, out, &T_out, &dim_out);
   if (!ok) { fprintf(stderr, "%s failed\n", stage.c_str()); return 1; }
   fprintf(stderr, "%s out: T_out=%d dim=%d\n", stage.c_str(), T_out, dim_out);
   FILE *o = fopen(outf, "wb");

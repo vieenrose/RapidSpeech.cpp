@@ -98,3 +98,8 @@ RS_API bool xasr_debug_encoder(const std::map<std::string, struct ggml_tensor *>
                                ggml_backend_t backend, const float *feats, int T,
                                int feat_dim, std::vector<float> &out, int *T_out,
                                int *dim_out);
+// Streaming over a full feature stream [n_frames, feat_dim] -> all encoder_out.
+RS_API bool xasr_debug_encoder_stream(const std::map<std::string, struct ggml_tensor *> &w,
+                                      ggml_backend_t backend, const float *feats,
+                                      int n_frames, int feat_dim, std::vector<float> &out,
+                                      int *out_dim, int *n_out);
