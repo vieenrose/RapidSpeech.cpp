@@ -719,6 +719,11 @@ struct EncRunner {
   // global processed_lens before this chunk. Returns encoder_out frame-major into
   // eo ([od*Tc]) and sets Tc/od. Recurrent caches advance via chost.
   void run(const float *feats_chunk, int pl_global, std::vector<float> &eo, int &Tc, int &od) {
+    const bool prof = getenv("XASR_PROFILE") != nullptr;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b){
+      return std::chrono::duration<double, std::milli>(b - a).count(); };
+    clk::time_point t0 = clk::now();
     ggml_backend_tensor_set(feats4, feats_chunk, 0, (size_t)FD * T * sizeof(float));
     if (chost.empty()) { // first chunk: all caches zero
       chost.resize(cc->in.size());
@@ -726,14 +731,21 @@ struct EncRunner {
     }
     for (size_t i = 0; i < cc->in.size(); ++i)
       ggml_backend_tensor_set(cc->in[i], chost[i].data(), 0, ggml_nbytes(cc->in[i]));
+    clk::time_point t1 = clk::now();
     K->upload();
     K->upload_masks(pl_global); // mask data varies per chunk; topology fixed
+    clk::time_point t2 = clk::now();
     ggml_backend_graph_compute(backend, gf);
+    clk::time_point t3 = clk::now();
     Tc = (int)y->ne[1]; od = (int)y->ne[0];
     eo.resize((size_t)od * Tc);
     ggml_backend_tensor_get(y, eo.data(), 0, ggml_nbytes(y));
     for (size_t i = 0; i < cc->out.size(); ++i) // read updated caches back
       ggml_backend_tensor_get(cc->out[i], chost[i].data(), 0, ggml_nbytes(cc->out[i]));
+    clk::time_point t4 = clk::now();
+    if (prof)
+      fprintf(stderr, "[prof] cache_up(%zu)=%.1f const+mask=%.1f compute=%.1f y+cache_dn(%zu)=%.1f ms\n",
+              cc->in.size(), ms(t0,t1), ms(t1,t2), ms(t2,t3), cc->out.size(), ms(t3,t4));
   }
   ~EncRunner() {
     if (alloc) ggml_gallocr_free(alloc);
