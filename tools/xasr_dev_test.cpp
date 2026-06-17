@@ -54,7 +54,15 @@ int main(int argc, char **argv) {
       }
     }
   }
-  if (!backend) { backend = ggml_backend_cpu_init(); fprintf(stderr, "backend: CPU\n"); }
+  if (!backend) {
+    backend = ggml_backend_cpu_init();
+    // XASR_NTHREADS overrides the ggml CPU thread count (default GGML_DEFAULT_N_THREADS=4).
+    const char *nt = getenv("XASR_NTHREADS");
+    int n_threads = nt ? atoi(nt) : 4;
+    if (n_threads < 1) n_threads = 1;
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    fprintf(stderr, "backend: CPU (%d threads)\n", n_threads);
+  }
   ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(data_ctx, backend);
   (void)buf;
 

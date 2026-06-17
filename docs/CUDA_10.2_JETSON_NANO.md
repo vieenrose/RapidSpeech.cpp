@@ -122,6 +122,36 @@ transcript; all run faster than real time (960 ms audio/chunk).
   444.7, slightly worse — 3-bit weights already minimise traffic). ~400 ms/chunk
   is the Nano bandwidth floor for this encoder.
 
+### vs sherpa-onnx, and CPU-thread / CUDA-core scaling
+
+A four-engine sweep (sherpa-onnx CPU, sherpa-onnx CUDA, RapidSpeech CPU,
+RapidSpeech CUDA) over every non-broken quantization, plus a CPU-thread (1→4) and
+CUDA-core (1→4) sweep. Encoder ms/chunk, 4 threads/cores unless noted:
+
+| Engine / weights | CPU (4 thr) | CUDA (best) | Correct? |
+|------------------|------------:|------------:|:--------:|
+| sherpa-onnx fp32 | 396.9 | — *not runnable* | ✓ |
+| sherpa-onnx int8 | **329.8** | — *not runnable* | ✓ |
+| RapidSpeech f16 | 639.1 | **386.5** (`RS_GEMM_FP16`) | ✓ |
+| RapidSpeech q8_0 | 459.2 | **355.3** (FP32) | ✓ |
+| RapidSpeech q3_k-im | 498.5 | 445.4 | ✓ |
+| RapidSpeech iq4_xs | 452.2 | 451.8 | ✓ |
+
+- **sherpa-onnx CUDA cannot run on this Nano:** the onnxruntime build is CPU-only
+  (no aarch64 onnxruntime-gpu wheel for this JetPack; the cuDNN/cuBLAS context OOMs
+  4 GB anyway). RapidSpeech.cpp's ggml-CUDA backend is the only way to put this
+  model on the Nano GPU — the motivation for this whole branch.
+- **sherpa-onnx CPU is the fastest engine** (MLAS tuned-ARM GEMM + op fusion +
+  int8) and **saturates at 3 threads**; RapidSpeech CPU scales ~linearly to 4
+  threads (~3.4× from 1→4) but starts behind (unfused graph, per-op f16→f32
+  dequant). RapidSpeech CUDA + FP16 lever reaches sherpa-CPU parity *on the GPU*.
+- **CUDA latency is essentially independent of CPU core count** (flat 4→2 cores,
+  ~5% slower at 1) — the encoder is GPU-bound and the greedy is light host work, so
+  the CUDA path frees the CPU. `XASR_NTHREADS=N` sets the ggml CPU thread count
+  (CPU backend only); the harness defaults to 4.
+- Set thread count for CPU runs with `XASR_NTHREADS`; limit CUDA host cores with
+  `taskset -c`.
+
 ### Build note (this device)
 
 The build script writes a `cuda_bf16.h` stub into the CUDA include dir via `sudo`.
