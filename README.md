@@ -12,14 +12,15 @@ English | [简体中文](./README-CN.md)
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
 
-# RapidSpeech.cpp 🎙️
+# RapidSpeech.cpp
 
-Python-friendly local ASR and TTS, powered by a native C++ GGUF runtime.
+On-device speech AI runtime for ASR, TTS, VAD, and voice cloning.
+Python-simple, C++-native, GGUF-powered.
 
-**RapidSpeech.cpp** gives Python developers a simple API for local speech
-recognition, text-to-speech, VAD, speaker embedding, and voice cloning. Under
-the hood it uses a pure C/C++ engine, **ggml** backends, and a unified **GGUF**
-model format, so you get native performance without running a speech server.
+**RapidSpeech.cpp** runs speech recognition, text-to-speech, VAD, speaker
+embedding, and voice cloning on-device. It gives Python developers a simple API
+while keeping the runtime pure C/C++, backed by **ggml** and a unified **GGUF**
+model format. No cloud API, no speech server, no heavyweight Python model stack.
 
 ------
 
@@ -81,10 +82,11 @@ print(asr.get_text())
 
 ## Why RapidSpeech.cpp
 
-- **Python API, native core**: write Python, run a C++/ggml engine underneath.
+- **Built for the edge**: run speech models locally on laptops, servers,
+  browsers, and device-class hardware.
+- **Python-simple, C++-native**: write Python, run a C++/ggml engine underneath.
 - **One model format**: ASR, TTS, VAD, and speaker models use GGUF.
 - **NumPy in, NumPy out**: ASR takes float32 PCM; TTS returns float32 PCM.
-- **Local by default**: no cloud API, no speech server, no Python model stack.
 - **Edge-first backends**: CPU, Metal, CUDA, Vulkan, CANN, OpenCL, and WebGPU.
 
 ------

@@ -11,11 +11,12 @@
 <a href="https://rapidai-rapidspeech-wasm.ms.show" target="_blank"><img src="https://img.shields.io/badge/魔搭-wasm Demo-blue"></a>
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
-# RapidSpeech.cpp 🎙️
+# RapidSpeech.cpp
 
-面向 Python 开发者的本地 ASR / TTS，底层由 C++ GGUF runtime 驱动。
+端侧语音 AI runtime，支持 ASR、TTS、VAD 和声音克隆。
+Python 易用，C++ 原生，GGUF 驱动。
 
-**RapidSpeech.cpp** 给 Python 开发者提供简单的本地语音识别、语音合成、VAD、说话人嵌入和声音克隆 API。底层使用纯 C/C++ 引擎、**ggml** 后端和统一的 **GGUF** 模型格式，所以你写的是 Python，跑的是原生性能，不需要启动语音服务。
+**RapidSpeech.cpp** 在端侧运行语音识别、语音合成、VAD、说话人嵌入和声音克隆。它给 Python 开发者一个简单 API，同时保持底层 runtime 为纯 C/C++，由 **ggml** 后端和统一的 **GGUF** 模型格式驱动。没有云 API，没有语音服务，也没有沉重的 Python 模型栈。
 
 ------
 
@@ -77,10 +78,10 @@ print(asr.get_text())
 
 ## 为什么是 RapidSpeech.cpp
 
-- **Python API，原生核心**：写 Python，底层跑 C++ / ggml 引擎。
+- **为端侧而生**：在笔记本、服务器、浏览器和设备级硬件上本地运行语音模型。
+- **Python 易用，C++ 原生**：写 Python，底层跑 C++ / ggml 引擎。
 - **一个模型格式**：ASR、TTS、VAD、说话人模型都使用 GGUF。
 - **NumPy 输入输出**：ASR 接收 float32 PCM；TTS 返回 float32 PCM。
-- **默认本地运行**：没有云 API，没有语音服务，没有 Python 模型栈。
 - **端侧后端栈**：CPU、Metal、CUDA、Vulkan、CANN、OpenCL、WebGPU。
 
 ------
