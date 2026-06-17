@@ -58,6 +58,17 @@ Nano):
 - `RS_FORCE_CC=530` — clamps the detected compute capability so ggml's whole
   dispatch (MMQ vs cuBLAS, tensor vs non-tensor) behaves as on real sm_53.
 - `RS_GEMM_NO_TENSOR=1` — forces the non-tensor GEMM path directly.
+- `RS_GEMM_FP16=1` — **opt-in FP16-compute GEMM** for default-precision matmuls
+  on pre-Volta NVIDIA GPUs. sm_53 (GM20B) has native 2x FP16 throughput, but the
+  stock path routes pre-Volta to FP32; this keeps the bulk encoder GEMMs in FP16
+  (`CUBLAS_COMPUTE_16F`, non-tensor algo) for ~2x compute and half the memory
+  traffic — the dominant cost on the Nano's ~25.6 GB/s memory. Numerically
+  sensitive matmuls (attention scores, joiner logits) stay FP32 via
+  `GGML_PREC_F32`, so output is token-exact with the FP32 path (verified on the
+  X-ASR encoder, all chunk variants). On a real Nano set `RS_GEMM_FP16=1` alone;
+  on newer hardware pair it with `RS_GEMM_NO_TENSOR=1` to exercise the same path.
+  This is a *latency* lever specific to the Nano (it gave nothing on the
+  bandwidth-rich GB10 dev host); on-device timing is still pending a Nano reflash.
 
 Under `RS_FORCE_CC=530` in the `dustynv/l4t-pytorch:r32.7.1` container (genuine
 nvcc 10.2 + real CUDA-10.2 cuBLAS), both models ran to completion with correct
