@@ -1,5 +1,7 @@
 #include "core/rs_processor.h"
+#ifndef __EMSCRIPTEN__
 #include "arch/cosyvoice3.h"
+#endif
 #include "ggml-backend.h"
 #include "utils/rs_log.h"
 #include <chrono>
@@ -271,6 +273,12 @@ void RSProcessor::StopTtsWorker() {
 int RSProcessor::ProcessTTSStream() {
   if (!model_ || !state_ || !sched_) return -1;
 
+#ifdef __EMSCRIPTEN__
+  // CosyVoice3 streaming path is excluded from the WASM build (CV3 sources
+  // are not compiled there). Callers should use ProcessTTS() instead.
+  RS_LOG_ERR("ProcessTTSStream: not available in WASM build");
+  return -1;
+#else
   auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(model_.get());
   if (!cv3) {
     RS_LOG_ERR("ProcessTTSStream: only CosyVoice3 supports streaming");
@@ -340,6 +348,7 @@ int RSProcessor::ProcessTTSStream() {
   tts_audio_buf_.clear();
   tts_audio_read_pos_ = 0;
   return 0;
+#endif
 }
 
 int RSProcessor::GetAudioOutput(float **out_data) {

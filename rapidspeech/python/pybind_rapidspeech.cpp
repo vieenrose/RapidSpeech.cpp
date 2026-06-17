@@ -68,6 +68,7 @@ public:
         }
         float *data = static_cast<float *>(buf.ptr);
         int n = static_cast<int>(buf.shape[0]);
+        py::gil_scoped_release nogil;
         check_rs(rs_push_audio(ctx_, data, n), "rs_push_audio failed");
     }
 
@@ -180,20 +181,27 @@ public:
     // ---- Synthesis ----
 
     py::array_t<float> synthesize(const std::string &text) {
-        rs_reset(ctx_);
-        check_rs(rs_push_text(ctx_, text.c_str()), "rs_push_text failed");
-
         std::vector<float> all_pcm;
-        int ret;
-        while ((ret = rs_process(ctx_)) >= 0) {
-            float *chunk = nullptr;
-            int n = rs_get_audio_output(ctx_, &chunk);
-            if (n > 0 && chunk) {
-                all_pcm.insert(all_pcm.end(), chunk, chunk + n);
+        bool errored = false;
+        {
+            py::gil_scoped_release nogil;
+            rs_reset(ctx_);
+            int push_rc = rs_push_text(ctx_, text.c_str());
+            if (push_rc != RS_OK) { errored = true; }
+            else {
+                int ret;
+                while ((ret = rs_process(ctx_)) >= 0) {
+                    float *chunk = nullptr;
+                    int n = rs_get_audio_output(ctx_, &chunk);
+                    if (n > 0 && chunk) {
+                        all_pcm.insert(all_pcm.end(), chunk, chunk + n);
+                    }
+                    if (ret == 0) break;
+                }
+                if (ret < 0) errored = true;
             }
-            if (ret == 0) break;
         }
-        if (ret < 0) {
+        if (errored) {
             throw std::runtime_error(rs_format_error("TTS inference error"));
         }
         auto result = py::array_t<float>(static_cast<py::ssize_t>(all_pcm.size()));
@@ -202,12 +210,25 @@ public:
     }
 
     py::list synthesize_streaming(const std::string &text) {
-        rs_reset(ctx_);
-        check_rs(rs_push_text(ctx_, text.c_str()), "rs_push_text failed");
-
         py::list chunks;
+        bool errored = false;
+        {
+            // Reset + push text under GIL release (no Python touched here).
+            py::gil_scoped_release nogil;
+            rs_reset(ctx_);
+            if (rs_push_text(ctx_, text.c_str()) != RS_OK) errored = true;
+        }
+        if (errored) {
+            throw std::runtime_error(rs_format_error("rs_push_text failed"));
+        }
+
         int ret;
-        while ((ret = rs_process(ctx_)) >= 0) {
+        while (true) {
+            {
+                py::gil_scoped_release nogil;
+                ret = rs_process(ctx_);
+            }
+            if (ret < 0) break;
             float *chunk = nullptr;
             int n = rs_get_audio_output(ctx_, &chunk);
             if (n > 0 && chunk) {
@@ -280,10 +301,10 @@ public:
         if (buf.ndim != 1) {
             throw std::runtime_error("PCM must be a 1-D float32 array");
         }
-        check_rs(rs_vad_push_audio(vad_,
-                                   static_cast<float *>(buf.ptr),
-                                   static_cast<int>(buf.shape[0])),
-                 "rs_vad_push_audio failed");
+        float *data = static_cast<float *>(buf.ptr);
+        int n = static_cast<int>(buf.shape[0]);
+        py::gil_scoped_release nogil;
+        check_rs(rs_vad_push_audio(vad_, data, n), "rs_vad_push_audio failed");
     }
 
     bool is_speech() const { return rs_vad_is_speech(vad_) != 0; }
@@ -372,7 +393,6 @@ PYBIND11_MODULE(rapidspeech, m) {
 
         .def("push_audio", &RSAsrOffline::push_audio,
              py::arg("pcm"),
-             py::call_guard<py::gil_scoped_release>(),
              "Push mono float32 PCM in [-1, 1] at the model's native sample rate.")
 
         .def("process", &RSAsrOffline::process,
@@ -435,12 +455,10 @@ PYBIND11_MODULE(rapidspeech, m) {
 
         .def("synthesize", &RSTTSSynthesizer::synthesize,
              py::arg("text"),
-             py::call_guard<py::gil_scoped_release>(),
              "Synthesize text and return the full PCM as a 1-D float32 numpy array.")
 
         .def("synthesize_streaming", &RSTTSSynthesizer::synthesize_streaming,
              py::arg("text"),
-             py::call_guard<py::gil_scoped_release>(),
              "Synthesize text and return a list of PCM chunks (1-D float32 arrays).")
 
         .def("get_sample_rate", &RSTTSSynthesizer::get_sample_rate,
@@ -473,7 +491,6 @@ PYBIND11_MODULE(rapidspeech, m) {
 
         .def("push_audio", &RSVad::push_audio,
              py::arg("pcm"),
-             py::call_guard<py::gil_scoped_release>(),
              "Push 16 kHz mono float32 PCM. Drives the segment/frame queues.")
 
         .def("is_speech", &RSVad::is_speech,
