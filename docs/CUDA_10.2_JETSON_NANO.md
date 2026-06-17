@@ -158,3 +158,23 @@ The build script writes a `cuda_bf16.h` stub into the CUDA include dir via `sudo
 If passwordless sudo isn't available, create the stub in a writable dir and add
 `-I <dir>` to `CMAKE_CUDA_FLAGS` instead, and configure with `-DRS_XASR_DEV_TEST=ON`
 to build the `xasr-dev-test` timing harness used for the table above.
+
+### Fast builds: cross-compile on an aarch64 host (≈15× faster)
+
+The Nano's 4× A57 build ggml-cuda in ~6 min. On an aarch64 dev host (e.g. GB10 /
+DGX Spark) the JetPack-4.6 container image builds the *same* sm_53 binary in ~25 s —
+and since both are aarch64, the binary runs natively on the Nano (no JIT). The host's
+own CUDA can't target Maxwell (CUDA 12+ dropped sm_5x) and the bare
+`dustynv/l4t-pytorch` image ships only a stub cuBLAS, so use the image that installs
+the real CUDA-10.2 libs:
+
+```bash
+docker build -t xasr-cuda:r32.7.1 -f scripts/xasr/Dockerfile.jetpack46-cuda .
+docker run --rm -v $PWD:/rs xasr-cuda:r32.7.1 bash -lc \
+  'cd /rs && cmake -S . -B build-hostc -DRS_CUDA=ON -DRS_XASR_DEV_TEST=ON ... -DCMAKE_CUDA_ARCHITECTURES=53 \
+   && cmake --build build-hostc --target xasr-dev-test -j$(nproc)'    # ~25 s
+```
+Then deploy `xasr-dev-test` + `libggml*.so` + `librapidspeech-core.so*` to the Nano
+and run with `LD_LIBRARY_PATH=<libs>:/usr/local/cuda-10.2/targets/aarch64-linux/lib`
+(the Nano provides the real CUDA-10.2 runtime). Verified: container-built binary runs
+token-exact on the real Nano.
