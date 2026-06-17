@@ -11,7 +11,7 @@ needed to compile *and run* RapidSpeech.cpp's CUDA backend on that toolchain.
 | Compiles under nvcc 10.2 / gcc-8 / C++14 / sm_53 | ✅ validated |
 | SenseVoice / silero-VAD / melo8k run on GPU without crashing | ✅ validated (sm_53 dispatch) |
 | GPU output correctness | ✅ SenseVoice transcription correct; melo8k GPU==CPU (corr 0.999999) |
-| GPU **speed** vs CPU on the actual Nano | ⏳ **pending real hardware** (see "Why speed isn't here") |
+| GPU **speed** vs CPU on the actual Nano | ✅ **measured** — X-ASR encoder, `RS_GEMM_FP16` 1.75× & token-exact (see "On-device speed") |
 
 Build it with [`scripts/build_jetson_nano_gen1_native.sh`](../scripts/build_jetson_nano_gen1_native.sh)
 (native, run on the device or an aarch64 L4T r32.7 container).
@@ -68,7 +68,8 @@ Nano):
   X-ASR encoder, all chunk variants). On a real Nano set `RS_GEMM_FP16=1` alone;
   on newer hardware pair it with `RS_GEMM_NO_TENSOR=1` to exercise the same path.
   This is a *latency* lever specific to the Nano (it gave nothing on the
-  bandwidth-rich GB10 dev host); on-device timing is still pending a Nano reflash.
+  bandwidth-rich GB10 dev host). **Measured on a real Nano: 1.75× faster encoder
+  and token-exact** — see "On-device speed" below.
 
 Under `RS_FORCE_CC=530` in the `dustynv/l4t-pytorch:r32.7.1` container (genuine
 nvcc 10.2 + real CUDA-10.2 cuBLAS), both models ran to completion with correct
@@ -92,11 +93,38 @@ cuDNN-based stack alone faults in ~782 MB before weights. (The cuDNN-free onnxru
 1.11 build of the same models needs ~1.2 GB / ~720 MB respectively — see the
 edge-speech-gpu-bench comparison.)
 
-## Why speed isn't here
+## On-device speed (real Jetson Nano gen1, sm_53)
 
-The GB10 has no native sm_53 cuBLAS SASS, so every kernel **JIT-compiles to sm_121
-on first use** — the one SenseVoice encode measured ~59 s, essentially all JIT. And
-even warm, it is Blackwell silicon, not Maxwell, so no GB10 number predicts Nano RTF,
-nor even whether GPU beats the A57 CPU on these small models. Absolute speed — and
-the "is CUDA actually worth it vs CPU on the Nano" question — will be measured on the
-real device.
+Measured on a **real Nano** (L4T R32.5.1, CUDA 10.2, MAXN, native sm_53 build, no
+JIT) with the X-ASR zh-en **960 ms** streaming encoder, full reference clip (1105
+frames / 11 chunks), steady-state, warm-up excluded. **Encoder ms/chunk** is the
+figure of merit:
+
+| Config | Encoder ms/chunk | Tokens |
+|--------|-----------------:|:------:|
+| CPU f16 | 637.1 | exact |
+| CPU q3_k-im | 535.0 | exact |
+| GPU f16, **default (FP32 GEMM)** | 703.6 | exact |
+| GPU f16, **`RS_GEMM_FP16=1`** | **401.5** | **exact** |
+| GPU q3_k-im, FP32 GEMM | 415.2 | exact |
+| GPU q3_k-im, `RS_GEMM_FP16=1` | 444.7 | exact |
+
+All six outputs are **byte-exact** with the CPU f16 reference and decode the correct
+transcript; all run faster than real time (960 ms audio/chunk).
+
+- **`RS_GEMM_FP16` gives a 1.75× encoder speedup (703.6 → 401.5 ms/chunk),
+  token-exact** — the FP16-throughput roofline prediction, confirmed on Maxwell.
+- **Without the lever, GPU is *not* worth it for f16:** stock GPU FP32 (703.6) is
+  *slower* than the A57 CPU (637.1). The FP16 lever — or quantization — is what
+  puts GPU ahead.
+- **Quantization is the other bandwidth lever:** q3_k-im FP32 (415.2) ≈ f16 +
+  FP16-lever (401.5). They are **substitutes, not additive** (q3_k-im + lever is
+  444.7, slightly worse — 3-bit weights already minimise traffic). ~400 ms/chunk
+  is the Nano bandwidth floor for this encoder.
+
+### Build note (this device)
+
+The build script writes a `cuda_bf16.h` stub into the CUDA include dir via `sudo`.
+If passwordless sudo isn't available, create the stub in a writable dir and add
+`-I <dir>` to `CMAKE_CUDA_FLAGS` instead, and configure with `-DRS_XASR_DEV_TEST=ON`
+to build the `xasr-dev-test` timing harness used for the table above.
