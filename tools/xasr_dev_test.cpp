@@ -29,8 +29,8 @@ static std::vector<float> read_bin(const char *path) {
 int main(int argc, char **argv) {
   std::string stage = argc > 1 ? argv[1] : "";
   if (argc < 7 || (stage != "embed" && stage != "encoder" && stage != "stream" &&
-                   stage != "transcribe" && stage != "online")) {
-    fprintf(stderr, "usage: %s <embed|encoder|stream|transcribe|online> <model.gguf> <feats.bin> <T|n_frames> <feat_dim> <out.bin>\n", argv[0]);
+                   stage != "transcribe" && stage != "online" && stage != "imatrix")) {
+    fprintf(stderr, "usage: %s <embed|encoder|stream|transcribe|online|imatrix> <model.gguf> <feats.bin> <T|n_frames> <feat_dim> <out.bin|out.dat>\n", argv[0]);
     return 1;
   }
   const char *model = argv[2], *featf = argv[3], *outf = argv[6];
@@ -94,6 +94,12 @@ int main(int argc, char **argv) {
   }
 
   XAsrHParams hp; xasr_read_hparams(gg, hp);
+  if (stage == "imatrix") {
+    bool ok = xasr_collect_imatrix(w, backend, hp, feats.data(), T, feat_dim, outf);
+    if (!ok) { fprintf(stderr, "imatrix failed\n"); return 1; }
+    fprintf(stderr, "imatrix written to %s\n", outf);
+    return 0;
+  }
   if (stage == "transcribe" || stage == "online") {
     std::vector<int32_t> ids;
     bool ok = (stage == "online")

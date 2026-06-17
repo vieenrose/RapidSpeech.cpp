@@ -1,8 +1,10 @@
 #include "xasr_zipformer2.h"
 #include "core/rs_context.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
+#include "../../../examples/imatrix/imatrix_collector.h"
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -881,6 +883,82 @@ RS_API bool xasr_debug_encoder_stream(const std::map<std::string, ggml_tensor *>
     processed_lens += pl_inc;
   }
   *n_out = total;
+  return true;
+}
+
+// ---------------------------------------------------------------- imatrix
+// Collect an activation importance matrix (AWQ) for the encoder by running it
+// over calibration features through a ggml scheduler with a per-node eval
+// callback. The collector accumulates sum(act^2) per input column for every
+// named weight matmul, which the quantizer then uses to protect the most
+// important channels — letting low-bit (q3/q2/IQ) quants keep accuracy.
+// Output is the legacy .dat format consumed by rs-quantize --imatrix.
+static IMatrixCollector *g_xasr_imatrix = nullptr;
+static bool xasr_imatrix_eval_cb(struct ggml_tensor *t, bool ask, void *ud) {
+  (void)ud;
+  if (ask) return true;          // observe every node
+  if (g_xasr_imatrix) g_xasr_imatrix->collect_node(t);
+  return true;
+}
+
+RS_API bool xasr_collect_imatrix(const std::map<std::string, ggml_tensor *> &w,
+                                 ggml_backend_t backend, const XAsrHParams &hp,
+                                 const float *feats, int n_frames, int feat_dim,
+                                 const char *out_dat) {
+  const auto &dims=hp.dims, &nlayers=hp.num_layers, &nheads=hp.num_heads,
+      &kernels=hp.cnn_kernels, &dsf=hp.downsampling_factor;
+  const int T = hp.T, shift = hp.decode_chunk_len, outW = (((feat_dim - 1) / 2) - 1) / 2;
+  const int pl_inc = hp.embed_out_len(), lc_base = hp.lc_base();
+
+  IMatrixCollector collector;
+  g_xasr_imatrix = &collector;
+  ggml_backend_sched_t sched =
+      ggml_backend_sched_new(&backend, nullptr, 1, 4096 * 64, false, false);
+  ggml_backend_sched_set_eval_callback(sched, xasr_imatrix_eval_cb, nullptr);
+
+  std::vector<std::vector<float>> state;
+  int processed_lens = 0, nchunk = 0;
+  for (int start = 0; start + T <= n_frames; start += shift, ++nchunk) {
+    size_t mem = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(200000, false);
+    ggml_init_params ip{mem, nullptr, true};
+    ggml_context *c = ggml_init(ip);
+    Consts K{c}; Caches cc{c};
+    ggml_tensor *feats4 = ggml_new_tensor_4d(c, GGML_TYPE_F32, feat_dim, T, 1, 1);
+    ggml_set_input(feats4);
+    ggml_tensor *ecache = cc.get(outW, 3, 128);
+    ggml_tensor *emb = build_embed(c, K, w, feats4, ecache, &cc);
+    ggml_tensor *y = build_encoder(c, K, cc, w, emb, dims, nlayers, nheads, kernels,
+                                   dsf, hp.pos_dim, processed_lens, lc_base);
+    ggml_set_output(y);
+    ggml_cgraph *gf = ggml_new_graph_custom(c, 200000, false);
+    ggml_build_forward_expand(gf, y);
+    for (ggml_tensor *o : cc.out) ggml_build_forward_expand(gf, o);
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+      ggml_free(c); ggml_backend_sched_free(sched); g_xasr_imatrix = nullptr; return false;
+    }
+    ggml_backend_tensor_set(feats4, feats + (size_t)start * feat_dim, 0,
+                            (size_t)feat_dim * T * sizeof(float));
+    if (state.empty()) {
+      state.resize(cc.in.size());
+      for (size_t i = 0; i < cc.in.size(); ++i) state[i].assign(ggml_nelements(cc.in[i]), 0.0f);
+    }
+    for (size_t i = 0; i < cc.in.size(); ++i)
+      ggml_backend_tensor_set(cc.in[i], state[i].data(), 0, ggml_nbytes(cc.in[i]));
+    K.upload();
+    K.upload_masks(processed_lens);
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      ggml_free(c); ggml_backend_sched_free(sched); g_xasr_imatrix = nullptr; return false;
+    }
+    for (size_t i = 0; i < cc.out.size(); ++i)
+      ggml_backend_tensor_get(cc.out[i], state[i].data(), 0, ggml_nbytes(cc.out[i]));
+    processed_lens += pl_inc;
+    ggml_free(c);
+  }
+  ggml_backend_sched_free(sched);
+  g_xasr_imatrix = nullptr;
+  fprintf(stderr, "imatrix: collected over %d chunks\n", nchunk);
+  collector.save(out_dat);
   return true;
 }
 

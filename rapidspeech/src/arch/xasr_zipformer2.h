@@ -126,6 +126,13 @@ RS_API bool xasr_debug_online(const std::map<std::string, struct ggml_tensor *> 
                               ggml_backend_t backend, const XAsrHParams &hp,
                               const float *feats, int n_frames, int feat_dim,
                               std::vector<int32_t> &ids);
+// Collect an activation importance matrix (AWQ) over calibration features and
+// write it as a legacy .dat file for rs-quantize --imatrix. Enables low-bit
+// (q3/q2/IQ) quantization with much less accuracy loss.
+RS_API bool xasr_collect_imatrix(const std::map<std::string, struct ggml_tensor *> &w,
+                                 ggml_backend_t backend, const XAsrHParams &hp,
+                                 const float *feats, int n_frames, int feat_dim,
+                                 const char *out_dat);
 
 // Persistent online streaming recognizer driven by raw 16 kHz mono int16 PCM
 // (online fbank + per-chunk encoder w/ persistent caches + greedy transducer).
