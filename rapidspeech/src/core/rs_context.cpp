@@ -64,6 +64,8 @@ rs_context_t::~rs_context_t() {
 
   // Now it is safe to free the scheduler as all its managed tensors/buffers are
   // gone
+  if (sched_cpu)
+    ggml_backend_sched_free(sched_cpu);
   if (sched)
     ggml_backend_sched_free(sched);
 
@@ -189,6 +191,11 @@ bool rs_context_t::init_backend(bool prefer_cpu) {
                                    (int)backends.size(), 16384, false, true);
     RS_LOG_INFO("Scheduler: GPU+CPU (op_offload=true, %d backend(s))",
                 (int)backends.size());
+    // CPU-only scheduler for batch-1 decode loops (Qwen3-ASR). The CPU backend is
+    // last in `backends`. Lets the autoregressive decode run on CPU (3.7x faster
+    // at batch-1 on Maxwell sm_53) while prefill/encode use the GPU `sched`.
+    ggml_backend_t cpu_only[1] = {backends[(int)backends.size() - 1]};
+    sched_cpu = ggml_backend_sched_new(cpu_only, nullptr, 1, 16384, false, false);
   } else {
     int cpu_idx = (int)backends.size() - 1;
     sched = ggml_backend_sched_new(&backends[cpu_idx], nullptr, 1, 16384, false,
@@ -237,6 +244,13 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   bool prefer_cpu = (arch == "openvoice2" || arch == "matcha-tts");
 #endif
 
+  // Qwen3-ASR keeps the GPU scheduler (for the parallel encoder + LLM prefill)
+  // but places its WEIGHTS on the CPU backend: the autoregressive decode loop
+  // runs on ctx->sched_cpu, which reads the CPU-resident weights in place
+  // (batch-1 is ~3.7x faster on the A57 than re-uploading weights to the GPU
+  // per token on Maxwell sm_53). Disable with RS_QWEN3ASR_GPU_WEIGHTS=1.
+  bool cpu_weights = (arch == "Qwen3ASR" && getenv("RS_QWEN3ASR_GPU_WEIGHTS") == nullptr);
+
   // 3. Hardware detection and backend initialization
   if (!ctx->init_backend(prefer_cpu)) {
     RS_LOG_ERR("Failed to initialize backend scheduler.");
@@ -244,8 +258,10 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   }
 
   // 4. Allocate physical memory buffers on the appropriate backend.
-  //    CPU-preferring models get CPU weights to avoid cross-device copies.
-  int weight_backend_idx = prefer_cpu ? (int)ctx->backends.size() - 1 : 0;
+  //    CPU-preferring models (and CPU-weights models like Qwen3-ASR) get CPU
+  //    weights to avoid cross-device copies in the decode loop.
+  int weight_backend_idx =
+      (prefer_cpu || cpu_weights) ? (int)ctx->backends.size() - 1 : 0;
   ggml_backend_buffer_t weight_buffer =
       ggml_backend_alloc_ctx_tensors(ctx->gguf_data, ctx->backends[weight_backend_idx]);
   if (weight_buffer) {

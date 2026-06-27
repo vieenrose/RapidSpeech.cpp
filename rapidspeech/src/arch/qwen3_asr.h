@@ -140,6 +140,11 @@ private:
   llm_model_ptr                       llm_model_;
   std::unique_ptr<llm_build_qwen3>    llm_graph_builder_;
 
+  // CPU-only scheduler (from rs_context, captured at Load). When set, the
+  // autoregressive decode loop runs on it instead of the GPU `sched` — batch-1
+  // decode is ~3.7x faster on the A57 than per-token weight uploads on sm_53.
+  ggml_backend_sched_t                decode_sched_ = nullptr;
+
   // Persistent host KV mirror (mirrors FunASRNano's optimised cache).
   std::vector<std::vector<float>>     host_kv_cache_k_;
   std::vector<std::vector<float>>     host_kv_cache_v_;

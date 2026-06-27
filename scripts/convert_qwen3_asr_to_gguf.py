@@ -45,6 +45,7 @@ import numpy as np
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
+    from gguf import quants as gguf_quants
 except ImportError:
     print("Please install gguf: pip install gguf", file=sys.stderr)
     raise
@@ -58,29 +59,35 @@ def encoder_name_map(hf_name: str, n_enc_layers: int) -> str | None:
     """Return the target GGUF tensor name, or None if the HF name is not part
     of the audio tower / projector."""
     n = hf_name
+    # Real checkpoint prefixes every tensor with `thinker.`
+    if n.startswith("thinker."):
+        n = n[len("thinker."):]
 
-    # Conv stack: audio_tower.conv{1,2,3}.{weight,bias}
+    # Conv stack: audio_tower.conv2d{1,2,3}.{weight,bias}
     for i in (1, 2, 3):
-        if n == f"audio_tower.conv{i}.weight":
+        if n == f"audio_tower.conv2d{i}.weight":
             return f"a.conv2d.{i - 1}.weight"
-        if n == f"audio_tower.conv{i}.bias":
+        if n == f"audio_tower.conv2d{i}.bias":
             return f"a.conv2d.{i - 1}.bias"
 
-    # proj_out: audio_tower.proj_out.{weight,bias}
-    if n == "audio_tower.proj_out.weight":
+    # Post-conv projection: audio_tower.conv_out.{weight,bias}
+    if n == "audio_tower.conv_out.weight":
         return "a.conv_out.weight"
-    if n == "audio_tower.proj_out.bias":
+    if n == "audio_tower.conv_out.bias":
         return "a.conv_out.bias"
 
     # Position embedding
     if n == "audio_tower.embed_positions.weight":
         return "a.position_embd.weight"
 
-    # Post-encoder layer norm
-    if n == "audio_tower.layer_norm.weight":
+    # Post-encoder norm. The reference forward applies ONLY ln_post (after the
+    # transformer stack); the separate layer_norm is loaded-but-unused, so drop it.
+    if n == "audio_tower.ln_post.weight":
         return "a.post_norm.weight"
-    if n == "audio_tower.layer_norm.bias":
+    if n == "audio_tower.ln_post.bias":
         return "a.post_norm.bias"
+    if n in ("audio_tower.layer_norm.weight", "audio_tower.layer_norm.bias"):
+        return None
 
     # Transformer layers
     prefix = "audio_tower.layers."
@@ -119,12 +126,13 @@ def encoder_name_map(hf_name: str, n_enc_layers: int) -> str | None:
         }
         return mapping.get(suffix)
 
-    # Multi-modal projector
+    # Projector (lives INSIDE audio_tower in the real checkpoint):
+    # proj1 (d_model->d_model) -> gelu -> proj2 (d_model->llm_embd).
     proj_map = {
-        "multi_modal_projector.linear_1.weight": "mm.a.mlp.0.weight",
-        "multi_modal_projector.linear_1.bias":   "mm.a.mlp.0.bias",
-        "multi_modal_projector.linear_2.weight": "mm.a.mlp.1.weight",
-        "multi_modal_projector.linear_2.bias":   "mm.a.mlp.1.bias",
+        "audio_tower.proj1.weight": "mm.a.mlp.0.weight",
+        "audio_tower.proj1.bias":   "mm.a.mlp.0.bias",
+        "audio_tower.proj2.weight": "mm.a.mlp.1.weight",
+        "audio_tower.proj2.bias":   "mm.a.mlp.1.bias",
     }
     if n in proj_map:
         return proj_map[n]
@@ -133,9 +141,15 @@ def encoder_name_map(hf_name: str, n_enc_layers: int) -> str | None:
 
 
 def llm_name_map(hf_name: str) -> str | None:
-    """Map `language_model.*` Qwen3 LLM tensors to RapidSpeech's `llm.*` keys."""
-    if hf_name.startswith("language_model."):
-        return "llm." + hf_name[len("language_model."):]
+    """Map the thinker's Qwen3 LLM tensors (`thinker.model.*`, `thinker.lm_head.*`)
+    to RapidSpeech's `llm.*` keys consumed by the qwen3 LLM loader."""
+    n = hf_name
+    if n.startswith("thinker."):
+        n = n[len("thinker."):]
+    if n.startswith("model."):
+        return "llm." + n            # llm.model.*
+    if n == "lm_head.weight":
+        return "llm.lm_head.weight"
     return None
 
 
@@ -143,17 +157,29 @@ def llm_name_map(hf_name: str) -> str | None:
 # Tensor write helper
 # ----------------------------------------------------------------------------
 
-def _store(writer: GGUFWriter, name: str, t: np.ndarray, use_f16: bool):
-    """Reverse shape (PT C-order bytes -> ggml ne0-fastest labels) and emit."""
-    if t.ndim >= 2:
-        new_shape = tuple(reversed(t.shape))
-        t = t.ravel().reshape(new_shape)
-    # Pick dtype: keep 1-D / normalization tensors / biases in F32 to avoid
-    # subtle numeric drift.
+def _store(writer: GGUFWriter, name: str, t: np.ndarray, quant: str):
+    """Emit a tensor. Pass the PyTorch shape AS-IS: gguf-py reverses numpy.shape
+    -> ggml ne internally, so a manual reverse here double-reverses and corrupts
+    the layout (e.g. conv kernel [OC,IC,KH,KW] must land as ne [KW,KH,IC,OC]).
+    quant in {f32,f16,q8_0,q4_0}. Norms/biases/1-D stay F32; conv (last dim not a
+    multiple of 32) falls back to F16. NOTE q4_0 is SLOWER than q8_0/f16 on
+    Maxwell sm_53 (no dp4a) and loses accuracy on the 0.6B model — prefer q8_0/f16
+    for the Jetson Nano; q4_0 is for Ampere+ where low-bit GEMM is fast."""
     eff_ndim = sum(1 for d in t.shape if d > 1)
-    if use_f16 and eff_ndim >= 2 and not name.endswith(".bias") and \
-            not name.endswith("norm.weight") and \
-            not name.endswith("layer_norm.weight"):
+    quantizable = (eff_ndim >= 2 and not name.endswith(".bias")
+                   and not name.endswith("norm.weight")
+                   and not name.endswith("layer_norm.weight"))
+    if quant in ("q8_0", "q4_0") and quantizable:
+        qt = (GGMLQuantizationType.Q8_0 if quant == "q8_0"
+              else GGMLQuantizationType.Q4_0)
+        try:
+            writer.add_tensor(name, gguf_quants.quantize(t.astype(np.float32), qt),
+                              raw_dtype=qt)
+            return
+        except Exception:
+            print(f"  ({quant} N/A for {name} shape {t.shape} -> F16)", file=sys.stderr)
+            quant = "f16"
+    if quant != "f32" and quantizable:
         t = t.astype(np.float16)
     else:
         t = t.astype(np.float32)
@@ -164,7 +190,7 @@ def _store(writer: GGUFWriter, name: str, t: np.ndarray, use_f16: bool):
 # Main conversion routine
 # ----------------------------------------------------------------------------
 
-def convert(hf_dir: Path, output: Path, use_f16: bool):
+def convert(hf_dir: Path, output: Path, quant: str):
     print(f"Loading from {hf_dir}")
     cfg_path = hf_dir / "config.json"
     if not cfg_path.exists():
@@ -172,9 +198,11 @@ def convert(hf_dir: Path, output: Path, use_f16: bool):
     with open(cfg_path) as f:
         cfg = json.load(f)
 
-    # Sub-configs (Qwen3-ASR architecture wraps an audio_config + text_config).
-    audio_cfg = cfg.get("audio_config", cfg.get("audio_tower_config", {}))
-    text_cfg  = cfg.get("text_config", cfg.get("language_config", cfg))
+    # Sub-configs. The published Qwen3-ASR checkpoint nests everything under
+    # `thinker_config` (audio_config + text_config); fall back to flat for older dumps.
+    tcfg      = cfg.get("thinker_config", cfg)
+    audio_cfg = tcfg.get("audio_config", tcfg.get("audio_tower_config", {}))
+    text_cfg  = tcfg.get("text_config", tcfg.get("language_config", tcfg))
 
     # Encoder hparams
     n_mels       = int(audio_cfg.get("num_mel_bins", 128))
@@ -201,8 +229,8 @@ def convert(hf_dir: Path, output: Path, use_f16: bool):
     rope_base    = float(text_cfg.get("rope_theta", 1000000.0))
     rms_eps      = float(text_cfg.get("rms_norm_eps", 1e-6))
     n_ctx_train  = int(text_cfg.get("max_position_embeddings", 32768))
-    bos          = int(text_cfg.get("bos_token_id", 151643))
-    eos          = int(text_cfg.get("eos_token_id", 151645))
+    bos          = int(text_cfg.get("bos_token_id") or cfg.get("bos_token_id") or 151643)
+    eos          = int(text_cfg.get("eos_token_id") or cfg.get("eos_token_id") or 151645)
 
     # mm projector dims
     mm_in_dim  = int(cfg.get("projector_input_dim", enc_d_model))
@@ -294,12 +322,12 @@ def convert(hf_dir: Path, output: Path, use_f16: bool):
         t = state_dict[name].detach().to(dtype=_t_to_dtype(state_dict[name])).cpu().numpy()
         gguf_name = encoder_name_map(name, enc_n_layer)
         if gguf_name is not None:
-            _store(writer, gguf_name, t, use_f16)
+            _store(writer, gguf_name, t, quant)
             converted_enc += 1
             continue
         gguf_name = llm_name_map(name)
         if gguf_name is not None:
-            _store(writer, gguf_name, t, use_f16)
+            _store(writer, gguf_name, t, quant)
             converted_llm += 1
             continue
         skipped += 1
@@ -384,9 +412,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf-dir", required=True, help="Local HF Qwen3-ASR checkpoint directory")
     parser.add_argument("--output", required=True, help="Output GGUF path")
-    parser.add_argument("--f16", action="store_true", help="Store 2-D weights as F16 (default F32)")
+    parser.add_argument("--f16", action="store_true", help="(legacy) same as --quant f16")
+    parser.add_argument("--quant", choices=["f32","f16","q8_0","q4_0"], default=None,
+                        help="Weight quantization (default f16). q8_0=half size, ~same speed on Nano. q4_0 NOT for Nano (slower on sm_53).")
     args = parser.parse_args()
     hf_dir = Path(args.hf_dir).expanduser()
     output = Path(args.output).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
-    convert(hf_dir, output, args.f16)
+    quant = args.quant if args.quant else ("f16" if args.f16 else "f16")
+    convert(hf_dir, output, quant)

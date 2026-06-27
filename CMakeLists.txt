@@ -189,6 +189,8 @@ set(RS_SOURCES
         rapidspeech/src/frontend/matcha_frontend.cpp
         rapidspeech/src/frontend/whisper_mel.h
         rapidspeech/src/frontend/whisper_mel.cpp
+        rapidspeech/src/frontend/qwen3_mel.h
+        rapidspeech/src/frontend/qwen3_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
@@ -290,6 +292,11 @@ if (RS_CUDA)
     if (TARGET ggml-cuda)
         target_link_libraries(rapidspeech-core PRIVATE ggml-cuda)
     endif()
+    # Qwen3-ASR cuFFT mel (batched R2C) — replaces the slow CPU DFT on the Nano.
+    enable_language(CUDA)
+    set_source_files_properties(rapidspeech/src/frontend/mel_cufft.cu PROPERTIES LANGUAGE CUDA)
+    target_sources(rapidspeech-core PRIVATE rapidspeech/src/frontend/mel_cufft.cu)
+    target_link_libraries(rapidspeech-core PRIVATE cufft)
 endif()
 
 # 2. Metal Configuration (Apple Platforms)

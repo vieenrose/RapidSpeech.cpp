@@ -18,6 +18,10 @@ struct rs_context_t {
   std::vector<ggml_backend_buffer_t> weight_buffers;
   std::vector<ggml_backend_t> backends;
   ggml_backend_sched_t sched = nullptr;
+  // CPU-only scheduler (created only when a GPU backend is also present). Used by
+  // Qwen3-ASR to run the batch-1 autoregressive decode on the CPU (3.7x faster
+  // than the GPU at batch-1 on Maxwell sm_53), while prefill/encode stay on `sched`.
+  ggml_backend_sched_t sched_cpu = nullptr;
   std::shared_ptr<ISpeechModel> model;
   std::unique_ptr<RSProcessor> processor;
 

@@ -79,15 +79,23 @@ void WhisperMelExtractor::InitMelFilters() {
   const int n_bins  = cfg_.n_fft / 2 + 1;
   mel_filters_.assign((size_t)n_mels * n_bins, 0.0f);
 
-  const double mel_lo = hz_to_mel_slaney(cfg_.f_min);
-  const double mel_hi = hz_to_mel_slaney(cfg_.f_max);
+  auto hz_to_mel = [&](double hz) {
+    return cfg_.use_htk ? 2595.0 * std::log10(1.0 + hz / 700.0)
+                        : hz_to_mel_slaney(hz);
+  };
+  auto mel_to_hz = [&](double mel) {
+    return cfg_.use_htk ? 700.0 * (std::pow(10.0, mel / 2595.0) - 1.0)
+                        : mel_to_hz_slaney(mel);
+  };
+  const double mel_lo = hz_to_mel(cfg_.f_min);
+  const double mel_hi = hz_to_mel(cfg_.f_max);
   std::vector<double> mel_points(n_mels + 2);
   for (int i = 0; i < n_mels + 2; ++i) {
     mel_points[i] = mel_lo + (mel_hi - mel_lo) * i / (double)(n_mels + 1);
   }
   std::vector<double> hz_points(n_mels + 2);
   for (int i = 0; i < n_mels + 2; ++i) {
-    hz_points[i] = mel_to_hz_slaney(mel_points[i]);
+    hz_points[i] = mel_to_hz(mel_points[i]);
   }
 
   const double fft_bin_hz = (double)cfg_.sample_rate / (double)cfg_.n_fft;

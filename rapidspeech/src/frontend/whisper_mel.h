@@ -29,6 +29,9 @@ struct WhisperMelConfig {
   // Chunk size in mel frames. Output is padded to a multiple of this.
   // Qwen3-ASR: chunk_size = 100 (2 * n_window with n_window=50).
   int chunk_size  = 100;
+  // Mel scale: false = Slaney (librosa htk=False, default), true = HTK
+  // (2595*log10(1+hz/700)). Qwen3-ASR's reference frontend uses HTK.
+  bool use_htk    = false;
 };
 
 class WhisperMelExtractor {

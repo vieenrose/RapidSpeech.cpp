@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
+#include "frontend/qwen3_mel.h"   // proven HTK mel frontend (matches the reference engine)
 
 #include <algorithm>
 #include <cmath>
@@ -76,8 +77,10 @@ bool Qwen3ASRModel::MapEncoderTensors(
 
   weights_.conv_out_w   = find_req(tensors, "a.conv_out.weight");
   weights_.conv_out_b   = find_opt(tensors, "a.conv_out.bias");
-  weights_.position_embd = find_req(tensors, "a.position_embd.weight");
-  if (!weights_.conv_out_w || !weights_.position_embd) return false;
+  // The real Qwen3-ASR audio tower has NO learned position table — positions are
+  // computed (per-chunk sinusoidal) at encode time. Keep optional for older dumps.
+  weights_.position_embd = find_opt(tensors, "a.position_embd.weight");
+  if (!weights_.conv_out_w) return false;
 
   weights_.post_norm_w = find_opt(tensors, "a.post_norm.weight");
   weights_.post_norm_b = find_opt(tensors, "a.post_norm.bias");
@@ -150,10 +153,16 @@ bool Qwen3ASRModel::LoadLLM(
     return false;
   }
   auto &vocab = const_cast<llm_vocab &>(llm_model_->vocab());
-  vocab.load_qwen3_special_tokens();
-
+  // Capture the audio delimiter IDs BEFORE load_qwen3_special_tokens(): that call
+  // re-labels 151669/151670 as <|startofspeech|>/<|endofspeech|>, and the lazy
+  // build_token_map() rebuilds the reverse map from the clobbered text, which
+  // would hide the real <|audio_start|>/<|audio_end|> tokens from find_token_id.
   audio_start_id_ = vocab.find_token_id("<|audio_start|>");
   audio_end_id_   = vocab.find_token_id("<|audio_end|>");
+  vocab.load_qwen3_special_tokens();
+  // Re-register the audio delimiters so prompt tokenize() + the reverse map keep them.
+  if (audio_start_id_ >= 0) vocab.add_special_token("<|audio_start|>", audio_start_id_);
+  if (audio_end_id_   >= 0) vocab.add_special_token("<|audio_end|>",   audio_end_id_);
 
   RS_LOG_INFO("Qwen3ASR LLM loaded: layers=%d, embd=%d, heads=%d, vocab=%d, "
               "audio_start=%d, audio_end=%d",
@@ -175,6 +184,9 @@ bool Qwen3ASRModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   }
   gguf_context *ctx_gguf  = ctx->ctx_gguf;
   ggml_context *gguf_data = ctx->gguf_data;
+  // CPU-only scheduler for the batch-1 decode loop (null in CPU-only builds —
+  // then the decode falls back to the main sched, which is already CPU there).
+  decode_sched_ = ctx->sched_cpu;
 
   auto get_i32 = [&](const char *key, int32_t def) -> int32_t {
     int idx = gguf_find_key(ctx_gguf, key);
@@ -242,6 +254,7 @@ bool Qwen3ASRModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   mel_cfg.n_mels      = hparams_.n_mels;
   mel_cfg.f_min       = 0.0f;
   mel_cfg.f_max       = (float)hparams_.sample_rate / 2.0f;
+  mel_cfg.use_htk     = (getenv("RS_MEL_HTK") != nullptr);  // Slaney (matches WhisperFeatureExtractor); RS_MEL_HTK=1 to test HTK
   mel_cfg.chunk_size  = hparams_.chunk_size;
   mel_              = std::make_unique<WhisperMelExtractor>(mel_cfg);
 
@@ -349,7 +362,7 @@ struct EncGraphHelper {
 
       cur = ggml_mul_mat(ctx, L.ffn_up_w, cur);
       if (L.ffn_up_b) cur = ggml_add(ctx, cur, L.ffn_up_b);
-      cur = ggml_gelu_erf(ctx, cur);
+      cur = ggml_gelu(ctx, cur);
       cur = ggml_mul_mat(ctx, L.ffn_dn_w, cur);
       if (L.ffn_dn_b) cur = ggml_add(ctx, cur, L.ffn_dn_b);
 
@@ -406,7 +419,7 @@ bool Qwen3ASRModel::RunEncoder(const std::vector<float> &mel_features,
       x = ggml_add(ctx0, x,
                    ggml_reshape_4d(ctx0, kb, 1, 1, x->ne[2], 1));
     }
-    return ggml_gelu_erf(ctx0, x);
+    return ggml_gelu(ctx0, x);
   };
   inp = conv_block(inp, weights_.conv2d_w[0], weights_.conv2d_b[0]);
   inp = conv_block(inp, weights_.conv2d_w[1], weights_.conv2d_b[1]);
@@ -427,17 +440,17 @@ bool Qwen3ASRModel::RunEncoder(const std::vector<float> &mel_features,
   const int tokens_per_chunk = n_pos / n_chunks;        // = OW = 13 expected
   hparams_.tokens_per_chunk = tokens_per_chunk;
 
-  // 6. Per-chunk position embedding: take first `tokens_per_chunk` rows of
-  //    the position table and repeat across chunks.
+  // 6. Per-chunk sinusoidal position embedding. The real model computes it
+  //    (no learned table); positions reset every chunk, so we build a
+  //    [d_model, tokens_per_chunk] sinusoidal input and repeat it across chunks.
+  ggml_tensor *inp_pos = ggml_new_tensor_2d(
+      ctx0, GGML_TYPE_F32, hparams_.enc_d_model, tokens_per_chunk);
+  ggml_set_name(inp_pos, "inp_pos");
+  ggml_set_input(inp_pos);
   {
-    ggml_tensor *pos_tmp = ggml_view_2d(
-        ctx0, weights_.position_embd,
-        weights_.position_embd->ne[0], tokens_per_chunk,
-        weights_.position_embd->nb[1], 0);
     ggml_tensor *tgt =
-        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                           weights_.position_embd->ne[0], n_pos);
-    inp = ggml_add(ctx0, inp, ggml_repeat(ctx0, pos_tmp, tgt));
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.enc_d_model, n_pos);
+    inp = ggml_add(ctx0, inp, ggml_repeat(ctx0, inp_pos, tgt));
   }
 
   // 7. Transformer encoder.
@@ -457,7 +470,7 @@ bool Qwen3ASRModel::RunEncoder(const std::vector<float> &mel_features,
   // 9. 2-layer MLP projector -> LLM hidden dim.
   cur = ggml_mul_mat(ctx0, weights_.mm_1_w, cur);
   if (weights_.mm_1_b) cur = ggml_add(ctx0, cur, weights_.mm_1_b);
-  cur = ggml_gelu_erf(ctx0, cur);
+  cur = ggml_gelu(ctx0, cur);
   cur = ggml_mul_mat(ctx0, weights_.mm_2_w, cur);
   if (weights_.mm_2_b) cur = ggml_add(ctx0, cur, weights_.mm_2_b);
   // cur: [mm_out_dim, n_pos]
@@ -472,6 +485,22 @@ bool Qwen3ASRModel::RunEncoder(const std::vector<float> &mel_features,
   }
   ggml_backend_tensor_set(inp_mel, mel_features.data(), 0,
                           mel_features.size() * sizeof(float));
+  // Upload the computed per-chunk sinusoidal position embedding (matches the
+  // reference compute_sinusoidal_pe: half=d/2, div_term=exp(-ln(1e4)*i/(half-1))).
+  {
+    const int d = hparams_.enc_d_model, half = d / 2, tpc = tokens_per_chunk;
+    std::vector<float> pe((size_t)d * tpc, 0.0f);
+    for (int p = 0; p < tpc; ++p) {
+      for (int i = 0; i < half; ++i) {
+        float div_term = std::exp(-std::log(10000.0f) * i / (half - 1));
+        float angle = (float)p * div_term;
+        pe[(size_t)p * d + i]        = std::sin(angle);
+        pe[(size_t)p * d + half + i] = std::cos(angle);
+      }
+    }
+    ggml_tensor *pe_t = ggml_graph_get_tensor(gf, "inp_pos");
+    ggml_backend_tensor_set(pe_t, pe.data(), 0, pe.size() * sizeof(float));
+  }
   if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("Qwen3ASR: encoder graph compute failed");
     ggml_free(ctx0);
@@ -484,6 +513,13 @@ bool Qwen3ASRModel::RunEncoder(const std::vector<float> &mel_features,
   st.n_embd  = n_embd;
   ggml_backend_tensor_get(cur, st.audio_embeds.data(), 0,
                           (size_t)n_embd * n_pos * sizeof(float));
+
+  if (const char* dp = getenv("QWEN_DUMP_EMB")) {
+    FILE* fe = fopen(dp, "wb");
+    if (fe) { int32_t d[2]={n_pos,n_embd}; fwrite(d,sizeof(int32_t),2,fe);
+      fwrite(st.audio_embeds.data(),sizeof(float),(size_t)n_embd*n_pos,fe); fclose(fe);
+      RS_LOG_INFO("dumped audio_embeds [%d,%d] -> %s", n_pos, n_embd, dp); }
+  }
 
   RS_LOG_INFO("Qwen3ASR encoder: n_chunks=%d tokens/chunk=%d T_audio=%d n_embd=%d",
               n_chunks, tokens_per_chunk, n_pos, n_embd);
@@ -500,11 +536,35 @@ bool Qwen3ASRModel::Encode(const std::vector<float> &input_frames,
     return false;
   }
   // input_frames is raw PCM because meta_.use_external_frontend = true.
-  std::vector<float> mel;
-  int n_frames_padded = mel_->Compute(input_frames, mel);
-  if (n_frames_padded == 0) {
-    RS_LOG_WARN("Qwen3ASR::Encode: empty mel features");
+  // Use the PROVEN HTK mel frontend (qwen3_mel) — the scaffold's whisper_mel STFT
+  // did not match torch.stft (~14x scaling + structural divergence). This is the
+  // exact mel the model was validated against.
+  static MelFilters s_mel_filters; static bool s_mf_init = false;
+  if (!s_mf_init) {
+    generate_mel_filters(s_mel_filters, hparams_.n_mels, hparams_.n_fft, hparams_.sample_rate);
+    s_mf_init = true;
+  }
+  MelSpectrogram ms;
+  if (!log_mel_spectrogram(input_frames.data(), (int)input_frames.size(),
+                           s_mel_filters, ms, 4) || ms.n_len <= 0) {
+    RS_LOG_WARN("Qwen3ASR::Encode: mel computation failed");
     return false;
+  }
+  // Pad to a multiple of chunk_size and lay out as [n_mel * n_frames_padded]
+  // (frame-fast), matching RunEncoder's inp_mel expectation.
+  const int chunk = hparams_.chunk_size;
+  const int n_frames_padded = ((ms.n_len + chunk - 1) / chunk) * chunk;
+  float floor_v = 1e30f;
+  for (float v : ms.data) if (v < floor_v) floor_v = v;
+  std::vector<float> mel((size_t)hparams_.n_mels * n_frames_padded, floor_v);
+  for (int j = 0; j < hparams_.n_mels; ++j)
+    for (int i = 0; i < ms.n_len; ++i)
+      mel[(size_t)j * n_frames_padded + i] = ms.data[(size_t)j * ms.n_len + i];
+  if (const char* dp = getenv("QWEN_DUMP_MEL")) {
+    FILE* fm = fopen(dp, "wb");
+    if (fm) { int32_t d[2]={(int32_t)hparams_.n_mels, n_frames_padded};
+      fwrite(d,sizeof(int32_t),2,fm); fwrite(mel.data(),sizeof(float),mel.size(),fm); fclose(fm);
+      RS_LOG_INFO("dumped mel [%d,%d] (%zu floats) -> %s", d[0], d[1], mel.size(), dp); }
   }
   return RunEncoder(mel, n_frames_padded, state, sched);
 }
@@ -531,15 +591,16 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // Rebuild prompt token streams when the user prompt changes.
   if (cached_prefix_tokens_.empty() ||
       cached_user_input_prompt_ != user_input_prompt_) {
+    // Minimal Qwen3-ASR chat template — matches the proven reference engine:
+    // EMPTY system message, bare audio, and NO instruction text after the audio.
+    // (The verbose "You are a speech recognition model" + user prompt is
+    // off-distribution for this checkpoint and yields empty/garbled output.)
     const std::string system_msg =
-        "<|im_start|>system\nYou are a speech recognition model. "
-        "Transcribe the user's audio into text.<|im_end|>\n"
-        "<|im_start|>user\n";
+        "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n";
     const std::string before_audio =
         (audio_start_id_ >= 0 ? std::string("<|audio_start|>") : std::string());
     const std::string after_audio_with_prompt =
-        (audio_end_id_ >= 0 ? std::string("<|audio_end|>\n") : std::string("\n")) +
-        user_input_prompt_ +
+        (audio_end_id_ >= 0 ? std::string("<|audio_end|>") : std::string()) +
         "<|im_end|>\n<|im_start|>assistant\n";
 
     cached_prefix_tokens_ =
@@ -564,6 +625,11 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   cparams.n_ubatch       = total_T;
   cparams.n_threads      = 4;
   cparams.n_threads_batch = 4;
+  // Jetson Nano gen1 (sm_53 Maxwell) has no flash-attention CUDA kernel, and the
+  // batch-1 decode would violate GGML_KQ_MASK_PAD. The manual multi-head path
+  // (build_multi_head_attn) is numerically correct on every backend, so disable
+  // flash-attn for Qwen3-ASR. Set RS_CUDA_FA=1 to force-enable on Ampere+ desktops.
+  cparams.flash_attn = (getenv("RS_CUDA_FA") != nullptr);
   llm_graph_builder_ =
       std::make_unique<llm_build_qwen3>(*llm_model_, cparams, sched);
 
@@ -715,7 +781,18 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   ggml_free(ctx_llm);
   ggml_backend_sched_reset(sched);
 
-  // -------- (c) GPU-persistent KV buffers & gallocr pre-warm --------
+  // -------- (c) persistent KV buffers & gallocr pre-warm --------
+  // The autoregressive decode runs on the CPU-only scheduler when available
+  // (batch-1 is ~3.7x faster on the A57 than per-token GPU weight uploads on
+  // Maxwell sm_53). Falls back to the main `sched` (already CPU in CPU-only
+  // builds). The CPU decode sched can ONLY be used when the LLM weights are
+  // CPU-resident — rs_context arranges that unless RS_QWEN3ASR_GPU_WEIGHTS=1,
+  // so that flag (and RS_QWEN3ASR_GPU_DECODE=1) must keep decode on the GPU
+  // sched, else the CPU sched hits a GPU-resident weight and aborts.
+  const bool gpu_decode = getenv("RS_QWEN3ASR_GPU_DECODE") != nullptr ||
+                          getenv("RS_QWEN3ASR_GPU_WEIGHTS") != nullptr;
+  ggml_backend_sched_t decode_sched =
+      (decode_sched_ && !gpu_decode) ? decode_sched_ : sched;
   const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
@@ -736,12 +813,16 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       ggml_set_name(gpu_kv_v_vec[il],
                     ("qwen3asr_kv_v_" + std::to_string(il)).c_str());
     }
+    // Persistent KV lives on the CPU backend so the CPU decode scheduler can
+    // read/write it in place. `sched`'s last backend is CPU (sched invariant),
+    // and `decode_sched_` is that same CPU backend — so this is correct for both
+    // the split (GPU prefill + CPU decode) and the CPU-only build.
     int n_backends = ggml_backend_sched_get_n_backends(sched);
-    ggml_backend_t gpu_backend =
+    ggml_backend_t kv_backend =
         ggml_backend_sched_get_backend(sched, n_backends - 1);
-    kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
+    kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, kv_backend);
     if (!kv_gpu_buf) {
-      RS_LOG_ERR("Qwen3ASR: failed to allocate GPU KV buffers");
+      RS_LOG_ERR("Qwen3ASR: failed to allocate persistent KV buffers");
     }
     for (int il = 0; il < n_layer; ++il) {
       size_t bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
@@ -766,10 +847,10 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     int32_t dummy = 0;
     auto warmup = llm_graph_builder_->build_graph(
         &dummy, 1, nullptr, &warmup_pos, &warmup_opts);
-    if (warmup) ggml_backend_sched_reserve(sched, warmup->get_graph());
+    if (warmup) ggml_backend_sched_reserve(decode_sched, warmup->get_graph());
   }
 
-  // -------- (d) autoregressive decode --------
+  // -------- (d) autoregressive decode (on the CPU scheduler) --------
   const int32_t eos_token_id = llm_model_->vocab().token_eos();
   std::vector<float> kv_stage_k(kv_dim), kv_stage_v(kv_dim);
   int consecutive_same_token = 0, alternating_count = 0;
@@ -797,7 +878,7 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       RS_LOG_ERR("Qwen3ASR: decode build failed at step %d", step);
       break;
     }
-    if (!ggml_backend_sched_alloc_graph(sched, dec->get_graph())) {
+    if (!ggml_backend_sched_alloc_graph(decode_sched, dec->get_graph())) {
       RS_LOG_ERR("Qwen3ASR: decode alloc failed at step %d", step);
       break;
     }
@@ -812,7 +893,7 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
     }
-    if (ggml_backend_sched_graph_compute(sched, dec->get_graph()) !=
+    if (ggml_backend_sched_graph_compute(decode_sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Qwen3ASR: decode compute failed at step %d", step);
       break;
@@ -878,23 +959,23 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     n_cached_tokens_++;
 
     if (next_token == eos_token_id) {
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     if (consecutive_same_token >= MAX_CONSECUTIVE_REPEAT) {
       RS_LOG_WARN("Qwen3ASR: token %d repeated %d times — stopping",
                   next_token, consecutive_same_token);
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     if (alternating_count >= MAX_ALTERNATING_REPEAT) {
       RS_LOG_WARN("Qwen3ASR: alternating pattern at step %d — stopping", step);
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     st.token_ids.push_back(next_token);
     best_token = next_token;
-    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_reset(decode_sched);
     (void)debug_decode;
   }
 
