@@ -244,12 +244,15 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   bool prefer_cpu = (arch == "openvoice2" || arch == "matcha-tts");
 #endif
 
-  // Qwen3-ASR keeps the GPU scheduler (for the parallel encoder + LLM prefill)
-  // but places its WEIGHTS on the CPU backend: the autoregressive decode loop
-  // runs on ctx->sched_cpu, which reads the CPU-resident weights in place
-  // (batch-1 is ~3.7x faster on the A57 than re-uploading weights to the GPU
-  // per token on Maxwell sm_53). Disable with RS_QWEN3ASR_GPU_WEIGHTS=1.
-  bool cpu_weights = (arch == "Qwen3ASR" && getenv("RS_QWEN3ASR_GPU_WEIGHTS") == nullptr);
+  // Qwen3-ASR: by default keep ALL weights on the GPU (encoder + LLM prefill +
+  // decode all on the GPU scheduler). Measured on Jetson Nano gen1 (sm_53): all-GPU
+  // gives RTF ~1.44, whereas placing weights on CPU to run the decode on a CPU
+  // scheduler BACKFIRES here — RapidSpeech uses a single weight buffer, so CPU
+  // weights also put the 185M encoder on CPU and op_offload re-uploads it per op
+  // (encoder 5s -> 16s). The CPU-decode split only wins with per-component weight
+  // buffers (as in the standalone engine). Opt in for experiments with
+  // RS_QWEN3ASR_CPU_WEIGHTS=1 (puts weights on CPU + runs decode on sched_cpu).
+  bool cpu_weights = (arch == "Qwen3ASR" && getenv("RS_QWEN3ASR_CPU_WEIGHTS") != nullptr);
 
   // 3. Hardware detection and backend initialization
   if (!ctx->init_backend(prefer_cpu)) {

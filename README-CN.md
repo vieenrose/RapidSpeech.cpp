@@ -50,7 +50,7 @@
 **语音识别（ASR）**
 - [x] SenseVoice-small
 - [x] FunASR-nano
-- [x] Qwen3-ASR **音频编码器 + Qwen3-0.6B 大模型解码器**（Whisper 风格 128 维 HTK 梅尔前端，8 倍下采样 conv2d 音频塔 + 18 层 Transformer，2 层投影接入 28 层 Qwen3 LLM；贪心自回归解码；原生繁体中文 + 标点，支持中英混说）。已针对 Jetson Nano gen1 优化：cuFFT 批量梅尔 + sm_53 关闭 flash-attn。GGUF：[Luigi/qwen3-asr-0.6b-rapidspeech-gguf](https://huggingface.co/Luigi/qwen3-asr-0.6b-rapidspeech-gguf)；使用 `scripts/convert_qwen3_asr_to_gguf.py` 从本地 `Qwen/Qwen3-ASR-0.6B` 权重转换。
+- [x] Qwen3-ASR **音频编码器 + Qwen3-0.6B 大模型解码器**（Whisper 风格 128 维 HTK 梅尔前端，8 倍下采样 conv2d 音频塔 + 18 层 Transformer，2 层投影接入 28 层 Qwen3 LLM；贪心自回归解码；原生繁体中文 + 标点，支持中英混说）。已针对 Jetson Nano gen1（Tegra X1, sm_53, CUDA 10.2）优化：cuFFT 批量梅尔 + sm_53 关闭 flash-attn + 权重全部放 GPU。13.5s 片段实测 RTF≈1.3（q8_0，转写与参考引擎一致）。GGUF：[Luigi/qwen3-asr-0.6b-rapidspeech-gguf](https://huggingface.co/Luigi/qwen3-asr-0.6b-rapidspeech-gguf)；使用 `scripts/convert_qwen3_asr_to_gguf.py` 从本地 `Qwen/Qwen3-ASR-0.6B` 权重转换。
 - [ ] FireRedASR2
 
 **语音合成（TTS）**

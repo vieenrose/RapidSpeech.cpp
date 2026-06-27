@@ -782,17 +782,15 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   ggml_backend_sched_reset(sched);
 
   // -------- (c) persistent KV buffers & gallocr pre-warm --------
-  // The autoregressive decode runs on the CPU-only scheduler when available
-  // (batch-1 is ~3.7x faster on the A57 than per-token GPU weight uploads on
-  // Maxwell sm_53). Falls back to the main `sched` (already CPU in CPU-only
-  // builds). The CPU decode sched can ONLY be used when the LLM weights are
-  // CPU-resident — rs_context arranges that unless RS_QWEN3ASR_GPU_WEIGHTS=1,
-  // so that flag (and RS_QWEN3ASR_GPU_DECODE=1) must keep decode on the GPU
-  // sched, else the CPU sched hits a GPU-resident weight and aborts.
-  const bool gpu_decode = getenv("RS_QWEN3ASR_GPU_DECODE") != nullptr ||
-                          getenv("RS_QWEN3ASR_GPU_WEIGHTS") != nullptr;
+  // Decode scheduler. DEFAULT = the main (GPU) sched: on Jetson Nano gen1 all-GPU
+  // is fastest (RTF ~1.44) because RapidSpeech's single weight buffer means CPU
+  // weights also drag the encoder onto op_offload. The CPU-decode split (sched_cpu)
+  // only helps when weights are CPU-resident, which is opt-in via
+  // RS_QWEN3ASR_CPU_WEIGHTS=1 — and the CPU sched can ONLY be used then (else it
+  // would hit a GPU-resident weight and abort). So gate decode_sched on that flag.
+  const bool cpu_decode = getenv("RS_QWEN3ASR_CPU_WEIGHTS") != nullptr;
   ggml_backend_sched_t decode_sched =
-      (decode_sched_ && !gpu_decode) ? decode_sched_ : sched;
+      (cpu_decode && decode_sched_) ? decode_sched_ : sched;
   const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
