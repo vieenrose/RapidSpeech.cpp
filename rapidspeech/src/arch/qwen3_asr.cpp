@@ -782,15 +782,20 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   ggml_backend_sched_reset(sched);
 
   // -------- (c) persistent KV buffers & gallocr pre-warm --------
-  // Decode scheduler. DEFAULT = the main (GPU) sched: on Jetson Nano gen1 all-GPU
-  // is fastest (RTF ~1.44) because RapidSpeech's single weight buffer means CPU
-  // weights also drag the encoder onto op_offload. The CPU-decode split (sched_cpu)
-  // only helps when weights are CPU-resident, which is opt-in via
-  // RS_QWEN3ASR_CPU_WEIGHTS=1 — and the CPU sched can ONLY be used then (else it
-  // would hit a GPU-resident weight and abort). So gate decode_sched on that flag.
-  const bool cpu_decode = getenv("RS_QWEN3ASR_CPU_WEIGHTS") != nullptr;
-  ggml_backend_sched_t decode_sched =
-      (cpu_decode && decode_sched_) ? decode_sched_ : sched;
+  // Decode scheduler. By DEFAULT the LLM weights are CPU-resident (per-component
+  // split in rs_context: encoder on GPU, LLM on CPU), so the batch-1 decode runs
+  // on the CPU scheduler in-place (~195ms/tok on the A57, vs ~460ms/tok on the
+  // Maxwell GPU). Prefill still runs on the GPU `sched` (op_offload copies the LLM
+  // weights up once). Only RS_QWEN3ASR_GPU_WEIGHTS=1 keeps weights+decode on GPU
+  // (then the CPU sched must NOT be used — it would hit a GPU-resident weight).
+  // CPU decode only in the opt-in per-component split (LLM weights then CPU-resident)
+  // or the all-CPU mode. Default keeps decode on the GPU sched (all weights on GPU).
+  const bool cpu_decode = decode_sched_ &&
+                          (getenv("RS_QWEN3ASR_SPLIT") != nullptr ||
+                           getenv("RS_QWEN3ASR_CPU_WEIGHTS") != nullptr);
+  ggml_backend_sched_t decode_sched = cpu_decode ? decode_sched_ : sched;
+  RS_LOG_INFO("Qwen3ASR decode on %s scheduler",
+              cpu_decode ? "CPU(sched_cpu)" : "GPU(sched)");
   const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);

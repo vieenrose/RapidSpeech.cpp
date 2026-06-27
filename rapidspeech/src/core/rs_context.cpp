@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstring>
 #include "core/rs_context.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -196,6 +197,8 @@ bool rs_context_t::init_backend(bool prefer_cpu) {
     // at batch-1 on Maxwell sm_53) while prefill/encode use the GPU `sched`.
     ggml_backend_t cpu_only[1] = {backends[(int)backends.size() - 1]};
     sched_cpu = ggml_backend_sched_new(cpu_only, nullptr, 1, 16384, false, false);
+    RS_LOG_INFO("CPU-only decode scheduler (sched_cpu) created: %s",
+                sched_cpu ? "OK" : "FAILED(null)");
   } else {
     int cpu_idx = (int)backends.size() - 1;
     sched = ggml_backend_sched_new(&backends[cpu_idx], nullptr, 1, 16384, false,
@@ -261,14 +264,63 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   }
 
   // 4. Allocate physical memory buffers on the appropriate backend.
-  //    CPU-preferring models (and CPU-weights models like Qwen3-ASR) get CPU
-  //    weights to avoid cross-device copies in the decode loop.
-  int weight_backend_idx =
-      (prefer_cpu || cpu_weights) ? (int)ctx->backends.size() - 1 : 0;
-  ggml_backend_buffer_t weight_buffer =
-      ggml_backend_alloc_ctx_tensors(ctx->gguf_data, ctx->backends[weight_backend_idx]);
-  if (weight_buffer) {
-    ctx->weight_buffers.push_back(weight_buffer);
+  //    Qwen3-ASR DEFAULT (GPU present): ALL weights on GPU (encoder + LLM). On
+  //    Jetson Nano gen1 (sm_53) this is the fastest config measured (RTF ~1.3):
+  //    GPU-persistent decode is ~460ms/tok. The PER-COMPONENT split (encoder GPU
+  //    + LLM CPU + CPU decode) is correct and the standalone engine reaches
+  //    195ms/tok with it, but RapidSpeech's per-token LLM decode path is ~4x
+  //    slower on CPU (~790ms/tok, per-token graph-build/alloc overhead), so the
+  //    split is currently a LOSS here (RTF ~2.1). Keep it opt-in for when that
+  //    decode path is optimized or on hardware where CPU decode wins.
+  //    Opt-in: RS_QWEN3ASR_SPLIT=1 (per-component). RS_QWEN3ASR_CPU_WEIGHTS=1 (all-CPU).
+  const bool have_gpu = (int)ctx->backends.size() > 1;
+  const bool split_weights = (arch == "Qwen3ASR" && have_gpu &&
+                              getenv("RS_QWEN3ASR_SPLIT") != nullptr);
+  auto is_encoder_tensor = [](const char *nm) {
+    return nm && (strncmp(nm, "a.", 2) == 0 || strncmp(nm, "mm.", 3) == 0);
+  };
+  if (split_weights) {
+    ggml_backend_t gpu_be = ctx->backends[0];
+    ggml_backend_t cpu_be = ctx->backends[(int)ctx->backends.size() - 1];
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_be);
+    const size_t align = ggml_backend_buft_get_alignment(gpu_buft);
+    // size the GPU (encoder/projector) group
+    size_t gpu_size = 0; int gpu_n = 0;
+    for (struct ggml_tensor *t = ggml_get_first_tensor(ctx->gguf_data); t;
+         t = ggml_get_next_tensor(ctx->gguf_data, t)) {
+      if (is_encoder_tensor(t->name)) {
+        gpu_size += ((ggml_nbytes(t) + align - 1) / align) * align;
+        gpu_n++;
+      }
+    }
+    // Generous headroom: tallocr re-aligns each tensor's offset, so reserve an
+    // extra `align` per tensor plus 1 MiB to avoid edge-case overflow.
+    ggml_backend_buffer_t gpu_buf = ggml_backend_buft_alloc_buffer(
+        gpu_buft, gpu_size + (size_t)(gpu_n + 8) * align + (1u << 20));
+    if (!gpu_buf) {
+      RS_LOG_ERR("Qwen3ASR: failed to alloc GPU encoder buffer (%zu B)", gpu_size);
+      return nullptr;
+    }
+    struct ggml_tallocr ta = ggml_tallocr_new(gpu_buf);
+    for (struct ggml_tensor *t = ggml_get_first_tensor(ctx->gguf_data); t;
+         t = ggml_get_next_tensor(ctx->gguf_data, t)) {
+      if (is_encoder_tensor(t->name)) ggml_tallocr_alloc(&ta, t);
+    }
+    ctx->weight_buffers.push_back(gpu_buf);
+    // remaining tensors (the LLM, still NULL-buffer) -> CPU
+    ggml_backend_buffer_t cpu_buf =
+        ggml_backend_alloc_ctx_tensors(ctx->gguf_data, cpu_be);
+    if (cpu_buf) ctx->weight_buffers.push_back(cpu_buf);
+    RS_LOG_INFO("Qwen3ASR per-component weights: %d encoder/proj tensors on GPU "
+                "(%zu MB), LLM on CPU (decode runs on CPU sched)",
+                gpu_n, gpu_size >> 20);
+  } else {
+    // Single-buffer path (all other models; or Qwen3-ASR all-GPU/all-CPU override).
+    int weight_backend_idx =
+        (prefer_cpu || cpu_weights) ? (int)ctx->backends.size() - 1 : 0;
+    ggml_backend_buffer_t weight_buffer =
+        ggml_backend_alloc_ctx_tensors(ctx->gguf_data, ctx->backends[weight_backend_idx]);
+    if (weight_buffer) ctx->weight_buffers.push_back(weight_buffer);
   }
 
   // 5. Load tensor data from the binary blob in the file
