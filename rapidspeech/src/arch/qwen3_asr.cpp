@@ -7,6 +7,7 @@
 #include "frontend/qwen3_mel.h"   // proven HTK mel frontend (matches the reference engine)
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -728,12 +729,18 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   if (auto t = result->get_input_tensor("causal_mask")) {
     result->set_causal_mask(t, total_T, 0);
   }
+  const bool dprof0 = getenv("RS_QWEN3ASR_DECODE_PROFILE") != nullptr;
+  auto pf0 = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
       GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("Qwen3ASR: LLM prefill compute failed");
     ggml_free(ctx_llm);
     return false;
   }
+  if (dprof0)
+    RS_LOG_INFO("prefill compute (%d tokens): %.1f ms", total_T,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - pf0).count());
 
   ggml_tensor *logits = result->get_logits();
   if (!logits) {
@@ -850,7 +857,12 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     int32_t dummy = 0;
     auto warmup = llm_graph_builder_->build_graph(
         &dummy, 1, nullptr, &warmup_pos, &warmup_opts);
+    auto wu0 = std::chrono::steady_clock::now();
     if (warmup) ggml_backend_sched_reserve(decode_sched, warmup->get_graph());
+    if (dprof0)
+      RS_LOG_INFO("warmup sched_reserve: %.1f ms",
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - wu0).count());
   }
 
   // -------- (d) autoregressive decode (on the CPU scheduler) --------
@@ -861,6 +873,16 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr float REPETITION_PENALTY = 1.10f;
   constexpr int PENALTY_WINDOW = 64;
+
+  // Per-token timing diag (RS_QWEN3ASR_DECODE_PROFILE=1): isolate build/alloc/
+  // compute/kv-stage to find the per-token bottleneck vs the standalone engine.
+  const bool dprof = getenv("RS_QWEN3ASR_DECODE_PROFILE") != nullptr;
+  double ms_build = 0, ms_alloc = 0, ms_comp = 0, ms_kv = 0, ms_post = 0; int n_steps = 0;
+  using clk = std::chrono::steady_clock;
+  auto NOW = [] { return clk::now(); };
+  auto MS = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
 
   for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
@@ -875,8 +897,10 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     dec_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v        = gpu_kv_v_vec.data();
 
+    auto t0 = NOW();
     auto dec = llm_graph_builder_->build_graph(&best_token, 1, nullptr,
                                               &decode_pos, &dec_opts);
+    auto t1 = NOW();
     if (!dec) {
       RS_LOG_ERR("Qwen3ASR: decode build failed at step %d", step);
       break;
@@ -885,6 +909,7 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       RS_LOG_ERR("Qwen3ASR: decode alloc failed at step %d", step);
       break;
     }
+    auto t2 = NOW();
     if (auto t = dec->get_input_tensor("inp_tokens")) {
       ggml_backend_tensor_set(t, &best_token, 0, sizeof(int32_t));
     }
@@ -896,11 +921,15 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
     }
+    auto t3 = NOW();
     if (ggml_backend_sched_graph_compute(decode_sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Qwen3ASR: decode compute failed at step %d", step);
       break;
     }
+    auto t4 = NOW();
+    if (dprof) { ms_build += MS(t0, t1); ms_alloc += MS(t1, t2);
+                 ms_comp += MS(t3, t4); n_steps++; }
     ggml_tensor *dec_logits = dec->get_logits();
     if (!dec_logits) {
       RS_LOG_ERR("Qwen3ASR: no logits at step %d", step);
@@ -948,6 +977,8 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
 
     // Stage new KV column to host + persistent GPU buffer.
+    auto t5 = NOW();
+    if (dprof) ms_post += MS(t4, t5);  // logits get + argmax + penalty
     for (int il = 0; il < n_layer; ++il) {
       ggml_tensor *k_out = dec->get_kv_output_k(il);
       ggml_tensor *v_out = dec->get_kv_output_v(il);
@@ -959,6 +990,7 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(), off, new_bytes);
       ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(), off, new_bytes);
     }
+    if (dprof) ms_kv += MS(t5, NOW());
     n_cached_tokens_++;
 
     if (next_token == eos_token_id) {
@@ -982,6 +1014,12 @@ bool Qwen3ASRModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     (void)debug_decode;
   }
 
+  if (dprof && n_steps > 0) {
+    RS_LOG_INFO("decode per-token (%d steps, ms/tok): build=%.1f alloc=%.1f "
+                "compute=%.1f post=%.1f kv_stage=%.1f", n_steps, ms_build / n_steps,
+                ms_alloc / n_steps, ms_comp / n_steps, ms_post / n_steps,
+                ms_kv / n_steps);
+  }
   if (kv_gpu_buf) ggml_backend_buffer_free(kv_gpu_buf);
   if (ctx_kv) ggml_free(ctx_kv);
 
