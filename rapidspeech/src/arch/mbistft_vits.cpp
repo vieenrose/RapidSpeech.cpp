@@ -158,18 +158,36 @@ struct ggml_tensor* mbv_linear_ct(struct ggml_context* ctx, struct ggml_tensor* 
   return out;
 }
 
-// Conv1d on [T,C] data (all-F32 im2col path; ggml_conv_1d would round the
-// im2col buffer to F16, hurting parity).  Returns [OL, OC].
+// im2col dtype for the heavy decoder / flow convs (Lever 1: F16 im2col makes the
+// mul_mat's src0 (the unfolded activations) F16, which is the operand ggml's
+// use_fp16 gate keys on — with RS_GEMM_FP16=1 on sm_53 the conv GEMMs then run
+// the FP16 cuBLAS path (~2x on Maxwell) instead of FP32.  Env-gated, default F32.
+enum ggml_type mbv_im_dec() {
+  static enum ggml_type t = getenv("MBISTFT_F16_DEC") ? GGML_TYPE_F16 : GGML_TYPE_F32;
+  return t;
+}
+enum ggml_type mbv_im_flow() {
+  static enum ggml_type t = getenv("MBISTFT_F16_FLOW") ? GGML_TYPE_F16 : GGML_TYPE_F32;
+  return t;
+}
+
+// Conv1d on [T,C] data.  Returns [OL, OC].  im_type F32 (exact) or F16 (rounds
+// the unfolded activations; ggml_im2col needs its kernel arg to match the dst
+// dtype, so pass an F16 cast of w for shape — the mul_mat still supplies the
+// full-precision F32 weight in src1).
 struct ggml_tensor* mbv_conv1d_tc(struct ggml_context* ctx, struct ggml_tensor* x,
                                   struct ggml_tensor* w, struct ggml_tensor* b,
-                                  int pad, int dil) {
+                                  int pad, int dil,
+                                  enum ggml_type im_type = GGML_TYPE_F32) {
   const int64_t T   = x->ne[0];
   const int64_t Cin = x->ne[1];
   const int64_t K   = w->ne[0];
   const int64_t OC  = w->ne[2];
   struct ggml_tensor* x3 = ggml_reshape_3d(ctx, x, T, Cin, 1);
-  struct ggml_tensor* im = ggml_im2col(ctx, w, x3, 1, 0, pad, 0, dil, 0,
-                                       /*is_2D=*/false, GGML_TYPE_F32);  // (Cin*K, OL, 1)
+  struct ggml_tensor* w_im = (im_type == GGML_TYPE_F16)
+      ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
+  struct ggml_tensor* im = ggml_im2col(ctx, w_im, x3, 1, 0, pad, 0, dil, 0,
+                                       /*is_2D=*/false, im_type);  // (Cin*K, OL, 1)
   struct ggml_tensor* out = ggml_mul_mat(
       ctx, ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2]),
       ggml_reshape_2d(ctx, w, K * Cin, OC));  // (OL, OC)
@@ -180,15 +198,18 @@ struct ggml_tensor* mbv_conv1d_tc(struct ggml_context* ctx, struct ggml_tensor* 
 // Conv1d on [C,T] data.  Returns [OC, OL].
 struct ggml_tensor* mbv_conv1d_ct(struct ggml_context* ctx, struct ggml_tensor* x,
                                   struct ggml_tensor* w, struct ggml_tensor* b,
-                                  int pad, int dil) {
+                                  int pad, int dil,
+                                  enum ggml_type im_type = GGML_TYPE_F32) {
   struct ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));  // (T, Cin)
   const int64_t T   = xt->ne[0];
   const int64_t Cin = xt->ne[1];
   const int64_t K   = w->ne[0];
   const int64_t OC  = w->ne[2];
   struct ggml_tensor* x3 = ggml_reshape_3d(ctx, xt, T, Cin, 1);
-  struct ggml_tensor* im = ggml_im2col(ctx, w, x3, 1, 0, pad, 0, dil, 0,
-                                       false, GGML_TYPE_F32);
+  struct ggml_tensor* w_im = (im_type == GGML_TYPE_F16)
+      ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
+  struct ggml_tensor* im = ggml_im2col(ctx, w_im, x3, 1, 0, pad, 0, dil, 0,
+                                       false, im_type);
   struct ggml_tensor* mm = ggml_mul_mat(
       ctx, ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2]),
       ggml_reshape_2d(ctx, w, K * Cin, OC));  // (OL, OC)
@@ -742,7 +763,8 @@ bool MBIstftVitsModel::RunFlowReverse(MBIstftVitsState& s,
       const std::string ip = p + ".enc.in_layers." + std::to_string(j);
       const std::string rp = p + ".enc.res_skip_layers." + std::to_string(j);
       struct ggml_tensor* xin = mbv_conv1d_ct(ctx0, h, Get(ip + ".weight"),
-                                              Get(ip + ".bias"), wn_pad, 1);  // (384, Tf)
+                                              Get(ip + ".bias"), wn_pad, 1,
+                                              mbv_im_flow());  // (384, Tf)
       struct ggml_tensor* ta = ggml_tanh(ctx0, ggml_cont(ctx0,
           ggml_view_2d(ctx0, xin, C, Tf, xin->nb[1], 0)));
       struct ggml_tensor* sa = ggml_sigmoid(ctx0, ggml_cont(ctx0,
@@ -815,7 +837,8 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
   z = ggml_reshape_2d(ctx0, z, Tf, C);
 
   struct ggml_tensor* x = mbv_conv1d_tc(ctx0, z, Get("dec.conv_pre.weight"),
-                                        Get("dec.conv_pre.bias"), 3, 1);  // (Tf, 512)
+                                        Get("dec.conv_pre.bias"), 3, 1,
+                                        mbv_im_dec());  // (Tf, 512)
 
   for (int i = 0; i < (int)hparams_.upsample_rates.size(); i++) {
     x = ggml_leaky_relu(ctx0, x, 0.1f, false);
@@ -849,12 +872,12 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
         xt = mbv_conv1d_tc(ctx0, xt,
             Get(rb + ".convs1." + std::to_string(di) + ".weight"),
             Get(rb + ".convs1." + std::to_string(di) + ".bias"),
-            (rk * dil - dil) / 2, dil);
+            (rk * dil - dil) / 2, dil, mbv_im_dec());
         xt = ggml_leaky_relu(ctx0, xt, 0.1f, false);
         xt = mbv_conv1d_tc(ctx0, xt,
             Get(rb + ".convs2." + std::to_string(di) + ".weight"),
             Get(rb + ".convs2." + std::to_string(di) + ".bias"),
-            (rk - 1) / 2, 1);
+            (rk - 1) / 2, 1, mbv_im_dec());
         rx = ggml_add(ctx0, rx, xt);
       }
       xs = xs ? ggml_add(ctx0, xs, rx) : rx;
@@ -873,7 +896,8 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
   }
 
   x = mbv_conv1d_tc(ctx0, x, Get("dec.subband_conv_post.weight"),
-                    Get("dec.subband_conv_post.bias"), 3, 1);  // (Tp, 72)
+                    Get("dec.subband_conv_post.bias"), 3, 1,
+                    mbv_im_dec());  // (Tp, 72)
   const int64_t Tp = x->ne[0];
 
   // channel c = s*(n_fft+2) + k  ->  view as (Tp, n_fft+2, sub)
