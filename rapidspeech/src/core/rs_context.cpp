@@ -242,12 +242,12 @@ bool rs_context_t::init_backend(bool prefer_cpu) {
   // hurt small-model throughput.
   if (gpu_initialized) {
     sched = ggml_backend_sched_new(backends.data(), nullptr,
-                                   (int)backends.size(), 16384, false, true);
+                                   (int)backends.size(), 65536, false, true);
     RS_LOG_INFO("Scheduler: GPU+CPU (op_offload=true, %d backend(s))",
                 (int)backends.size());
   } else {
     int cpu_idx = (int)backends.size() - 1;
-    sched = ggml_backend_sched_new(&backends[cpu_idx], nullptr, 1, 16384, false,
+    sched = ggml_backend_sched_new(&backends[cpu_idx], nullptr, 1, 65536, false,
                                    false);
     RS_LOG_INFO("Scheduler: CPU-only mode");
   }

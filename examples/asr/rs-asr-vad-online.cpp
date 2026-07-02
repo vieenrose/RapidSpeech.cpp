@@ -45,6 +45,7 @@
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include "../common/rs_cli_utf8.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -781,11 +782,18 @@ static void asr_worker(const std::string &model_path, int n_threads,
   SpeechSegmentQueue::Segment seg;
   while (queue.pop(seg)) {
     float seg_dur = seg.end_s - seg.start_s;
-    if (seg_dur < SHORT_SEG_S) {
+    if (!seg.is_partial && seg_dur < SHORT_SEG_S) {
       // Try to merge with upcoming segments
       SpeechSegmentQueue::Segment next;
       while (queue.try_pop(next)) {
         float gap = next.start_s - seg.end_s;
+        if (next.is_partial || gap < 0.0f) {
+          // Partials and overlapping segments can be supersets of the
+          // current audio.  Do not turn a negative timestamp gap into a huge
+          // vector insert count.
+          queue.push_front(std::move(next));
+          break;
+        }
         if (gap <= MERGE_GAP_S) {
           // Fill gap with zeros and append
           int gap_samples = (int)(gap * SAMPLE_RATE);
@@ -1330,9 +1338,10 @@ int main(int argc, char **argv) {
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
 #endif
+  rs::cli::Utf8Args utf8_args(argc, argv);
 
   OnlineArgs args;
-  if (!parse_args(argc, argv, args))
+  if (!parse_args(utf8_args.argc(), utf8_args.argv(), args))
     return 1;
 
   // Allow enabling verbose mode via env var too (e.g. RS_VERBOSE=1).

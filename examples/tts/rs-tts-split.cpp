@@ -11,6 +11,7 @@
 
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
+#include "../common/rs_cli_utf8.h"
 
 #include <algorithm>
 #include <chrono>
@@ -252,8 +253,10 @@ static bool push_reference(rs_context_t *ctx, const SplitArgs &args) {
 }
 
 int main(int argc, char **argv) {
+    rs::cli::Utf8Args utf8_args(argc, argv);
+
     SplitArgs args;
-    if (!parse_args(argc, argv, args)) return 1;
+    if (!parse_args(utf8_args.argc(), utf8_args.argv(), args)) return 1;
 
     // Split text
     auto sentences = split_sentences(args.text);

@@ -16,6 +16,7 @@
 
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
+#include "../common/rs_cli_utf8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -369,8 +370,10 @@ private:
 };
 
 int main(int argc, char **argv) {
+  rs::cli::Utf8Args utf8_args(argc, argv);
+
   TtsArgs args;
-  if (!parse_args(argc, argv, args)) return 1;
+  if (!parse_args(utf8_args.argc(), utf8_args.argv(), args)) return 1;
 
   LOG_INFO("RapidSpeech.cpp v%s", rs_get_version());
   LOG_INFO("TTS model: %s", args.model_path);

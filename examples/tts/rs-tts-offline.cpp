@@ -26,6 +26,7 @@
 
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
+#include "../common/rs_cli_utf8.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +59,24 @@ struct TtsArgs {
   const char *prompt_tokens_bin = nullptr;     // CosyVoice3 prompt-tokens int32 LE blob
   const char *voice_path = nullptr;            // CosyVoice3 pre-baked voice GGUF
   const char *save_voice_path = nullptr;       // CosyVoice3 voice bake output GGUF
+  const char *bigvgan_gguf = nullptr;          // IndexTTS-2 BigVGAN GGUF
+  const char *gpt_test_dir = nullptr;          // IndexTTS-2 GPT prefill smoke
+  const char *w2v_bert_test_dir = nullptr;     // IndexTTS-2 W2V-BERT smoke
+  const char *s2mel_test_dir = nullptr;        // IndexTTS-2 S2Mel smoke
+  const char *conformer_test_dir = nullptr;    // IndexTTS-2 Conformer smoke
+  const char *sc_hidden_npy = nullptr;         // IndexTTS-2 pre-computed sc_hidden
+  // IndexTTS-2 emotion control.
+  const char *emo_audio_path = nullptr;        // mode 1: emotion reference WAV
+  const char *emo_vector_csv = nullptr;        // mode 2: "a,b,...,h" (8 floats)
+  const char *emo_text = nullptr;              // mode 3: emotion description
+  const char *qwen_emo_gguf = nullptr;         // mode 3: Qwen3 emotion GGUF
+  const char *emo_test_dir = nullptr;          // emovec smoke dump dir
+  float emo_alpha = 1.0f;                       // emo_weight (0..1)
+  bool emo_random = false;                      // random prototype (vector path)
+  int emo_mode = -1;                            // -1 = auto from provided args
+  int s2mel_steps = 0;                          // IndexTTS-2 CFM steps (0 = default)
+  float peak_norm = 0.95f;                       // peak-normalize target (0 = off)
+  float gain = 1.0f;                             // extra linear gain
   int seed = 42;
   int n_steps = 32;
   int n_threads = 4;
@@ -104,6 +123,31 @@ static void print_usage(const char *prog) {
       << "      --dump-step0-logits <path>\n"
       << "                          Debug: dump first speech-token logits "
          "(CosyVoice3-LLM only)\n"
+      << "      --bigvgan-gguf <path>\n"
+      << "                          IndexTTS-2: BigVGAN-v2 GGUF path\n"
+      << "      --gpt-test-dir <dir>\n"
+      << "                          IndexTTS-2: GPT prefill smoke dir\n"
+      << "      --w2v-bert-test-dir <dir>\n"
+      << "                          IndexTTS-2: W2V-BERT smoke dir\n"
+      << "      --s2mel-test-dir <dir>\n"
+      << "                          IndexTTS-2: S2Mel smoke dir\n"
+      << "      --conformer-test-dir <dir>\n"
+      << "                          IndexTTS-2: Conformer smoke dir\n"
+      << "      --sc-hidden-npy <path>\n"
+      << "                          IndexTTS-2: pre-computed sc_hidden.npy\n"
+      << "      --emo-audio <path>   IndexTTS-2: emotion reference WAV (mode 1)\n"
+      << "      --emo-vector <csv>   IndexTTS-2: 8 floats happy,angry,sad,afraid,\n"
+      << "                          disgusted,melancholic,surprised,calm (mode 2)\n"
+      << "      --emo-text <text>    IndexTTS-2: emotion description (mode 3, Qwen)\n"
+      << "      --qwen-emo-gguf <path>\n"
+      << "                          IndexTTS-2: Qwen3 emotion classifier GGUF (mode 3)\n"
+      << "      --emo-alpha <f>      IndexTTS-2: emotion weight 0..1 (default 1.0)\n"
+      << "      --emo-random         IndexTTS-2: random prototype in vector path\n"
+      << "      --emo-test-dir <dir> IndexTTS-2: dump base_vec/emovec for validation\n"
+      << "      --s2mel-steps <n>    IndexTTS-2: CFM diffusion steps (default 6; lower=faster)\n"
+      << "      --peak <v>           Peak-normalize output to |v| (default 0.95; 0=off)\n"
+      << "      --no-normalize       Disable peak normalization (keep raw amplitude)\n"
+      << "      --gain <x>           Extra linear gain applied to output (default 1.0)\n"
       << "  -h, --help               Show this help\n"
       << std::endl;
 }
@@ -153,6 +197,42 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.use_gpu = parse_bool(argv[++i]);
     } else if (a == "--dump-step0-logits" && i + 1 < argc) {
       args.dump_step0 = argv[++i];
+    } else if (a == "--bigvgan-gguf" && i + 1 < argc) {
+      args.bigvgan_gguf = argv[++i];
+    } else if (a == "--gpt-test-dir" && i + 1 < argc) {
+      args.gpt_test_dir = argv[++i];
+    } else if (a == "--w2v-bert-test-dir" && i + 1 < argc) {
+      args.w2v_bert_test_dir = argv[++i];
+    } else if (a == "--s2mel-test-dir" && i + 1 < argc) {
+      args.s2mel_test_dir = argv[++i];
+    } else if (a == "--conformer-test-dir" && i + 1 < argc) {
+      args.conformer_test_dir = argv[++i];
+    } else if (a == "--sc-hidden-npy" && i + 1 < argc) {
+      args.sc_hidden_npy = argv[++i];
+    } else if (a == "--emo-audio" && i + 1 < argc) {
+      args.emo_audio_path = argv[++i];
+    } else if (a == "--emo-vector" && i + 1 < argc) {
+      args.emo_vector_csv = argv[++i];
+    } else if (a == "--emo-text" && i + 1 < argc) {
+      args.emo_text = argv[++i];
+    } else if (a == "--qwen-emo-gguf" && i + 1 < argc) {
+      args.qwen_emo_gguf = argv[++i];
+    } else if (a == "--emo-alpha" && i + 1 < argc) {
+      args.emo_alpha = std::stof(argv[++i]);
+    } else if (a == "--emo-random") {
+      args.emo_random = true;
+    } else if (a == "--emo-mode" && i + 1 < argc) {
+      args.emo_mode = std::stoi(argv[++i]);
+    } else if (a == "--emo-test-dir" && i + 1 < argc) {
+      args.emo_test_dir = argv[++i];
+    } else if (a == "--s2mel-steps" && i + 1 < argc) {
+      args.s2mel_steps = std::stoi(argv[++i]);
+    } else if (a == "--no-normalize") {
+      args.peak_norm = 0.0f;
+    } else if (a == "--peak" && i + 1 < argc) {
+      args.peak_norm = std::stof(argv[++i]);
+    } else if (a == "--gain" && i + 1 < argc) {
+      args.gain = std::stof(argv[++i]);
     } else if (a == "-h" || a == "--help") {
       print_usage(argv[0]);
       return false;
@@ -217,8 +297,10 @@ static bool write_wav_file(const char *filename, const std::vector<float> &pcm,
 }
 
 int main(int argc, char **argv) {
+  rs::cli::Utf8Args utf8_args(argc, argv);
+
   TtsArgs args;
-  if (!parse_args(argc, argv, args)) return 1;
+  if (!parse_args(utf8_args.argc(), utf8_args.argv(), args)) return 1;
 
   // Init TTS model
   LOG_INFO("RapidSpeech.cpp v%s", rs_get_version());
@@ -267,6 +349,44 @@ int main(int argc, char **argv) {
     // CosyVoice3-LLM reads this env var inside Decode (Phase-2 debug hook).
     set_env_var("RS_CV3_DUMP_STEP0_LOGITS", args.dump_step0);
     LOG_INFO("Step-0 logits dump: %s", args.dump_step0);
+  }
+  if (args.bigvgan_gguf && args.bigvgan_gguf[0]) {
+    set_env_var("RS_INDEXTTS2_BIGVGAN_GGUF", args.bigvgan_gguf);
+    LOG_INFO("BigVGAN GGUF: %s", args.bigvgan_gguf);
+  }
+  if (args.gpt_test_dir && args.gpt_test_dir[0]) {
+    set_env_var("RS_INDEXTTS2_GPT_TEST_DIR", args.gpt_test_dir);
+    LOG_INFO("GPT test dir: %s", args.gpt_test_dir);
+  }
+  if (args.w2v_bert_test_dir && args.w2v_bert_test_dir[0]) {
+    set_env_var("RS_INDEXTTS2_W2V_BERT_TEST_DIR", args.w2v_bert_test_dir);
+    LOG_INFO("W2V-BERT test dir: %s", args.w2v_bert_test_dir);
+  }
+  if (args.s2mel_test_dir && args.s2mel_test_dir[0]) {
+    set_env_var("RS_INDEXTTS2_S2MEL_TEST_DIR", args.s2mel_test_dir);
+    LOG_INFO("S2Mel test dir: %s", args.s2mel_test_dir);
+  }
+  if (args.conformer_test_dir && args.conformer_test_dir[0]) {
+    set_env_var("RS_INDEXTTS2_CONFORMER_TEST_DIR", args.conformer_test_dir);
+    LOG_INFO("Conformer test dir: %s", args.conformer_test_dir);
+  }
+  if (args.sc_hidden_npy && args.sc_hidden_npy[0]) {
+    set_env_var("RS_INDEXTTS2_SC_HIDDEN_NPY", args.sc_hidden_npy);
+    LOG_INFO("sc_hidden npy: %s", args.sc_hidden_npy);
+  }
+  if (args.qwen_emo_gguf && args.qwen_emo_gguf[0]) {
+    set_env_var("RS_INDEXTTS2_QWEN_EMO_GGUF", args.qwen_emo_gguf);
+    LOG_INFO("Qwen emotion GGUF: %s", args.qwen_emo_gguf);
+  }
+  if (args.emo_test_dir && args.emo_test_dir[0]) {
+    set_env_var("RS_INDEXTTS2_EMO_TEST_DIR", args.emo_test_dir);
+    LOG_INFO("Emo test dir: %s", args.emo_test_dir);
+  }
+  if (args.s2mel_steps > 0) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%d", args.s2mel_steps);
+    set_env_var("RS_INDEXTTS2_S2MEL_NSTEPS", buf);
+    LOG_INFO("S2Mel CFM steps: %d", args.s2mel_steps);
   }
 
   rs_init_params_t tts_params = rs_default_params();
@@ -335,6 +455,67 @@ int main(int argc, char **argv) {
       }
       LOG_INFO("Reference text: \"%s\"", args.ref_text);
     }
+  }
+
+  // IndexTTS-2 emotion control (optional). Determine the mode from the provided
+  // flags unless --emo-mode forces it:
+  //   --emo-text   → mode 3 (Qwen text), --emo-vector → mode 2, --emo-audio →
+  //   mode 1, otherwise mode 0 (follow speaker).
+  {
+    int mode = args.emo_mode;
+    if (mode < 0) {
+      if (args.emo_text && args.emo_text[0]) mode = 3;
+      else if (args.emo_vector_csv && args.emo_vector_csv[0]) mode = 2;
+      else if (args.emo_audio_path && args.emo_audio_path[0]) mode = 1;
+      else mode = 0;
+    }
+    if (mode == 1 && args.emo_audio_path && args.emo_audio_path[0]) {
+      std::vector<float> emo_pcm;
+      int emo_sr = 0;
+      if (!load_wav_file(args.emo_audio_path, emo_pcm, &emo_sr)) {
+        LOG_ERROR("Failed to load emotion WAV: %s", args.emo_audio_path);
+        rs_free(tts_ctx);
+        return 1;
+      }
+      LOG_INFO("Emotion audio: %zu samples @ %d Hz", emo_pcm.size(), emo_sr);
+      if (rs_push_emotion_audio(tts_ctx, emo_pcm.data(),
+                                (int32_t)emo_pcm.size(), emo_sr) != RS_OK) {
+        rs_error_info_t err = rs_get_last_error();
+        LOG_ERROR("rs_push_emotion_audio failed: %s", err.message);
+        rs_free(tts_ctx);
+        return 1;
+      }
+    }
+    float vec[8] = {0};
+    const float *vecp = nullptr;
+    if (mode == 2 && args.emo_vector_csv && args.emo_vector_csv[0]) {
+      int n = 0;
+      std::string buf;
+      for (const char *p = args.emo_vector_csv;; ++p) {
+        if (*p == ',' || *p == '\0') {
+          if (!buf.empty() && n < 8) vec[n++] = std::stof(buf);
+          buf.clear();
+          if (*p == '\0') break;
+        } else if (*p != ' ') {
+          buf.push_back(*p);
+        }
+      }
+      vecp = vec;
+      LOG_INFO("Emotion vector: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+               vec[0], vec[1], vec[2], vec[3], vec[4], vec[5], vec[6], vec[7]);
+    }
+    rs_emotion_mode_t emode = (rs_emotion_mode_t)mode;
+    if (rs_set_emotion(tts_ctx, emode, args.emo_alpha, vecp, args.emo_random,
+                       /*apply_bias=*/(mode == 2), args.emo_text) != RS_OK) {
+      rs_error_info_t err = rs_get_last_error();
+      LOG_ERROR("rs_set_emotion failed: %s", err.message);
+      rs_free(tts_ctx);
+      return 1;
+    }
+    LOG_INFO("Emotion mode: %d  alpha: %.3f  random: %s", mode, args.emo_alpha,
+             args.emo_random ? "yes" : "no");
+    if (mode == 3 && args.emo_text)
+      LOG_INFO("Emotion text: \"%s\"", args.emo_text);
   }
 
   // Push text
@@ -421,6 +602,22 @@ int main(int argc, char **argv) {
 
   LOG_INFO("Generated %zu samples (%.2f s) in %d chunks, %.0f ms, RTF: %.3f",
            all_pcm.size(), audio_dur, chunks, elapsed_ms, rtf);
+
+  // Post-gain + peak normalization. IndexTTS-2 / BigVGAN output is often
+  // low-amplitude (matches PyTorch level); normalize so the WAV is audible.
+  if (args.gain != 1.0f) {
+    for (float &v : all_pcm) v *= args.gain;
+  }
+  if (args.peak_norm > 0.0f && !all_pcm.empty()) {
+    float peak = 0.0f;
+    for (float v : all_pcm) peak = std::max(peak, std::fabs(v));
+    if (peak > 1e-6f) {
+      const float scale = args.peak_norm / peak;
+      for (float &v : all_pcm) v *= scale;
+      LOG_INFO("Peak-normalized: peak %.4f → %.2f (gain %.1fx)", peak,
+               args.peak_norm, scale);
+    }
+  }
 
   // Write WAV
   if (write_wav_file(args.output_path, all_pcm, meta.audio_sample_rate)) {

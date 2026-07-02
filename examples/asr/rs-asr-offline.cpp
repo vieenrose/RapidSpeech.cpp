@@ -47,6 +47,7 @@
 #include "arch/fireredvad.h"
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
+#include "../common/rs_cli_utf8.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -913,8 +914,10 @@ spectral_cluster_embeddings(const std::vector<std::vector<float>> &embs,
 // main
 // ─────────────────────────────────────────────────────
 int main(int argc, char **argv) {
+  rs::cli::Utf8Args utf8_args(argc, argv);
+
   OfflineArgs args;
-  if (!parse_args(argc, argv, args))
+  if (!parse_args(utf8_args.argc(), utf8_args.argv(), args))
     return 1;
 
   const int SAMPLE_RATE = 16000;
