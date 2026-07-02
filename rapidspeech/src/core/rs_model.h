@@ -92,6 +92,33 @@ public:
     (void)state; (void)out_data; return 0;
   }
 
+  // Independent emotion control (IndexTTS-2). Default no-ops; only emotion-aware
+  // TTS models override these.
+  //
+  // PushEmotionAudio: separate emotion reference audio (distinct from the
+  // speaker/timbre reference pushed via PushReferenceAudio).
+  virtual bool PushEmotionAudio(RSState &state, const float *samples,
+                                int n_samples, int sample_rate,
+                                ggml_backend_sched_t sched) {
+    (void)state; (void)samples; (void)n_samples; (void)sample_rate;
+    (void)sched; return false;
+  }
+
+  // SetEmotionControl: select the emotion mode and its parameters.
+  //   mode:       0=from speaker, 1=from emo audio, 2=from vector, 3=from text
+  //   emo_alpha:  blend weight (emo_weight); 0..1
+  //   vec8:       8-d emotion vector [happy, angry, sad, afraid, disgusted,
+  //               melancholic, surprised, calm], or nullptr
+  //   use_random: random prototype selection in the vector path
+  //   apply_bias: apply the bias de-emphasis to vec8 (mode 2)
+  //   emo_text:   emotion description text (mode 3), or nullptr
+  virtual void SetEmotionControl(RSState &state, int mode, float emo_alpha,
+                                 const float *vec8, bool use_random,
+                                 bool apply_bias, const char *emo_text) {
+    (void)state; (void)mode; (void)emo_alpha; (void)vec8;
+    (void)use_random; (void)apply_bias; (void)emo_text;
+  }
+
   // Set number of MaskGIT diffusion steps (OmniVoice TTS only). Default 32.
   virtual void SetDiffusionSteps(int n_steps) { (void)n_steps; }
 

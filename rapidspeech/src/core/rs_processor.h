@@ -110,6 +110,19 @@ public:
   int PushReferenceText(const char *ref_text);
 
   /**
+   * Push an independent emotion reference audio (TTS only; IndexTTS-2).
+   * @return 0 on success, -1 on error
+   */
+  int PushEmotionAudio(const float *samples, int n_samples, int sample_rate);
+
+  /**
+   * Configure emotion control (TTS only; IndexTTS-2). See ISpeechModel.
+   */
+  void SetEmotionControl(int mode, float emo_alpha, const float *vec8,
+                         bool use_random, bool apply_bias,
+                         const char *emo_text);
+
+  /**
    * Run one TTS processing step.
    * First call runs encoder + duration + flow decoder.
    * Subsequent calls run vocoder on mel chunks.

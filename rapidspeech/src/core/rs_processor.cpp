@@ -212,6 +212,21 @@ int RSProcessor::PushReferenceText(const char *ref_text) {
   return model_->PushReferenceText(*state_, ref_text) ? 0 : -1;
 }
 
+int RSProcessor::PushEmotionAudio(const float *samples, int n_samples,
+                                  int sample_rate) {
+  if (!model_ || !state_ || !sched_) return -1;
+  return model_->PushEmotionAudio(*state_, samples, n_samples, sample_rate,
+                                  sched_) ? 0 : -1;
+}
+
+void RSProcessor::SetEmotionControl(int mode, float emo_alpha,
+                                    const float *vec8, bool use_random,
+                                    bool apply_bias, const char *emo_text) {
+  if (!model_ || !state_) return;
+  model_->SetEmotionControl(*state_, mode, emo_alpha, vec8, use_random,
+                            apply_bias, emo_text);
+}
+
 int RSProcessor::ProcessTTS() {
   if (!model_ || !state_ || !sched_) return -1;
 

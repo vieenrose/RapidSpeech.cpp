@@ -152,6 +152,34 @@ RS_API int rs_push_reference_audio(rs_context_t* ctx, const float* samples,
 // Returns: RS_OK on success, error code on failure
 RS_API rs_error_t rs_push_reference_text(rs_context_t* ctx, const char* ref_text);
 
+// Emotion control mode (IndexTTS-2).
+typedef enum {
+    RS_EMO_FROM_SPEAKER = 0, // follow the speaker/timbre reference audio
+    RS_EMO_FROM_AUDIO   = 1, // an independent emotion reference audio
+    RS_EMO_FROM_VECTOR  = 2, // an 8-d emotion vector
+    RS_EMO_FROM_TEXT    = 3, // an emotion description text (via QwenEmotion)
+} rs_emotion_mode_t;
+
+// Push an independent emotion reference audio (TTS mode, IndexTTS-2).
+// Distinct from rs_push_reference_audio, which sets the speaker/timbre.
+// Returns: RS_OK on success, error code on failure.
+RS_API rs_error_t rs_push_emotion_audio(rs_context_t* ctx, const float* samples,
+                                        int32_t n_samples, int32_t sample_rate);
+
+// Configure emotion control (TTS mode, IndexTTS-2).
+//   mode:       see rs_emotion_mode_t
+//   emo_alpha:  blend weight (0..1); webui default is 0.65
+//   vec8:       8-d vector [happy, angry, sad, afraid, disgusted, melancholic,
+//               surprised, calm], or NULL (required for RS_EMO_FROM_VECTOR)
+//   use_random: random prototype selection in the vector path
+//   apply_bias: apply bias de-emphasis to vec8 (RS_EMO_FROM_VECTOR)
+//   emo_text:   emotion description (RS_EMO_FROM_TEXT), or NULL → use main text
+// Returns: RS_OK on success, error code on failure.
+RS_API rs_error_t rs_set_emotion(rs_context_t* ctx, rs_emotion_mode_t mode,
+                                 float emo_alpha, const float* vec8,
+                                 bool use_random, bool apply_bias,
+                                 const char* emo_text);
+
 // Execute single inference step
 // Returns: 0=No output yet, 1=Has output, -1=Error (use rs_get_last_error)
 RS_API int32_t rs_process(rs_context_t* ctx);

@@ -188,12 +188,27 @@ set(RS_SOURCES
         rapidspeech/src/frontend/kokoro_g2p_en.cpp
         rapidspeech/src/frontend/wetext_normalizer.cpp
         rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/arch/stable_audio3.h
+        rapidspeech/src/arch/stable_audio3.cpp
+        rapidspeech/src/arch/indextts2.h
+        rapidspeech/src/arch/indextts2.cpp
+        rapidspeech/src/arch/indextts2_gpt.cpp
+        rapidspeech/src/arch/indextts2_s2mel.cpp
+        rapidspeech/src/arch/indextts2_bigvgan.cpp
+        rapidspeech/src/arch/indextts2_tokenizer.cpp
+        rapidspeech/src/arch/indextts2_qwen_emo.cpp
         rapidspeech/src/arch/campplus.cpp
+        rapidspeech/src/arch/w2v_bert.h
+        rapidspeech/src/arch/w2v_bert.cpp
+        rapidspeech/src/arch/semantic_codec.h
+        rapidspeech/src/arch/semantic_codec.cpp
         rapidspeech/src/arch/bert.cpp
         rapidspeech/src/arch/bert.h
         rapidspeech/src/frontend/text_frontend.cpp
         rapidspeech/src/frontend/whisper_mel.h
         rapidspeech/src/frontend/whisper_mel.cpp
+        rapidspeech/src/frontend/seamless_mel.h
+        rapidspeech/src/frontend/seamless_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
@@ -318,7 +333,7 @@ endif()
 if (APPLE)
     # Always link Metal + Foundation — used by our custom DAC vocoder shader.
     # ggml-metal is not required for our Metal path (we use MTL API directly).
-    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal" "-framework Accelerate")
+    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal" "-framework MetalPerformanceShaders" "-framework Accelerate")
 
     # Custom Metal DAC vocoder (fused compute kernels, bypasses ggml per-op overhead)
     target_sources(rapidspeech-core PRIVATE rapidspeech/src/arch/dac_metal.mm)
@@ -331,6 +346,13 @@ if (APPLE)
     set_source_files_properties(rapidspeech/src/arch/kokoro_metal.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL_KOKORO)
+
+    # Custom Metal BigVGAN-v2 vocoder for IndexTTS-2 (single command buffer,
+    # bypasses the ~467 CPU/Metal graph splits of the anti-aliased Snake path).
+    target_sources(rapidspeech-core PRIVATE rapidspeech/src/arch/indextts2_bigvgan_metal.mm)
+    set_source_files_properties(rapidspeech/src/arch/indextts2_bigvgan_metal.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL_BIGVGAN)
 endif()
 
 if (RS_METAL AND APPLE)

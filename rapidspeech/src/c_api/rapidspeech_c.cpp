@@ -235,7 +235,7 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     const bool is_tts =
         (arch == "openvoice2" || arch == "OmniVoice" ||
          arch == "cosyvoice3-llm" || arch == "cosyvoice3" ||
-         arch == "kokoro");
+         arch == "kokoro" || arch == "indextts2");
     if (is_tts) {
       // Streaming path: only CosyVoice3 implements it today. Falls back to
       // the offline ProcessTTS for other arches even if the caller asks for
@@ -335,6 +335,52 @@ RS_API rs_error_t rs_push_reference_text(rs_context_t *ctx, const char *ref_text
     return RS_ERR_INFERENCE_FAILED;
   } catch (...) {
     set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceText unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
+RS_API rs_error_t rs_push_emotion_audio(rs_context_t *ctx, const float *samples,
+                                        int32_t n_samples, int32_t sample_rate) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  if (!samples || n_samples <= 0) {
+    set_error(RS_ERR_INVALID_ARGS, "Invalid emotion audio data");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    if (ctx->processor->PushEmotionAudio(samples, n_samples, sample_rate) != 0) {
+      set_error(RS_ERR_INFERENCE_FAILED, "PushEmotionAudio failed");
+      return RS_ERR_INFERENCE_FAILED;
+    }
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushEmotionAudio failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushEmotionAudio unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
+RS_API rs_error_t rs_set_emotion(rs_context_t *ctx, rs_emotion_mode_t mode,
+                                 float emo_alpha, const float *vec8,
+                                 bool use_random, bool apply_bias,
+                                 const char *emo_text) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    ctx->processor->SetEmotionControl((int)mode, emo_alpha, vec8, use_random,
+                                      apply_bias, emo_text);
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetEmotion failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetEmotion unknown error");
     return RS_ERR_INFERENCE_FAILED;
   }
 }
