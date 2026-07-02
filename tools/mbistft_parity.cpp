@@ -138,6 +138,12 @@ int main(int argc, char** argv) {
 
   rs_init_params_t p = rs_default_params();
   p.model_path = gguf_path;
+  if (getenv("MBISTFT_CPU")) p.use_gpu = false;  // force CPU-only (watchdog-safe correctness/RTF baseline)
+  if (const char* nt = getenv("MBISTFT_THREADS")) {  // override CPU thread count (default 4)
+    int n = atoi(nt);
+    if (n >= 1) p.n_threads = n;
+  }
+  printf("[cfg] use_gpu=%d n_threads=%d\n", p.use_gpu, p.n_threads);
   rs_context_t* ctx = rs_init_from_file(p);
   if (!ctx || !ctx->model) { fprintf(stderr, "model load failed\n"); return 1; }
 

@@ -1,12 +1,16 @@
 #include "mbistft_vits.h"
 #include "core/rs_context.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -40,6 +44,76 @@ void mbv_flush_inputs() {
     ggml_backend_tensor_set(pi.tensor, pi.data.data(), 0, pi.data.size());
   }
   g_mbv_pending.clear();
+}
+
+// =====================================================================
+// Backend scheduling policy (env-gated; no effect on numerics).
+//
+//   MBISTFT_PROFILE     : run each stage node-by-node and print per-node
+//                         op/shape/backend/ms to stderr (the sched
+//                         synchronizes before the callback, so timing is
+//                         exact — used to locate the watchdog-tripping op).
+//   MBISTFT_ENC_CPU     : pin the whole encoder+DP graph to the CPU backend.
+//   MBISTFT_FLOW_CPU    : pin the whole reverse-flow graph to the CPU backend.
+//   MBISTFT_DEC_CPU     : pin the whole MB-iSTFT decoder graph to CPU.
+//   MBISTFT_DEC_CT_CPU  : pin ONLY the conv_transpose_1d ops of the decoder
+//                         to CPU (the quadratic-in-length CUDA kernel that
+//                         trips the Nano's 2s display watchdog), leaving the
+//                         matmul/im2col ops on the GPU.
+// All pinning routes cross-backend copies through the sched automatically, so
+// results are bit-for-bit identical to the all-GPU / all-CPU paths.
+// =====================================================================
+
+thread_local std::chrono::high_resolution_clock::time_point g_mbv_prof_t0;
+
+bool mbv_prof_cb(struct ggml_tensor* t, bool ask, void* ud) {
+  (void)ud;
+  if (ask) {
+    g_mbv_prof_t0 = std::chrono::high_resolution_clock::now();
+    return true;  // observe this node
+  }
+  double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - g_mbv_prof_t0).count();
+  ggml_backend_buffer_t buf = t->buffer;
+  const char* bname = buf ? ggml_backend_buffer_name(buf) : "?";
+  fprintf(stderr,
+          "[mbv-prof] %-16s op=%-18s ne=[%5lld,%5lld,%3lld,%2lld] buf=%-10s %8.2f ms\n",
+          t->name[0] ? t->name : "(anon)", ggml_op_name(t->op),
+          (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
+          (long long)t->ne[3], bname, ms);
+  return true;
+}
+
+ggml_backend_t mbv_cpu_backend(ggml_backend_sched_t sched) {
+  int n = ggml_backend_sched_get_n_backends(sched);
+  for (int i = 0; i < n; i++) {
+    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+    if (ggml_backend_is_cpu(b)) return b;
+  }
+  return nullptr;
+}
+
+// Must be called AFTER ggml_backend_sched_reset and BEFORE
+// ggml_backend_sched_alloc_graph (set_tensor_backend feeds split_graph).
+void mbv_apply_sched_policy(ggml_backend_sched_t sched, struct ggml_cgraph* gf,
+                            bool all_cpu, bool convt_cpu) {
+  ggml_backend_sched_set_eval_callback(
+      sched, getenv("MBISTFT_PROFILE") ? mbv_prof_cb : nullptr, nullptr);
+  if (!all_cpu && !convt_cpu) return;
+  ggml_backend_t cpu = mbv_cpu_backend(sched);
+  if (!cpu) return;  // CPU-only sched: everything is already on CPU
+  const int n = ggml_graph_n_nodes(gf);
+  int pinned = 0;
+  for (int i = 0; i < n; i++) {
+    struct ggml_tensor* node = ggml_graph_node(gf, i);
+    if (all_cpu || (convt_cpu && node->op == GGML_OP_CONV_TRANSPOSE_1D)) {
+      ggml_backend_sched_set_tensor_backend(sched, node, cpu);
+      pinned++;
+    }
+  }
+  if (getenv("MBISTFT_PROFILE"))
+    fprintf(stderr, "[mbv-prof] pinned %d/%d nodes to CPU%s\n", pinned, n,
+            convt_cpu && !all_cpu ? " (conv_transpose_1d only)" : "");
 }
 
 // Create an F32 input tensor and register its contents.
@@ -121,6 +195,68 @@ struct ggml_tensor* mbv_conv1d_ct(struct ggml_context* ctx, struct ggml_tensor* 
   struct ggml_tensor* out = ggml_cont(ctx, ggml_transpose(ctx, mm));  // (OC, OL)
   if (b) out = ggml_add(ctx, out, b);
   return out;
+}
+
+// Drop-in replacement for ggml_conv_transpose_1d(w, x, s, 0, 1) that stays on
+// the GPU.  ggml's CUDA conv_transpose_1d kernel is O(out*IC*L) with a
+// per-output stride scan over the full input length — on the decoder's long
+// axes (upsampling, iSTFT-OLA, PQMF) a single launch runs >2s and trips the
+// Jetson Nano's 2s display watchdog.  We instead zero-insert the input (insert
+// s-1 zeros after each sample) and run a regular F32 conv1d with the
+// flipped/transposed weight: mathematically identical to a stride-s transpose
+// conv, but it uses the fast im2col + cuBLAS path (no watchdog, no CPU offload).
+//   w: PyTorch ConvTranspose1d weight, ne=(K, OC, IC).
+//   x: input [L, IC]  (ne0 = length).
+// Returns (OL_full, OC, 1), OL_full = (L-1)*s + K — identical shape to
+// ggml_conv_transpose_1d's unpadded output.
+struct ggml_tensor* mbv_convt1d_reform(struct ggml_context* ctx,
+                                       struct ggml_tensor* w,
+                                       struct ggml_tensor* x, int s) {
+  const int64_t K  = w->ne[0];
+  const int64_t OC = w->ne[1];
+  const int64_t IC = w->ne[2];
+  const int64_t L  = x->ne[0];
+  const int64_t OL_full = (L - 1) * s + K;
+  static int ct_uid = 0;
+
+  // zero-insert along the time axis:
+  //   (L,IC) -> (1,L,IC) -> pad ne0 to s -> (s,L,IC) -> (s*L, IC)
+  // u[l*s]=x[l], u[l*s+j]=0 for 0<j<s (ggml_pad fills with zeros).
+  struct ggml_tensor* xr = ggml_reshape_3d(ctx, ggml_cont(ctx, x), 1, L, IC);
+  struct ggml_tensor* xp = ggml_pad(ctx, xr, (int)s - 1, 0, 0, 0);  // (s,L,IC)
+  struct ggml_tensor* u  = ggml_reshape_2d(ctx, xp, s * L, IC);     // (s*L,IC)
+
+  // conv weight: permute (K,OC,IC)->(K,IC,OC) then flip along K (ne0).
+  struct ggml_tensor* wp = ggml_cont(ctx, ggml_permute(ctx, w, 0, 2, 1, 3));
+  std::vector<int32_t> rev((size_t)K);
+  for (int i = 0; i < (int)K; i++) rev[i] = (int32_t)(K - 1 - i);
+  char nm[48];
+  snprintf(nm, sizeof(nm), "ct_revk_%d", ct_uid++);
+  struct ggml_tensor* rk = mbv_input_i32(ctx, nm, rev.data(), K);
+  struct ggml_tensor* wf = ggml_reshape_2d(ctx, wp, K, IC * OC);   // (K, IC*OC)
+  wf = ggml_cont(ctx, ggml_transpose(ctx, wf));                    // (IC*OC, K)
+  wf = ggml_get_rows(ctx, wf, rk);                                 // flip along K
+  wf = ggml_cont(ctx, ggml_transpose(ctx, wf));                    // (K, IC*OC)
+  struct ggml_tensor* wconv = ggml_reshape_3d(ctx, wf, K, IC, OC); // (K, IC, OC)
+
+  // regular F32 conv1d with pad = K-1, dilation 1  ->  (s*L+K-1, OC)
+  struct ggml_tensor* y = mbv_conv1d_tc(ctx, u, wconv, nullptr, (int)K - 1, 1);
+  // the transpose-conv output is the leading OL_full rows (the s-1 tail rows
+  // are structurally zero — no valid input taps reach them).
+  struct ggml_tensor* yt = ggml_cont(ctx,
+      ggml_view_2d(ctx, y, OL_full, OC, y->nb[1], 0));
+  return ggml_reshape_3d(ctx, yt, OL_full, OC, 1);
+}
+
+// Dispatch: default to the GPU-friendly zero-insert+conv1d reformulation (it is
+// numerically identical, uses only portable ops, and dodges ggml's watchdog-
+// tripping CUDA conv_transpose_1d kernel).  Escape hatch MBISTFT_CT_STOCK=1
+// forces the stock ggml_conv_transpose_1d (e.g. for A/B or non-CUDA backends).
+struct ggml_tensor* mbv_convt1d(struct ggml_context* ctx, struct ggml_tensor* w,
+                                struct ggml_tensor* x, int s) {
+  static const bool stock = getenv("MBISTFT_CT_STOCK") != nullptr;
+  if (stock) return ggml_conv_transpose_1d(ctx, w, x, s, 0, 1);
+  return mbv_convt1d_reform(ctx, w, x, s);
 }
 
 // LayerNorm over the channel dim of [C,T] data (modules.LayerNorm, eps=1e-5).
@@ -534,6 +670,7 @@ bool MBIstftVitsModel::RunEncoderAndDP(MBIstftVitsState& s,
   ggml_build_forward_expand(gf, logs_p);
 
   ggml_backend_sched_reset(sched);
+  mbv_apply_sched_policy(sched, gf, getenv("MBISTFT_ENC_CPU") != nullptr, false);
   if (!ggml_backend_sched_alloc_graph(sched, gf)) {
     RS_LOG_ERR("mbistft-vits: encoder graph alloc failed");
     ggml_free(ctx0);
@@ -635,6 +772,7 @@ bool MBIstftVitsModel::RunFlowReverse(MBIstftVitsState& s,
   ggml_build_forward_expand(gf, x);
 
   ggml_backend_sched_reset(sched);
+  mbv_apply_sched_policy(sched, gf, getenv("MBISTFT_FLOW_CPU") != nullptr, false);
   if (!ggml_backend_sched_alloc_graph(sched, gf)) {
     RS_LOG_ERR("mbistft-vits: flow graph alloc failed");
     ggml_free(ctx0);
@@ -687,8 +825,8 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
     const int trim = (k - u) / 2;
     const std::string up = "dec.ups." + std::to_string(i);
     struct ggml_tensor* w = Get(up + ".weight");   // (K, OC, IC)
-    struct ggml_tensor* ct = ggml_conv_transpose_1d(ctx0, w,
-        ggml_cont(ctx0, x), u, 0, 1);              // (OL_full, OC, 1)
+    struct ggml_tensor* ct = mbv_convt1d(ctx0, w,
+        ggml_cont(ctx0, x), u);                    // (OL_full, OC, 1)
     const int64_t OLf = ct->ne[0];
     const int64_t OC  = ct->ne[1];
     struct ggml_tensor* ct2 = ggml_reshape_2d(ctx0, ct, OLf, OC);
@@ -791,7 +929,7 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
   std::vector<float> ones_v((size_t)Tp, 1.0f);
   struct ggml_tensor* ones = mbv_input_f32(ctx0, "ones", ones_v.data(), Tp, 1);
   ones = ggml_reshape_2d(ctx0, ones, Tp, 1);
-  struct ggml_tensor* env = ggml_conv_transpose_1d(ctx0, env_k, ones, hop, 0, 1);
+  struct ggml_tensor* env = mbv_convt1d(ctx0, env_k, ones, hop);
   env = ggml_reshape_2d(ctx0, env, env->ne[0], 1);
   env = ggml_clamp(ctx0, env, 1e-9f, INFINITY);
 
@@ -801,7 +939,7 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
     struct ggml_tensor* fs = ggml_view_2d(ctx0, frames, n_fft, Tp,
         frames->nb[1], (size_t)sb * frames->nb[2]);
     struct ggml_tensor* fst = ggml_cont(ctx0, ggml_transpose(ctx0, fs));  // (Tp, n_fft)
-    struct ggml_tensor* y = ggml_conv_transpose_1d(ctx0, ola_k, fst, hop, 0, 1);
+    struct ggml_tensor* y = mbv_convt1d(ctx0, ola_k, fst, hop);
     y = ggml_reshape_2d(ctx0, y, y->ne[0], 1);
     y = ggml_div(ctx0, y, env);
     // center=True trim: n_fft/2 from both ends
@@ -815,8 +953,8 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
 
   // PQMF synthesis
   struct ggml_tensor* ud = ggml_scale(ctx0, Get("pqmf.updown_filter"), (float)sub);
-  struct ggml_tensor* up = ggml_conv_transpose_1d(ctx0, ud,
-      ggml_cont(ctx0, o_mb), sub, 0, 1);  // (sub*Ls, sub, 1)
+  struct ggml_tensor* up = mbv_convt1d(ctx0, ud,
+      ggml_cont(ctx0, o_mb), sub);  // (sub*Ls, sub, 1)
   up = ggml_reshape_2d(ctx0, up, up->ne[0], up->ne[1]);
   // gguf stores the baked filter as torch [4,1,63] (ne 63,1,4); the synthesis
   // conv wants [OC=1, IC=4, K=63] (ne 63,4,1) — identical memory, reshape only.
@@ -831,6 +969,8 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
   ggml_build_forward_expand(gf, wav);
 
   ggml_backend_sched_reset(sched);
+  mbv_apply_sched_policy(sched, gf, getenv("MBISTFT_DEC_CPU") != nullptr,
+                         getenv("MBISTFT_DEC_CT_CPU") != nullptr);
   if (!ggml_backend_sched_alloc_graph(sched, gf)) {
     RS_LOG_ERR("mbistft-vits: decoder graph alloc failed");
     ggml_free(ctx0);
