@@ -17,6 +17,7 @@ option(RS_WEBGPU "Enable WebGPU acceleration (Dawn native / emdawnwebgpu for WAS
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
 option(RS_MATCHA_ESPEAK "Enable espeak-ng English path in the Matcha text frontend" OFF)
 option(RS_BUILD_CLI "Build command-line example executables" ON)
+option(RS_MBISTFT_PARITY "Build the mbistft-vits parity harness tool" OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -180,6 +181,7 @@ set(RS_SOURCES
         rapidspeech/src/frontend/cosyvoice3_mel.h
         rapidspeech/src/frontend/cosyvoice3_mel.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
+        rapidspeech/src/arch/mbistft_vits.cpp
         rapidspeech/src/arch/matcha.cpp
         rapidspeech/src/arch/omnivoice.cpp
         rapidspeech/src/arch/campplus.cpp
@@ -461,6 +463,14 @@ if (RS_BUILD_CLI)
     add_executable(matcha-tts-server
             examples/matcha_server/matcha_tts_server.cpp
     )
+    if (RS_MBISTFT_PARITY)
+        add_executable(mbistft-parity tools/mbistft_parity.cpp)
+        target_link_libraries(mbistft-parity PRIVATE rapidspeech-core ggml)
+        target_include_directories(mbistft-parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+            ${GGML_PATH}/include ${GGML_PATH}/src)
+    endif()
     if (RS_XASR_DEV_TEST)
         add_executable(xasr-dev-test tools/xasr_dev_test.cpp)
         target_link_libraries(xasr-dev-test PRIVATE rapidspeech-core ggml)
