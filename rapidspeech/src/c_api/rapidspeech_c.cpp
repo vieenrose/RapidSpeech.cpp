@@ -233,7 +233,7 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     const std::string &arch = ctx->processor->GetArchName();
     if (arch == "openvoice2" || arch == "OmniVoice" ||
         arch == "cosyvoice3-llm" || arch == "cosyvoice3" ||
-        arch == "matcha-tts") {
+        arch == "matcha-tts" || arch == "mbistft-vits") {
       result = ctx->processor->ProcessTTS();
     } else {
       result = ctx->processor->Process();
