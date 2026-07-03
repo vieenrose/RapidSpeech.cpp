@@ -280,11 +280,12 @@ static void vq_quantize(const float *enc_out, int T,
     }
 
     // Process each time step.
+    std::vector<float> proj(D);
+    std::vector<float> qry(D);
     for (int t = 0; t < T; ++t) {
         const float *row = enc_out + (size_t)t * C;
 
         // in_proj: proj = row @ in_proj_w^T + in_proj_b  → [D]
-        float proj[D];
         for (int d = 0; d < D; ++d) {
             double acc = (double)in_proj_b[d];
             for (int c = 0; c < C; ++c)
@@ -296,7 +297,6 @@ static void vq_quantize(const float *enc_out, int T,
         double norm2 = 0.0;
         for (int d = 0; d < D; ++d) norm2 += (double)proj[d] * proj[d];
         float inv_norm = (float)(1.0 / std::sqrt(norm2 + 1e-12));
-        float qry[D];
         for (int d = 0; d < D; ++d) qry[d] = proj[d] * inv_norm;
 
         // Find nearest codebook entry (max dot product).
