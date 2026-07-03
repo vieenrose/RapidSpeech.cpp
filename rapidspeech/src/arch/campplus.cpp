@@ -125,9 +125,10 @@ bool CAMPPlusModel::MapTensors(ggml_context* gguf_data) {
 
     int n_missing = 0;
     auto get = [&](const std::string& name) -> ggml_tensor* {
-        ggml_tensor* t = ggml_get_tensor(gguf_data, name.c_str());
+        const std::string full = tensor_prefix_ + name;
+        ggml_tensor* t = ggml_get_tensor(gguf_data, full.c_str());
         if (!t) {
-            RS_LOG_DEBUG("campplus: tensor missing: %s", name.c_str());
+            RS_LOG_DEBUG("campplus: tensor missing: %s", full.c_str());
             n_missing++;
         }
         return t;
@@ -163,7 +164,8 @@ bool CAMPPlusModel::MapTensors(ggml_context* gguf_data) {
         b.conv2_w = get(base + ".conv2.weight");
         bind_bn(b.bn2, base + ".bn2");
         // Shortcut only on stride!=1 blocks.
-        ggml_tensor* sc_w = ggml_get_tensor(gguf_data, (base + ".shortcut.0.weight").c_str());
+        ggml_tensor* sc_w = ggml_get_tensor(gguf_data,
+            (tensor_prefix_ + base + ".shortcut.0.weight").c_str());
         if (sc_w) {
             b.has_shortcut = true;
             b.sc_w = sc_w;
@@ -369,8 +371,10 @@ bool CAMPPlusModel::FoldAllBN(ggml_context* gguf_data) {
         ggml_tensor* mean_t = e.bn->gamma;
         ggml_tensor* var_t  = e.bn->beta;
         // Optional weight/bias (affine=False cases lack these).
-        ggml_tensor* w_t = ggml_get_tensor(gguf_data, (e.base + ".weight").c_str());
-        ggml_tensor* b_t = ggml_get_tensor(gguf_data, (e.base + ".bias").c_str());
+        ggml_tensor* w_t = ggml_get_tensor(gguf_data,
+            (tensor_prefix_ + e.base + ".weight").c_str());
+        ggml_tensor* b_t = ggml_get_tensor(gguf_data,
+            (tensor_prefix_ + e.base + ".bias").c_str());
 
         std::vector<float> mean = rs_campplus_read_f32(mean_t);
         std::vector<float> var  = rs_campplus_read_f32(var_t);
@@ -420,9 +424,11 @@ bool CAMPPlusModel::FoldAllBN(ggml_context* gguf_data) {
 // ---------------------------------------------------------------------------
 
 bool CAMPPlusModel::LoadDirect(ggml_context* gguf_data, gguf_context* ctx_gguf,
-                               ggml_backend_t backend) {
+                               ggml_backend_t backend,
+                               const std::string& tensor_prefix) {
     if (!gguf_data || !backend) return false;
     backend_ = backend;
+    tensor_prefix_ = tensor_prefix;
     if (!LoadHParams(ctx_gguf)) return false;
     meta_.audio_sample_rate = hparams_.sample_rate;
     meta_.n_mels = hparams_.n_mels;
@@ -634,8 +640,13 @@ ggml_tensor* cam_dense_layer_graph(ggml_context* ctx, ggml_tensor* x,
             n_full * seg_len, C, 1,
             y->nb[1], y->nb[2], 0);
         y_full = ggml_cont(ctx, y_full);
-        seg = ggml_pool_1d(ctx, y_full, GGML_OP_POOL_AVG,
-                           (int)seg_len, (int)seg_len, 0);
+        // Non-overlapping avg-pool1d (k=s=seg_len) == segment mean. ggml_pool_1d
+        // is not implemented on the CUDA backend, so express it as reshape+mean
+        // (both CUDA-supported, numerically identical): [seg_len*n_full] →
+        // [seg_len, n_full] then mean over ne[0].
+        ggml_tensor* y_seg = ggml_reshape_4d(ctx, y_full, seg_len, n_full, C, 1);
+        ggml_tensor* seg_mean = ggml_mean(ctx, y_seg);   // [1, n_full, C, 1]
+        seg = ggml_reshape_3d(ctx, seg_mean, n_full, C, 1);
         // seg: [n_full, 128, 1]
     }
     if (partial_len > 0) {
@@ -711,10 +722,12 @@ ggml_tensor* transit_graph(ggml_context* ctx, ggml_tensor* x, const CAMPPlusUnit
 // CAMPPlus full graph builder.
 //
 // `feat` is the input fbank with ggml shape [T, n_mels, 1, 1] (ne0=T, ne1=80).
-// Returns the output 192-d L2-normalized embedding tensor [192].
+// Returns the output 192-d embedding tensor [192]. `l2_normalize=false` exposes
+// the raw dense+BN output used by IndexTTS2 style conditioning.
 ggml_cgraph* campplus_build_graph(ggml_context* ctx, ggml_tensor* feat,
                                   const CAMPPlusWeights& w,
-                                  const CAMPPlusHParams& hp) {
+                                  const CAMPPlusHParams& hp,
+                                  bool l2_normalize) {
     // ---- Reshape fbank to 2D conv input ----
     // PyTorch CAMPPlus does: x.permute(2,1,0)  — i.e. (B=1, n_mels=80, T) → conv2d
     // unsqueezes channel to give (1, 1, 80, T).
@@ -809,10 +822,16 @@ ggml_cgraph* campplus_build_graph(ggml_context* ctx, ggml_tensor* feat,
     y = apply_bn(ctx, y, w.dense.bn);
     // y: [1, 192, 1]
 
-    // ---- L2 normalize along the 192 channel axis ----
-    // y is [1, 192, 1]; we want to L2-norm across the ne[1] axis. Squeeze
-    // to [192] first.
     y = ggml_reshape_1d(ctx, y, y->ne[1]);
+    ggml_set_name(y, "embedding_raw");
+    ggml_set_output(y);
+    if (!l2_normalize) {
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx, CAMPPLUS_MAX_NODES, false);
+        ggml_build_forward_expand(gf, y);
+        return gf;
+    }
+
+    // ---- L2 normalize along the 192 channel axis ----
     // L2 norm: y / sqrt(sum(y^2)).
     ggml_tensor* sq = ggml_sqr(ctx, y);
     // Reshape to row vector [192, 1] for sum_rows.
@@ -839,7 +858,7 @@ ggml_cgraph* campplus_build_graph(ggml_context* ctx, ggml_tensor* feat,
 // ---------------------------------------------------------------------------
 
 bool CAMPPlusModel::Embed(const float* pcm_16k, int n_samples, RSState& state,
-                          ggml_backend_sched_t /*sched*/) {
+                          ggml_backend_sched_t /*sched*/, bool l2_normalize) {
     auto& cs = dynamic_cast<CAMPPlusState&>(state);
     cs.embedding.assign((size_t)hparams_.embed_dim, 0.0f);
 
@@ -904,7 +923,8 @@ bool CAMPPlusModel::Embed(const float* pcm_16k, int n_samples, RSState& state,
     ggml_set_name(feat_t, "fbank");
     ggml_set_input(feat_t);
 
-    ggml_cgraph* gf = campplus_build_graph(ctx0, feat_t, weights_, hparams_);
+    ggml_cgraph* gf = campplus_build_graph(ctx0, feat_t, weights_, hparams_,
+                                           l2_normalize);
     if (!gf) {
         ggml_free(ctx0);
         return false;
@@ -929,7 +949,8 @@ bool CAMPPlusModel::Embed(const float* pcm_16k, int n_samples, RSState& state,
     }
 
     // ---- 4. Read output ----
-    ggml_tensor* emb_t = ggml_graph_get_tensor(gf, "embedding");
+    ggml_tensor* emb_t = ggml_graph_get_tensor(
+        gf, l2_normalize ? "embedding" : "embedding_raw");
     if (!emb_t) {
         RS_LOG_ERR("campplus: embedding tensor not found in graph");
         ggml_gallocr_free(alloc);

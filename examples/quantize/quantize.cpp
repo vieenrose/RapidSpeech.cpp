@@ -145,7 +145,42 @@ static bool rs_model_quantize(const std::string &fname_inp,
       "flow\\.decoder\\.estimator\\.norm_out\\..*\\.weight",
       "flow\\.decoder\\.estimator\\.proj_out\\.weight",
       // CosyVoice3 baked voice tuple — kept at original F32 (host metadata).
-      "cv3\\.default_voice\\..*"};
+      "cv3\\.default_voice\\..*",
+      // ---- IndexTTS-2 ----
+      // Embedding / positional / head tables are read on the host (dequant path
+      // only supports F16/F32) and drive AR token generation — quantizing them
+      // zeros the tables and the AR loop never emits stop (appears to hang).
+      "indextts2\\.gpt\\..*embedding\\.weight",
+      "indextts2\\.gpt\\..*_emb\\.weight",
+      "indextts2\\.gpt\\..*pos_embedding\\.emb\\.weight",
+      "indextts2\\.gpt\\.mel_head\\.weight",
+      "indextts2\\.gpt\\.text_head\\.weight",
+      // Conformer/Perceiver conditioning + semantic_codec + campplus + w2v_bert
+      // run through ggml_conv / dup / concat graphs that don't accept quantized
+      // weights, and run once per request (voice cloning) so quantizing them
+      // saves little. Keep them at source precision.
+      "indextts2\\.gpt\\.conditioning_encoder\\..*",
+      "indextts2\\.gpt\\.emo_conditioning_encoder\\..*",
+      "indextts2\\.gpt\\.perceiver_encoder\\..*",
+      "indextts2\\.gpt\\.emo_perceiver_encoder\\..*",
+      "indextts2\\.semantic_codec\\..*",
+      "indextts2\\.campplus\\..*",
+      // w2v-bert Conformer: quantize the attn (q/k/v/o) and FFN (fc1/fc2)
+      // linears; skip the conv module (depthwise/pointwise), relative-position
+      // embedding, and feature projection. (1D layer-norms auto-skip on ndim.)
+      "indextts2\\.w2v_bert\\..*\\.conv\\..*",
+      "indextts2\\.w2v_bert\\..*\\.dist_emb\\.weight",
+      "indextts2\\.w2v_bert\\.fp\\..*",
+      "indextts2\\.spk_matrix", "indextts2\\.emo_matrix",
+      "indextts2\\.w2v\\..*",
+      // S2Mel DiT: quantize the transformer.layers attn/ffn linears (the bulk of
+      // the CFM compute) + the DiT projection linears, but keep the 1D convs,
+      // WaveNet, length_regulator (conv), and embedder lookups at f16.
+      "indextts2\\.s2mel\\..*conv.*\\.weight",
+      "indextts2\\.s2mel\\..*wavenet.*",
+      "indextts2\\.s2mel\\..*length_regulator.*",
+      "indextts2\\.s2mel\\..*embedder\\.weight",
+      "indextts2\\.s2mel\\..*embedding\\.weight"};
 
   // For non-mixed strategies (bare Q*_K / IQ*): default policy is to keep
   // embed/lm_head/ctc at source precision (F32/F16) because the GPU F16

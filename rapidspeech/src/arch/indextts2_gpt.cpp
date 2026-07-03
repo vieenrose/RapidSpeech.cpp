@@ -75,8 +75,17 @@ static void tensor_get_f32(ggml_tensor *t, float *dst, size_t n_elem) {
         for (size_t i = 0; i < n_elem; ++i) dst[i] = ggml_fp16_to_fp32(src[i]);
         return;
     }
-    // Unsupported types (quantized embedding tables are unusual but possible):
-    // fall back to zero rather than crash.
+    // Quantized tables (e.g. embeddings quantized for CUDA): dequantize via
+    // ggml's per-type to_float. Without this the host read would be garbage and
+    // the AR loop would misbehave (embeds ≈ 0 → never emits stop token).
+    {
+        const auto *tt = ggml_get_type_traits(t->type);
+        if (tt && tt->to_float) {
+            tt->to_float(raw.data(), dst, (int64_t)n_elem);
+            return;
+        }
+    }
+    // Truly unsupported type: zero rather than crash.
     std::memset(dst, 0, n_elem * sizeof(float));
 }
 
@@ -1211,10 +1220,16 @@ bool Model::RunAR(State &s, ggml_backend_sched_t sched) {
     std::vector<float> spk_latents_z((size_t)hp_.cond_latents * D, 0.0f);
     std::vector<float> emo_vec_z((size_t)D, 0.0f);
     const int D_in = hp_.sc_hidden;
+    // The Conformer/Perceiver conditioning consumes spk_cond_emb (normalized
+    // W2V-BERT hidden[17]) — NOT the semantic-codec S_ref (that feeds S2Mel).
+    // Fall back to sc_hidden only for the RS_INDEXTTS2_SC_HIDDEN_NPY bring-up
+    // override, which populates sc_hidden directly.
+    const std::vector<float> &cond_feat =
+        !s.spk_cond_emb.empty() ? s.spk_cond_emb : s.sc_hidden;
     const auto t_cond0 = std::chrono::steady_clock::now();
-    if (!s.sc_hidden.empty() && s.T_sc > 0 &&
-        (int)s.sc_hidden.size() == s.T_sc * D_in) {
-        if (!RunConditioning(s, sched, s.sc_hidden, s.T_sc, spk_latents_z)) {
+    if (!cond_feat.empty() && s.T_sc > 0 &&
+        (int)cond_feat.size() == s.T_sc * D_in) {
+        if (!RunConditioning(s, sched, cond_feat, s.T_sc, spk_latents_z)) {
             RS_LOG_WARN("[indextts2] RunConditioning failed — using zeros");
             spk_latents_z.assign((size_t)hp_.cond_latents * D, 0.0f);
         }

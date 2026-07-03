@@ -316,7 +316,16 @@ std::vector<float> BigVGANMetalDecoder::read_host(const ggml_tensor *t) {
         ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), raw.data(), 0, n * sizeof(ggml_fp16_t));
         for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(raw[i]);
     } else {
-        std::fill(out.begin(), out.end(), 0.0f);
+        // Quantized conv weights (BigVGAN GGUF quantized for CUDA): pull the raw
+        // blocks and dequantize via ggml's per-type to_float.
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), raw.data(), 0, raw.size());
+        const auto *tt = ggml_get_type_traits(t->type);
+        if (tt && tt->to_float) {
+            tt->to_float(raw.data(), out.data(), (int64_t)n);
+        } else {
+            std::fill(out.begin(), out.end(), 0.0f);
+        }
     }
     return out;
 }

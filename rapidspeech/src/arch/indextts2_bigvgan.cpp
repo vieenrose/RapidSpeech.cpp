@@ -257,12 +257,18 @@ static ggml_tensor *bv_fir_upsample_2x(ggml_context *ctx, ggml_tensor *x,
     const int64_t L_unpad = (L - 1) * 2 + K;
 
     // 1. Zero-stuff to length 2L-1.
-    //    reshape [L, C, B] → [1, L, C, B], pad ne0 by 1 on right → [2, L, C, B]
-    //    (row 0 = original, row 1 = zero). Reshape → [2L, C, B], then drop the
-    //    trailing zero with a view of length 2L-1.
-    ggml_tensor *x4 = ggml_reshape_4d(ctx, x, 1, L, C, B);
-    ggml_tensor *stuffed = ggml_pad_ext(ctx, x4, /*lp0=*/0, /*rp0=*/1,
-                                        0,0, 0,0, 0,0);
+    //    reshape [L, C, B] → [1, L, C, B], interleave with a zeros tensor along
+    //    ne0 → [2, L, C, B] (row 0 = original, row 1 = zero). Reshape → [2L,C,B],
+    //    then drop the trailing zero with a view of length 2L-1.
+    //    NOTE: we use ggml_concat (not ggml_pad_ext) here on purpose. The CUDA
+    //    pad kernel maps ne1 → gridDim.y (max 65535); at activation_post L is the
+    //    full audio length (>100k) and would overflow the grid ("PAD failed:
+    //    invalid argument"). ggml_concat's contiguous path uses a flat
+    //    grid-stride kernel with no such limit, and produces the identical
+    //    interleaved buffer.
+    ggml_tensor *x4    = ggml_reshape_4d(ctx, x, 1, L, C, B);
+    ggml_tensor *zeros = ggml_scale(ctx, x4, 0.0f);
+    ggml_tensor *stuffed = ggml_concat(ctx, x4, zeros, /*dim=*/0);
     stuffed = ggml_cont(ctx, stuffed);
     stuffed = ggml_reshape_3d(ctx, stuffed, 2 * L, C, B);
     stuffed = ggml_view_3d(ctx, stuffed, 2 * L - 1, C, B,

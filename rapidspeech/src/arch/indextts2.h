@@ -246,6 +246,13 @@ struct State : public RSState {
     std::vector<float>   sc_hidden;
     int                  T_sc = 0;
 
+    // spk_cond_emb: the normalized W2V-BERT hidden[17] features (pre semantic
+    // codec) that the Conformer/Perceiver conditioning + get_emovec consume —
+    // upstream feeds get_emb() here, NOT S_ref. Shares T_sc (same frame count).
+    std::vector<float>   spk_cond_emb;
+    // emo_cond_emb: same, for an independent emotion reference audio (mode 1).
+    std::vector<float>   emo_cond_emb;
+
     // ---- Emotion control (mirrors infer_v2.py infer() emotion args) ----
     // emo_mode: 0=from speaker (follow voice), 1=from external emo audio,
     //           2=from 8-d emotion vector, 3=from emo text (QwenEmotion).
@@ -344,13 +351,14 @@ private:
     bool QwenEmoInfer(ggml_backend_sched_t sched, const std::string &text,
                       std::vector<float> &vec8);
 
-    // ComputeScHidden: fbank → W2V-BERT → per-channel normalize → semantic_codec
-    // quantize, producing the [T*sc_hidden] feature buffer the conditioning
-    // encoders consume. `pcm16` must be 16 kHz mono. Shared by PushReferenceAudio
-    // and PushEmotionAudio. Returns false on failure (out left empty).
+    // ComputeScHidden: fbank → W2V-BERT → per-channel normalize (→ `cond_out`,
+    // the spk_cond_emb the Conformer/Perceiver conditioning consumes) →
+    // semantic_codec quantize (→ `out` = S_ref, for the S2Mel prompt).
+    // `pcm16` must be 16 kHz mono. Shared by PushReferenceAudio / PushEmotionAudio.
     bool ComputeScHidden(const float *pcm16, int n16,
                          std::vector<float> &out, int &T_out,
-                         ggml_backend_sched_t sched, bool is_emo);
+                         ggml_backend_sched_t sched, bool is_emo,
+                         std::vector<float> *cond_out = nullptr);
 
     // ResolveEmotion: assembles the final emo conditioning vector (`emovec`,
     // [n_embd]) per the active State::emo_mode, mirroring infer_v2.py

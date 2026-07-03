@@ -508,7 +508,7 @@ bool Model::PushReferenceAudio(RSState &state, const float *samples,
 
     // W2V-BERT + semantic_codec → sc_hidden for AR conditioning.
     if (!ComputeScHidden(pcm16, n16, s.sc_hidden, s.T_sc, sched,
-                         /*is_emo=*/false)) {
+                         /*is_emo=*/false, /*cond_out=*/&s.spk_cond_emb)) {
         RS_LOG_WARN("[indextts2] PushReferenceAudio: ComputeScHidden failed — "
                     "set RS_INDEXTTS2_SC_HIDDEN_NPY for pre-computed features");
         s.sc_hidden.clear();
@@ -524,9 +524,11 @@ bool Model::PushReferenceAudio(RSState &state, const float *samples,
 // ---------------------------------------------------------------------------
 bool Model::ComputeScHidden(const float *pcm16, int n16,
                             std::vector<float> &out, int &T_out,
-                            ggml_backend_sched_t sched, bool is_emo) {
+                            ggml_backend_sched_t sched, bool is_emo,
+                            std::vector<float> *cond_out) {
     out.clear();
     T_out = 0;
+    if (cond_out) cond_out->clear();
     if (!(w2v_bert_model_ && semantic_codec_model_ && w2v_mean_ && w2v_std_)) {
         return false;
     }
@@ -566,6 +568,9 @@ bool Model::ComputeScHidden(const float *pcm16, int n16,
     }
     dump_f32_if_enabled(dump_dir, is_emo ? "emo_cond_emb" : "spk_cond_emb",
                         hidden17);
+    // The normalized W2V-BERT hidden[17] IS the spk_cond_emb the Conformer/
+    // Perceiver conditioning + get_emovec consume upstream (NOT S_ref).
+    if (cond_out) *cond_out = hidden17;
 
     // Step 4: Semantic codec quantize.
     out.resize((size_t)T_fbank * D);
@@ -623,7 +628,7 @@ bool Model::PushEmotionAudio(RSState &state, const float *samples,
     }
 
     if (!ComputeScHidden(pcm16, n16, s.emo_sc_hidden, s.emo_T_sc, sched,
-                         /*is_emo=*/true)) {
+                         /*is_emo=*/true, /*cond_out=*/&s.emo_cond_emb)) {
         RS_LOG_WARN("[indextts2] PushEmotionAudio: ComputeScHidden failed");
         s.emo_sc_hidden.clear();
         s.emo_T_sc = 0;
@@ -686,13 +691,18 @@ bool Model::ResolveEmotion(State &s, ggml_backend_sched_t sched,
     const int D = hp_.n_embd; // 1280
     emovec.assign((size_t)D, 0.0f);
 
-    if (s.sc_hidden.empty() || s.T_sc <= 0) {
+    // get_emovec consumes the same features as the Conformer/Perceiver
+    // conditioning: spk_cond_emb (normalized W2V-BERT hidden[17]), NOT the
+    // semantic-codec S_ref. Fall back to sc_hidden for the npy bring-up path.
+    const std::vector<float> &spk_feat =
+        !s.spk_cond_emb.empty() ? s.spk_cond_emb : s.sc_hidden;
+    if (spk_feat.empty() || s.T_sc <= 0) {
         // No speaker conditioning at all → zero emo (voice-agnostic AR).
         return true;
     }
     const int D_in = hp_.sc_hidden;
-    if ((int)s.sc_hidden.size() != s.T_sc * D_in) {
-        RS_LOG_WARN("[indextts2] ResolveEmotion: spk sc_hidden size mismatch");
+    if ((int)spk_feat.size() != s.T_sc * D_in) {
+        RS_LOG_WARN("[indextts2] ResolveEmotion: spk cond feat size mismatch");
         return true;
     }
 
@@ -721,24 +731,24 @@ bool Model::ResolveEmotion(State &s, ggml_backend_sched_t sched,
             x = (float)((long)(x * a * 10000.0f)) / 10000.0f;
     }
 
-    // Steps (A)+(D): pick the emo source sc_hidden and the merge alpha.
+    // Steps (A)+(D): pick the emo source features and the merge alpha.
     //   vector/text mode → emo_audio=None → use speaker audio, merge alpha=1.0
-    //   external emo audio (mode 1, no vector) → emo_sc_hidden, merge alpha=user
+    //   external emo audio (mode 1, no vector) → emo_cond_emb, merge alpha=user
     //   otherwise (mode 0) → speaker audio, merge alpha=1.0
-    const std::vector<float> *emo_src = &s.sc_hidden;
+    const std::vector<float> *emo_src = &spk_feat;
     int emo_T = s.T_sc;
     float merge_alpha = 1.0f;
-    if (!using_vector && !s.emo_sc_hidden.empty() && s.emo_T_sc > 0 &&
-        (int)s.emo_sc_hidden.size() == s.emo_T_sc * D_in) {
-        emo_src = &s.emo_sc_hidden;
+    if (!using_vector && !s.emo_cond_emb.empty() && s.emo_T_sc > 0 &&
+        (int)s.emo_cond_emb.size() == s.emo_T_sc * D_in) {
+        emo_src = &s.emo_cond_emb;
         emo_T   = s.emo_T_sc;
         merge_alpha = s.emo_alpha;
     }
 
     // Per-segment merge: base from speaker, emo from the chosen source.
     std::vector<float> base_vec, emo_vec;
-    if (!RunGetEmovec(s, sched, s.sc_hidden, s.T_sc, base_vec)) return false;
-    if (emo_src == &s.sc_hidden) {
+    if (!RunGetEmovec(s, sched, spk_feat, s.T_sc, base_vec)) return false;
+    if (emo_src == &spk_feat) {
         emo_vec = base_vec; // identical input → identical get_emovec
     } else if (!RunGetEmovec(s, sched, *emo_src, emo_T, emo_vec)) {
         return false;

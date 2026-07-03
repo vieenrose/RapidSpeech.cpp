@@ -196,8 +196,13 @@ public:
     // owns its own gguf/ggml contexts (not via rs_context_t). The backend
     // is the buffer owner for the GGUF tensors; folded BN tensors are
     // additionally allocated on the same backend.
+    //
+    // `tensor_prefix` is prepended to every CAMPPlus tensor name during lookup
+    // (e.g. "indextts2.campplus." when borrowing tensors from another model's
+    // GGUF). Defaults to empty for the standalone CAMPPlus GGUF case.
     bool LoadDirect(ggml_context* gguf_data, gguf_context* ctx_gguf,
-                    ggml_backend_t backend);
+                    ggml_backend_t backend,
+                    const std::string& tensor_prefix = "");
 
     std::shared_ptr<RSState> CreateState() override;
 
@@ -213,7 +218,7 @@ public:
     // Convenience entry for callers that already have a state handle.
     // Equivalent to Encode() but more discoverable.
     bool Embed(const float* pcm_16k, int n_samples, RSState& state,
-               ggml_backend_sched_t sched);
+               ggml_backend_sched_t sched, bool l2_normalize = true);
 
     int  GetEmbedDim()    const { return hparams_.embed_dim; }
     int  GetSampleRate()  const { return hparams_.sample_rate; }
@@ -234,6 +239,11 @@ private:
     CAMPPlusHParams  hparams_;
     CAMPPlusWeights  weights_;
     ggml_backend_t   backend_ = nullptr;
+
+    // Prefix prepended to every GGUF tensor lookup. Empty for the standalone
+    // CAMPPlus GGUF; set to "indextts2.campplus." when CAMPPlus tensors share
+    // the IndexTTS-2 GGUF namespace.
+    std::string      tensor_prefix_;
 
     // Synthetic ggml context + buffer holding the folded BN tensors. Lives
     // for the lifetime of the model. Allocated lazily during Load().
