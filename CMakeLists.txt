@@ -157,6 +157,9 @@ set(RS_SOURCES
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/arch/silero_vad.cpp
         rapidspeech/src/arch/fireredvad.cpp
+        rapidspeech/src/arch/xasr.h
+        rapidspeech/src/arch/xasr.cpp
+        rapidspeech/src/arch/xasr_zipformer.cpp
         rapidspeech/src/arch/llm_model.h
         rapidspeech/src/arch/llm_model.cpp
         rapidspeech/src/arch/llm_graph.h
@@ -482,6 +485,10 @@ if (RS_BUILD_CLI)
             examples/asr/rs-asr-vad-online.cpp
     )
 
+    add_executable(rs-asr-online
+            examples/asr/rs-asr-online.cpp
+    )
+
     add_executable(rs-tts-offline
             examples/tts/rs-tts-offline.cpp
     )
@@ -509,6 +516,7 @@ if (RS_BUILD_CLI)
     set(RS_CLI_TARGETS
             rs-asr-offline
             rs-asr-vad-online
+            rs-asr-online
             rs-tts-offline
             rs-tts-online
             rs-tts-split
@@ -528,6 +536,7 @@ if (RS_BUILD_CLI)
 
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
+    target_link_libraries(rs-asr-online PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
@@ -564,6 +573,13 @@ if (RS_BUILD_CLI)
     )
 
     target_include_directories(rs-asr-vad-online PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+    target_include_directories(rs-asr-online PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src

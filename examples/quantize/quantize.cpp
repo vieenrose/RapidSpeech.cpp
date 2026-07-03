@@ -180,7 +180,19 @@ static bool rs_model_quantize(const std::string &fname_inp,
       "indextts2\\.s2mel\\..*wavenet.*",
       "indextts2\\.s2mel\\..*length_regulator.*",
       "indextts2\\.s2mel\\..*embedder\\.weight",
-      "indextts2\\.s2mel\\..*embedding\\.weight"};
+      "indextts2\\.s2mel\\..*embedding\\.weight",
+      // ---- X-ASR (Zipformer2 transducer) ----
+      // encoder_embed Conv2dSubsampling + ConvNeXt: tiny 2D/4D conv kernels
+      // reshaped inside ggml_conv graphs; can't tile to K-quant blocks and the
+      // whole module is only a few MB. Keep at source precision.
+      "encoder_embed\\..*",
+      // ChunkCausalDepthwiseConv1d kernels: small [C,1,k] depthwise weights
+      // consumed as mul_mat src0 after im2col; not worth quantizing.
+      "enc\\..*\\.depthwise_conv\\..*\\.weight",
+      // Stateless predictor tables are read back to the host (F16/F32 only) and
+      // drive greedy decoding; quantizing them corrupts the host read.
+      "decoder\\.embedding\\.weight",
+      "decoder\\.conv\\.weight"};
 
   // For non-mixed strategies (bare Q*_K / IQ*): default policy is to keep
   // embed/lm_head/ctc at source precision (F32/F16) because the GPU F16

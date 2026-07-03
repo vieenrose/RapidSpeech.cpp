@@ -92,8 +92,9 @@ void AudioProcessor::InitMelFilters() {
 
   mel_filters_.assign(n_mel * num_bins, 0.0f);
 
-  const double mel_low_freq = 31.748642;
-  const double mel_freq_delta = 34.6702385;
+  const double mel_low_freq = mel_scale(config_.mel_low_hz);
+  const double mel_high_freq = mel_scale(config_.mel_high_hz);
+  const double mel_freq_delta = (mel_high_freq - mel_low_freq) / (n_mel + 1);
   const double fft_bin_width = (double)config_.sample_rate / config_.n_fft;
 
   for (int i = 0; i < n_mel; i++) {
@@ -121,19 +122,45 @@ void AudioProcessor::ProcessFrame(int frame_idx,
                                   const std::vector<float> &samples,
                                   std::vector<double> &window_buf,
                                   std::vector<double> &power_spec_buf,
-                                  std::vector<float> &output_mel) {
+                                  std::vector<float> &output_mel,
+                                  int out_idx) {
+  if (out_idx < 0) out_idx = frame_idx;
 
   int n_samples = samples.size();
-  int offset = frame_idx * config_.frame_step;
+  int offset;
+  if (config_.snip_edges) {
+    offset = frame_idx * config_.frame_step;
+  } else {
+    // kaldi snip_edges=false: frame centered at i*step + step/2
+    offset = frame_idx * config_.frame_step + config_.frame_step / 2 -
+             config_.frame_size / 2;
+  }
 
   // 1. Copy and Pad
   // Use std::fill for zeroing, often faster/cleaner than loop assignment
   std::fill(window_buf.begin(), window_buf.end(), 0.0);
 
-  int copy_len = std::min(config_.frame_size, n_samples - offset);
-  if (copy_len > 0) {
-    for (int j = 0; j < copy_len; j++) {
-      window_buf[j] = static_cast<double>(samples[offset + j]);
+  if (config_.snip_edges) {
+    int copy_len = std::min(config_.frame_size, n_samples - offset);
+    if (copy_len > 0) {
+      for (int j = 0; j < copy_len; j++) {
+        window_buf[j] = static_cast<double>(samples[offset + j]);
+      }
+    }
+  } else {
+    // out-of-range samples are reflected (kaldi feature-window.cc)
+    for (int j = 0; j < config_.frame_size; j++) {
+      int s = offset + j;
+      if (s < 0)
+        s = -s - 1;
+      if (s >= n_samples)
+        s = 2 * n_samples - 1 - s;
+      // for extremely short signals reflection can still be out of range
+      if (s < 0)
+        s = 0;
+      if (s >= n_samples)
+        s = n_samples - 1;
+      window_buf[j] = static_cast<double>(samples[s]);
     }
   }
 
@@ -188,7 +215,7 @@ void AudioProcessor::ProcessFrame(int frame_idx,
       mel_energy += power_spec_buf[k] * filter_row[k];
     }
 
-    output_mel[frame_idx * config_.n_mels + j] =
+    output_mel[out_idx * config_.n_mels + j] =
         static_cast<float>(log(std::max(mel_energy, 1.19e-7)));
   }
 }
@@ -196,10 +223,16 @@ void AudioProcessor::ProcessFrame(int frame_idx,
 void AudioProcessor::ComputeFbank(const std::vector<float> &samples,
                                   std::vector<float> &output_mel) {
   int n_samples = samples.size();
-  if (n_samples < config_.frame_size)
-    return;
-
-  int n_frames = (n_samples - config_.frame_size) / config_.frame_step + 1;
+  int n_frames;
+  if (config_.snip_edges) {
+    if (n_samples < config_.frame_size)
+      return;
+    n_frames = (n_samples - config_.frame_size) / config_.frame_step + 1;
+  } else {
+    n_frames = (n_samples + config_.frame_step / 2) / config_.frame_step;
+    if (n_frames <= 0)
+      return;
+  }
   output_mel.resize(n_frames * config_.n_mels);
 
   // ==========================================
@@ -265,6 +298,33 @@ void AudioProcessor::ComputeFbank(const std::vector<float> &samples,
       t.join();
   }
 #endif
+}
+
+void AudioProcessor::ComputeFbankFrames(const std::vector<float> &samples,
+                                        int frame_start, int n_frames,
+                                        std::vector<float> &output_mel) {
+  output_mel.resize((size_t)n_frames * config_.n_mels);
+  std::vector<double> window_buf(config_.n_fft);
+  std::vector<double> power_spec_buf(config_.n_fft / 2 + 1);
+  for (int i = 0; i < n_frames; i++) {
+    ProcessFrame(frame_start + i, samples, window_buf, power_spec_buf,
+                 output_mel, i);
+  }
+}
+
+int AudioProcessor::NumReadyFrames(size_t n_samples) const {
+  // frame i needs samples up to first_sample(i) + frame_size
+  //   snip_edges=true:  i*step + frame_size
+  //   snip_edges=false: i*step + step/2 - frame_size/2 + frame_size
+  long n = (long)n_samples;
+  if (config_.snip_edges) {
+    if (n < config_.frame_size) return 0;
+    return (int)((n - config_.frame_size) / config_.frame_step + 1);
+  }
+  const long need_off =
+      (long)config_.frame_step / 2 + (long)config_.frame_size / 2;
+  if (n < need_off) return 0;
+  return (int)((n - need_off) / config_.frame_step + 1);
 }
 
 void AudioProcessor::ApplyLFR(const std::vector<float> &input_mel, int n_frames,
