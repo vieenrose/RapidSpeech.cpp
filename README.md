@@ -137,6 +137,14 @@ CosyVoice3, Qwen3-ASR, Qwen3-TTS.
 - [Python examples](python-api-examples/README.md)
 - [Technical Notes](docs/TECHNICAL.md): architecture, design tradeoffs, backends,
   model conversion, and binding surfaces.
+- Model guides:
+  - ASR — [X-ASR](docs/x-asr.md) (Zipformer2, streaming) ·
+    [SenseVoice](docs/sensevoice.md) · [FunASR-Nano](docs/funasr-nano.md)
+  - TTS — [IndexTTS-2](docs/index2tts.md) (voice clone + emotion) ·
+    [CosyVoice3](docs/cosyvoice3.md) · [OmniVoice](docs/omnivoice.md) ·
+    [OpenVoice2](docs/openvoice2.md) · [Kokoro](docs/kokoro.md)
+  - VAD — [Silero / FireRedVAD](docs/vad.md)
+  - Speaker — [CAMPPlus](docs/campplus.md)
 - [Browser / WASM examples](wasm-examples/README.md)
 - [Node.js example](node-api-example/README.md)
 

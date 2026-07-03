@@ -105,10 +105,20 @@ RTF = 处理时间 / 音频时长。越低越快；RTF < 1 表示快于实时。
 
 | 任务 | 模型 | 状态 |
 | --- | --- | --- |
-| ASR | SenseVoice-small, FunASR-nano | 稳定 |
+| ASR | SenseVoice-small, FunASR-nano, X-ASR（Zipformer2，流式） | 稳定 |
 | VAD | Silero VAD, FireRedVAD | 稳定 |
-| TTS | OmniVoice, OpenVoice2, Kokoro | 活跃开发 |
+| TTS | OmniVoice, OpenVoice2, Kokoro, IndexTTS-2 | 活跃开发 |
 | Speaker | CAMPPlus | 稳定 |
+
+**X-ASR** — 中英文 Zipformer2 transducer（icefall/k2）。一份 GGUF 同时支持**离线**
+全上下文解码与**真正的分 chunk 流式**（逐层左上下文缓存、亚秒级出字，
+`--chunk-len 16/32/48/96/192` fbank 帧）。带标点和大小写，greedy transducer 解码，
+可在 CPU / Metal / CUDA / Vulkan 上运行，可量化到 q4_k_m（99.5 MB）。详见
+[docs/x-asr.md](docs/x-asr.md)。
+
+**IndexTTS-2** — 带情感控制的零样本语音克隆 TTS（GPT + S2Mel CFM + BigVGAN-v2
+声码器），4 种情感控制模式（参考音频 / 向量 / 文本 / Qwen）。详见
+[docs/index2tts.md](docs/index2tts.md)。
 
 ## 开发中
 
@@ -120,6 +130,14 @@ CosyVoice3、Qwen3-ASR、Qwen3-TTS。
 
 - [Python 示例](python-api-examples/README.md)
 - [技术说明](docs/TECHNICAL-CN.md)：架构、设计取舍、后端、模型转换和绑定接口。
+- 模型使用说明：
+  - ASR — [X-ASR](docs/x-asr.md)（Zipformer2，流式）·
+    [SenseVoice](docs/sensevoice.md) · [FunASR-Nano](docs/funasr-nano.md)
+  - TTS — [IndexTTS-2](docs/index2tts.md)（音色克隆 + 情感）·
+    [CosyVoice3](docs/cosyvoice3.md) · [OmniVoice](docs/omnivoice.md) ·
+    [OpenVoice2](docs/openvoice2.md) · [Kokoro](docs/kokoro.md)
+  - VAD — [Silero / FireRedVAD](docs/vad.md)
+  - 说话人 — [CAMPPlus](docs/campplus.md)
 - [浏览器 / WASM 示例](wasm-examples/README.md)
 - [Node.js 示例](node-api-example/README.md)
 
@@ -147,6 +165,7 @@ cmake --build build --config Release
 构建产物位于 `build/` 目录：
 - `rs-asr-offline` — 离线 ASR 命令行工具
 - `rs-asr-vad-online` — VAD 切段的伪流式 ASR 命令行工具
+- `rs-asr-online` — 真正的分 chunk 流式 ASR（X-ASR；麦克风或 WAV，实时出字）
 - `rs-tts-offline` — 离线 TTS 命令行工具
 - `rs-quantize` — 模型量化工具
 
@@ -173,6 +192,17 @@ cmake --build build --config Release
   --vad-threshold 0.5 \
   --silence-ms 600
 ```
+
+**流式 ASR（X-ASR）**
+
+```bash
+# WAV：实时速率回放 + 实时出字（加 --fast 则尽快跑完）
+./build/rs-asr-online -m /path/to/xasr-q4_k_m.gguf -w /path/to/audio.wav --chunk-len 32
+# 麦克风
+./build/rs-asr-online -m /path/to/xasr-q4_k_m.gguf --mic --chunk-len 16
+```
+
+模型、chunk 大小/延迟权衡与 GGUF 转换详见 [docs/x-asr.md](docs/x-asr.md)。
 
 **文本转语音**
 
