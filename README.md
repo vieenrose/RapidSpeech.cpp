@@ -111,10 +111,20 @@ faster than real time.
 
 | Task | Models | Status |
 | --- | --- | --- |
-| ASR | SenseVoice-small, FunASR-nano | Stable |
+| ASR | SenseVoice-small, FunASR-nano, X-ASR (Zipformer2, streaming) | Stable |
 | VAD | Silero VAD, FireRedVAD | Stable |
-| TTS | OmniVoice, OpenVoice2, Kokoro | Active |
+| TTS | OmniVoice, OpenVoice2, Kokoro, IndexTTS-2 | Active |
 | Speaker | CAMPPlus | Stable |
+
+**X-ASR** — Chinese/English Zipformer2 transducer (icefall/k2). One GGUF serves
+both **offline** full-context decoding and **true chunked streaming** (per-layer
+left-context caches, sub-second partials, `--chunk-len 16/32/48/96/192` fbank
+frames). Punctuation and casing, greedy transducer decode, runs on CPU / Metal /
+CUDA / Vulkan and quantizes to q4_k_m (99.5 MB).
+
+**IndexTTS-2** — expressive zero-shot voice-cloning TTS (GPT + S2Mel CFM +
+BigVGAN-v2 vocoder) with 4-mode emotion control (reference audio / vector / text
+/ Qwen). See [docs/index2tts.md](docs/index2tts.md).
 
 ## In Progress
 
@@ -154,6 +164,7 @@ cmake --build build --config Release
 Build artifacts are located in the `build/` directory:
 - `rs-asr-offline` — Offline ASR command-line tool
 - `rs-asr-vad-online` — VAD-segmented quasi-streaming ASR command-line tool
+- `rs-asr-online` — True chunked streaming ASR (X-ASR; mic or WAV, live partials)
 - `rs-tts-offline` — Offline TTS command-line tool
 - `rs-quantize` — Model quantization tool
 
@@ -180,6 +191,18 @@ Build artifacts are located in the `build/` directory:
   --vad-threshold 0.5 \
   --silence-ms 600
 ```
+
+**Streaming ASR (X-ASR)**
+
+```bash
+# WAV, real-time paced with live partials (or --fast to run as fast as possible)
+./build/rs-asr-online -m /path/to/xasr-q4_k_m.gguf -w /path/to/audio.wav --chunk-len 32
+# Microphone
+./build/rs-asr-online -m /path/to/xasr-q4_k_m.gguf --mic --chunk-len 16
+```
+
+See [docs/x-asr.md](docs/x-asr.md) for the model, chunk-size / latency tradeoffs,
+and GGUF conversion.
 
 **Text to speech**
 
@@ -222,3 +245,4 @@ If you are interested in the following areas, we welcome your PRs or participati
 4. [cppjieba](https://github.com/yanyiwu/cppjieba) — Chinese word segmentation
 5. [WeText](https://github.com/wenet-e2e/wetext) — text normalization (ITN/TN)
 6. [miniaudio](https://github.com/mackron/miniaudio) — single-file audio I/O
+7. [X-ASR](https://github.com/Gilgamesh-J/X-ASR) Streaming-focused automatic speech recognition models

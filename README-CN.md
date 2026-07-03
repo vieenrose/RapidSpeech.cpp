@@ -214,3 +214,4 @@ cmake --build build --config Release
 4. [cppjieba](https://github.com/yanyiwu/cppjieba) —— 中文分词
 5. [WeText](https://github.com/wenet-e2e/wetext) —— 文本归一化（ITN/TN）
 6. [miniaudio](https://github.com/mackron/miniaudio) —— 单文件音频 I/O
+7. 7. [X-ASR](https://github.com/Gilgamesh-J/X-ASR) 重点面向 流式 ASR 和 低延迟部署，同时支持离线识别
