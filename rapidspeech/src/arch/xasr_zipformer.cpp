@@ -9,6 +9,7 @@
 #include "arch/xasr.h"
 #include "ggml.h"
 #include "utils/rs_log.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>

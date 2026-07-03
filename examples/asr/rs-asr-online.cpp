@@ -17,10 +17,12 @@
 #include "../common/rs_cli_utf8.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
