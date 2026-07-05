@@ -15,7 +15,7 @@
 #include <random>
 #include <vector>
 
-#define MBV_MAX_NODES 8192
+#define MBV_MAX_NODES 16384  // streaming mode adds causal-pad + band-bias nodes
 
 // =====================================================================
 // Pending-inputs registry (no_alloc graph pattern, same as openvoice2):
@@ -158,18 +158,36 @@ struct ggml_tensor* mbv_linear_ct(struct ggml_context* ctx, struct ggml_tensor* 
   return out;
 }
 
-// Conv1d on [T,C] data (all-F32 im2col path; ggml_conv_1d would round the
-// im2col buffer to F16, hurting parity).  Returns [OL, OC].
+// im2col dtype for the heavy decoder / flow convs (Lever 1: F16 im2col makes the
+// mul_mat's src0 (the unfolded activations) F16, which is the operand ggml's
+// use_fp16 gate keys on — with RS_GEMM_FP16=1 on sm_53 the conv GEMMs then run
+// the FP16 cuBLAS path (~2x on Maxwell) instead of FP32.  Env-gated, default F32.
+enum ggml_type mbv_im_dec() {
+  static enum ggml_type t = getenv("MBISTFT_F16_DEC") ? GGML_TYPE_F16 : GGML_TYPE_F32;
+  return t;
+}
+enum ggml_type mbv_im_flow() {
+  static enum ggml_type t = getenv("MBISTFT_F16_FLOW") ? GGML_TYPE_F16 : GGML_TYPE_F32;
+  return t;
+}
+
+// Conv1d on [T,C] data.  Returns [OL, OC].  im_type F32 (exact) or F16 (rounds
+// the unfolded activations; ggml_im2col needs its kernel arg to match the dst
+// dtype, so pass an F16 cast of w for shape — the mul_mat still supplies the
+// full-precision F32 weight in src1).
 struct ggml_tensor* mbv_conv1d_tc(struct ggml_context* ctx, struct ggml_tensor* x,
                                   struct ggml_tensor* w, struct ggml_tensor* b,
-                                  int pad, int dil) {
+                                  int pad, int dil,
+                                  enum ggml_type im_type = GGML_TYPE_F32) {
   const int64_t T   = x->ne[0];
   const int64_t Cin = x->ne[1];
   const int64_t K   = w->ne[0];
   const int64_t OC  = w->ne[2];
   struct ggml_tensor* x3 = ggml_reshape_3d(ctx, x, T, Cin, 1);
-  struct ggml_tensor* im = ggml_im2col(ctx, w, x3, 1, 0, pad, 0, dil, 0,
-                                       /*is_2D=*/false, GGML_TYPE_F32);  // (Cin*K, OL, 1)
+  struct ggml_tensor* w_im = (im_type == GGML_TYPE_F16)
+      ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
+  struct ggml_tensor* im = ggml_im2col(ctx, w_im, x3, 1, 0, pad, 0, dil, 0,
+                                       /*is_2D=*/false, im_type);  // (Cin*K, OL, 1)
   struct ggml_tensor* out = ggml_mul_mat(
       ctx, ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2]),
       ggml_reshape_2d(ctx, w, K * Cin, OC));  // (OL, OC)
@@ -180,21 +198,86 @@ struct ggml_tensor* mbv_conv1d_tc(struct ggml_context* ctx, struct ggml_tensor* 
 // Conv1d on [C,T] data.  Returns [OC, OL].
 struct ggml_tensor* mbv_conv1d_ct(struct ggml_context* ctx, struct ggml_tensor* x,
                                   struct ggml_tensor* w, struct ggml_tensor* b,
-                                  int pad, int dil) {
+                                  int pad, int dil,
+                                  enum ggml_type im_type = GGML_TYPE_F32) {
   struct ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));  // (T, Cin)
   const int64_t T   = xt->ne[0];
   const int64_t Cin = xt->ne[1];
   const int64_t K   = w->ne[0];
   const int64_t OC  = w->ne[2];
   struct ggml_tensor* x3 = ggml_reshape_3d(ctx, xt, T, Cin, 1);
-  struct ggml_tensor* im = ggml_im2col(ctx, w, x3, 1, 0, pad, 0, dil, 0,
-                                       false, GGML_TYPE_F32);
+  struct ggml_tensor* w_im = (im_type == GGML_TYPE_F16)
+      ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
+  struct ggml_tensor* im = ggml_im2col(ctx, w_im, x3, 1, 0, pad, 0, dil, 0,
+                                       false, im_type);
   struct ggml_tensor* mm = ggml_mul_mat(
       ctx, ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2]),
       ggml_reshape_2d(ctx, w, K * Cin, OC));  // (OL, OC)
   struct ggml_tensor* out = ggml_cont(ctx, ggml_transpose(ctx, mm));  // (OC, OL)
   if (b) out = ggml_add(ctx, out, b);
   return out;
+}
+
+// =====================================================================
+// Phase-4 STREAMING mode (env-gated MBISTFT_STREAM=1).  Runs the v2-Stream
+// checkpoint (keep_streamenc_10k): token-level band self-attention + causal FFN
+// in the encoder, and causal (left-pad) convs in the decoder.  Weights are
+// shape-identical to v2 — only these graph ops differ.  MUST match, exactly,
+// attentions.py (_band_mask, causal FFN) and causal_patch.py (causal decoder).
+// =====================================================================
+static inline bool mbv_stream() {
+  static const bool s = getenv("MBISTFT_STREAM") != nullptr;
+  return s;
+}
+static inline int mbv_stream_lookahead() {
+  const char* e = getenv("MBISTFT_STREAM_LOOKAHEAD");
+  static const int la = e ? atoi(e) : 5;
+  return la;
+}
+// bisect helpers: MBISTFT_SKIP_ENC / MBISTFT_SKIP_DEC disable each half.
+static inline bool mbv_stream_enc() { return mbv_stream() && !getenv("MBISTFT_SKIP_ENC"); }
+static inline bool mbv_stream_dec() { return mbv_stream() && !getenv("MBISTFT_SKIP_DEC"); }
+
+// Prepend `lp` zero frames on the TIME axis.  Built as a zeroed slice of x so no
+// new leaf tensor is needed.  tc-layout: [T,C], time = ne0.  ct-layout: [C,T],
+// time = ne1.
+static int g_mbv_lpad_uid = 0;
+// tc-layout [T,C]: prepend lp zero frames on ne0 (time).
+static struct ggml_tensor* mbv_lpad_time_tc(struct ggml_context* ctx,
+                                            struct ggml_tensor* x, int lp) {
+  if (lp <= 0) return x;
+  const int64_t C = x->ne[1];
+  std::vector<float> zeros((size_t)lp * C, 0.0f);
+  char nm[48]; snprintf(nm, sizeof(nm), "lpad_tc_%d", g_mbv_lpad_uid++);
+  struct ggml_tensor* z = mbv_input_f32(ctx, nm, zeros.data(), lp, C);
+  return ggml_concat(ctx, z, x, 0);  // (T+lp, C)
+}
+// ct-layout [C,T]: prepend lp zero frames on ne1 (time).
+static struct ggml_tensor* mbv_lpad_time_ct(struct ggml_context* ctx,
+                                            struct ggml_tensor* x, int lp) {
+  if (lp <= 0) return x;
+  const int64_t C = x->ne[0];
+  std::vector<float> zeros((size_t)C * lp, 0.0f);
+  char nm[48]; snprintf(nm, sizeof(nm), "lpad_ct_%d", g_mbv_lpad_uid++);
+  struct ggml_tensor* z = mbv_input_f32(ctx, nm, zeros.data(), C, lp);
+  return ggml_concat(ctx, z, x, 1);  // (C, T+lp)
+}
+
+// Causal conv: symmetric-pad p -> left-pad 2p (= dil*(k-1)), conv with pad 0.
+// Output length preserved (== plain symmetric conv), receptive field shifted to
+// the past.  Matches causal_patch.causalize_generator.  (mbv_conv1d_tc/ct are
+// defined above.)
+static struct ggml_tensor* mbv_conv1d_tc_causal(struct ggml_context* ctx,
+    struct ggml_tensor* x, struct ggml_tensor* w, struct ggml_tensor* b,
+    int sym_pad, int dil, enum ggml_type im_type) {
+  x = mbv_lpad_time_tc(ctx, x, 2 * sym_pad);
+  return mbv_conv1d_tc(ctx, x, w, b, 0, dil, im_type);
+}
+static struct ggml_tensor* mbv_conv1d_ct_causal(struct ggml_context* ctx,
+    struct ggml_tensor* x, struct ggml_tensor* w, struct ggml_tensor* b,
+    int sym_pad, int dil, enum ggml_type im_type) {
+  x = mbv_lpad_time_ct(ctx, x, 2 * sym_pad);
+  return mbv_conv1d_ct(ctx, x, w, b, 0, dil, im_type);
 }
 
 // Drop-in replacement for ggml_conv_transpose_1d(w, x, s, 0, 1) that stays on
@@ -341,6 +424,22 @@ struct ggml_tensor* mbv_rel_mha(struct ggml_context* ctx, struct ggml_tensor* x,
 
   // softmax over the key dim: transpose to (T_k, T_q, nh)
   struct ggml_tensor* scores_t = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3));
+  // STREAMING band mask (attentions.py _band_mask): query q attends key k iff
+  // (k-q) <= lookahead (full left history, bounded right lookahead). Added as an
+  // additive bias (0 / -1e4) to the (T_k,T_q) scores, broadcast over heads — done
+  // as an explicit ggml_add (not the soft_max_ext mask arg) to sidestep this
+  // ggml build's KQ-mask padding constraints.
+  if (mbv_stream_enc()) {
+    const int La = mbv_stream_lookahead();
+    std::vector<float> bm((int64_t)T * T);
+    for (int q = 0; q < T; q++)
+      for (int k = 0; k < T; k++)
+        bm[(int64_t)k + (int64_t)T * q] = (k <= q + La) ? 0.0f : -1e4f;
+    char bnm[48];
+    snprintf(bnm, sizeof(bnm), "band_bias_l%d", layer_idx);
+    struct ggml_tensor* band = mbv_input_f32(ctx, bnm, bm.data(), T, T);
+    scores_t = ggml_add(ctx, scores_t, band);  // broadcasts over nh (ne2)
+  }
   struct ggml_tensor* p = ggml_soft_max_ext(ctx, scores_t, nullptr, scale, 0.0f);
 
   // out = p @ V : (hd, T_q, nh)
@@ -631,11 +730,18 @@ bool MBIstftVitsModel::RunEncoderAndDP(MBIstftVitsState& s,
     x = mbv_layer_norm_ct(ctx0, ggml_add(ctx0, x, y),
                           Get(n1 + ".gamma"), Get(n1 + ".beta"));
 
-    struct ggml_tensor* f = mbv_conv1d_ct(ctx0, x, Get(fp + ".conv_1.weight"),
-                                          Get(fp + ".conv_1.bias"), ffn_pad, 1);
+    // FFN convs: causal (left-pad) in streaming mode, else symmetric.
+    struct ggml_tensor* f = mbv_stream_enc()
+        ? mbv_conv1d_ct_causal(ctx0, x, Get(fp + ".conv_1.weight"),
+                               Get(fp + ".conv_1.bias"), ffn_pad, 1, GGML_TYPE_F32)
+        : mbv_conv1d_ct(ctx0, x, Get(fp + ".conv_1.weight"),
+                        Get(fp + ".conv_1.bias"), ffn_pad, 1);
     f = ggml_relu(ctx0, f);
-    f = mbv_conv1d_ct(ctx0, f, Get(fp + ".conv_2.weight"),
-                      Get(fp + ".conv_2.bias"), ffn_pad, 1);
+    f = mbv_stream_enc()
+        ? mbv_conv1d_ct_causal(ctx0, f, Get(fp + ".conv_2.weight"),
+                               Get(fp + ".conv_2.bias"), ffn_pad, 1, GGML_TYPE_F32)
+        : mbv_conv1d_ct(ctx0, f, Get(fp + ".conv_2.weight"),
+                        Get(fp + ".conv_2.bias"), ffn_pad, 1);
     x = mbv_layer_norm_ct(ctx0, ggml_add(ctx0, x, f),
                           Get(n2 + ".gamma"), Get(n2 + ".beta"));
   }
@@ -742,7 +848,8 @@ bool MBIstftVitsModel::RunFlowReverse(MBIstftVitsState& s,
       const std::string ip = p + ".enc.in_layers." + std::to_string(j);
       const std::string rp = p + ".enc.res_skip_layers." + std::to_string(j);
       struct ggml_tensor* xin = mbv_conv1d_ct(ctx0, h, Get(ip + ".weight"),
-                                              Get(ip + ".bias"), wn_pad, 1);  // (384, Tf)
+                                              Get(ip + ".bias"), wn_pad, 1,
+                                              mbv_im_flow());  // (384, Tf)
       struct ggml_tensor* ta = ggml_tanh(ctx0, ggml_cont(ctx0,
           ggml_view_2d(ctx0, xin, C, Tf, xin->nb[1], 0)));
       struct ggml_tensor* sa = ggml_sigmoid(ctx0, ggml_cont(ctx0,
@@ -814,8 +921,11 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
   struct ggml_tensor* z = mbv_input_f32(ctx0, "z", z_tc.data(), Tf, C);
   z = ggml_reshape_2d(ctx0, z, Tf, C);
 
-  struct ggml_tensor* x = mbv_conv1d_tc(ctx0, z, Get("dec.conv_pre.weight"),
-                                        Get("dec.conv_pre.bias"), 3, 1);  // (Tf, 512)
+  struct ggml_tensor* x = mbv_stream_dec()
+      ? mbv_conv1d_tc_causal(ctx0, z, Get("dec.conv_pre.weight"),
+                             Get("dec.conv_pre.bias"), 3, 1, mbv_im_dec())
+      : mbv_conv1d_tc(ctx0, z, Get("dec.conv_pre.weight"),
+                      Get("dec.conv_pre.bias"), 3, 1, mbv_im_dec());  // (Tf, 512)
 
   for (int i = 0; i < (int)hparams_.upsample_rates.size(); i++) {
     x = ggml_leaky_relu(ctx0, x, 0.1f, false);
@@ -830,9 +940,11 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
     const int64_t OLf = ct->ne[0];
     const int64_t OC  = ct->ne[1];
     struct ggml_tensor* ct2 = ggml_reshape_2d(ctx0, ct, OLf, OC);
+    // Symmetric trim (k-u)/2 each side normally; causal drops all (k-u) from the
+    // RIGHT (offset 0) so output depends only on past input (causal_patch).
+    const size_t ct_off = mbv_stream_dec() ? 0 : (size_t)trim * sizeof(float);
     struct ggml_tensor* trimmed = ggml_cont(ctx0,
-        ggml_view_2d(ctx0, ct2, OLf - 2 * trim, OC, ct2->nb[1],
-                     (size_t)trim * sizeof(float)));
+        ggml_view_2d(ctx0, ct2, OLf - 2 * trim, OC, ct2->nb[1], ct_off));
     x = ggml_add(ctx0, trimmed,
                  ggml_reshape_2d(ctx0, Get(up + ".bias"), 1, OC));
 
@@ -846,15 +958,25 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
       for (int di = 0; di < 3; di++) {
         const int dil = dils[di];
         struct ggml_tensor* xt = ggml_leaky_relu(ctx0, rx, 0.1f, false);
-        xt = mbv_conv1d_tc(ctx0, xt,
-            Get(rb + ".convs1." + std::to_string(di) + ".weight"),
-            Get(rb + ".convs1." + std::to_string(di) + ".bias"),
-            (rk * dil - dil) / 2, dil);
+        xt = mbv_stream_dec()
+            ? mbv_conv1d_tc_causal(ctx0, xt,
+                Get(rb + ".convs1." + std::to_string(di) + ".weight"),
+                Get(rb + ".convs1." + std::to_string(di) + ".bias"),
+                (rk * dil - dil) / 2, dil, mbv_im_dec())
+            : mbv_conv1d_tc(ctx0, xt,
+                Get(rb + ".convs1." + std::to_string(di) + ".weight"),
+                Get(rb + ".convs1." + std::to_string(di) + ".bias"),
+                (rk * dil - dil) / 2, dil, mbv_im_dec());
         xt = ggml_leaky_relu(ctx0, xt, 0.1f, false);
-        xt = mbv_conv1d_tc(ctx0, xt,
-            Get(rb + ".convs2." + std::to_string(di) + ".weight"),
-            Get(rb + ".convs2." + std::to_string(di) + ".bias"),
-            (rk - 1) / 2, 1);
+        xt = mbv_stream_dec()
+            ? mbv_conv1d_tc_causal(ctx0, xt,
+                Get(rb + ".convs2." + std::to_string(di) + ".weight"),
+                Get(rb + ".convs2." + std::to_string(di) + ".bias"),
+                (rk - 1) / 2, 1, mbv_im_dec())
+            : mbv_conv1d_tc(ctx0, xt,
+                Get(rb + ".convs2." + std::to_string(di) + ".weight"),
+                Get(rb + ".convs2." + std::to_string(di) + ".bias"),
+                (rk - 1) / 2, 1, mbv_im_dec());
         rx = ggml_add(ctx0, rx, xt);
       }
       xs = xs ? ggml_add(ctx0, xs, rx) : rx;
@@ -872,8 +994,12 @@ bool MBIstftVitsModel::RunDecoder(MBIstftVitsState& s,
     x = ggml_concat(ctx0, col, x, 0);  // (T+1, C)
   }
 
-  x = mbv_conv1d_tc(ctx0, x, Get("dec.subband_conv_post.weight"),
-                    Get("dec.subband_conv_post.bias"), 3, 1);  // (Tp, 72)
+  x = mbv_stream_dec()
+      ? mbv_conv1d_tc_causal(ctx0, x, Get("dec.subband_conv_post.weight"),
+                             Get("dec.subband_conv_post.bias"), 3, 1, mbv_im_dec())
+      : mbv_conv1d_tc(ctx0, x, Get("dec.subband_conv_post.weight"),
+                      Get("dec.subband_conv_post.bias"), 3, 1,
+                      mbv_im_dec());  // (Tp, 72)
   const int64_t Tp = x->ne[0];
 
   // channel c = s*(n_fft+2) + k  ->  view as (Tp, n_fft+2, sub)
