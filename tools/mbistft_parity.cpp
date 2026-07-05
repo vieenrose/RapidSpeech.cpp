@@ -126,9 +126,11 @@ int main(int argc, char** argv) {
   const char* inputs_path = argv[2];
   const std::string outdir = argv[3];
   bool do_rtf = false;
+  bool do_stream = false;
   std::string refs_dir;
   for (int i = 4; i < argc; i++) {
     if (strcmp(argv[i], "--rtf") == 0) do_rtf = true;
+    else if (strcmp(argv[i], "--stream-chunks") == 0) do_stream = true;
     else if (strcmp(argv[i], "--refs") == 0 && i + 1 < argc) refs_dir = argv[++i];
   }
 
@@ -229,6 +231,70 @@ int main(int argc, char** argv) {
     printf("[rtf] total wall=%.3fs audio=%.3fs RTF=%.4f (xRT=%.1f)\n",
            total_wall, total_audio, total_wall / total_audio,
            total_audio / total_wall);
+  }
+
+  // ---- streaming chunked-emission pass (real first-audio) ----
+  // Encode once (enc+dur+flow, whole phrase), then decode the latent z in fixed
+  // CHUNK-frame steps via overlap-save (decode z[a-LEFT : b+RIGHT], keep the
+  // middle (b-a)*HOP samples) — bit-exact vs full decode (host stream_decoder.py
+  // proved LEFT=64/RIGHT=4 => max-abs 1e-6). Measures first-audio = enc + first
+  // chunk decode, vs whole-utterance (must wait for the entire decode).
+  if (do_stream) {
+    const int C = 192, HOP = 256, CHUNK = 24, LEFT = 64, RIGHT = 4;
+    double sum_first = 0, sum_full = 0, worst_err = 0; int n = 0;
+    for (auto& u : utts) {
+      auto st = ctx->model->CreateState();
+      auto* s = static_cast<MBIstftVitsState*>(st.get());
+      s->phone_ids = u.phone_ids; s->tone_ids = u.tone_ids; s->lang_ids = u.lang_ids;
+      s->noise_scale = 0.0f; s->length_scale = 1.0f;
+      auto te0 = std::chrono::high_resolution_clock::now();
+      if (!ctx->model->Encode({}, *st, ctx->sched)) return 1;
+      double t_enc = std::chrono::duration<double>(
+          std::chrono::high_resolution_clock::now() - te0).count();
+
+      std::vector<float> zfull = s->z;     // time-major [T*C]
+      const int T = s->T_frames;
+      // reference: whole-utterance decode
+      auto tf0 = std::chrono::high_resolution_clock::now();
+      ctx->model->Decode(*st, ctx->sched);
+      double t_full = t_enc + std::chrono::duration<double>(
+          std::chrono::high_resolution_clock::now() - tf0).count();
+      std::vector<float> ref = s->audio_output;
+
+      // chunked overlap-save decode
+      std::vector<float> out; out.reserve(ref.size());
+      double t_first = 0; bool first = true;
+      auto tc0 = std::chrono::high_resolution_clock::now();
+      for (int a = 0; a < T; a += CHUNK) {
+        int b = std::min(a + CHUNK, T);
+        int s0 = std::max(0, a - LEFT), e = std::min(T, b + RIGHT);
+        s->z.assign(zfull.begin() + (size_t)s0 * C, zfull.begin() + (size_t)e * C);
+        s->T_frames = e - s0;
+        if (!ctx->model->Decode(*st, ctx->sched)) return 1;
+        int off = (a - s0) * HOP, keep = (b - a) * HOP;
+        auto& ao = s->audio_output;
+        if (off < (int)ao.size())
+          out.insert(out.end(), ao.begin() + off,
+                     ao.begin() + std::min((size_t)(off + keep), ao.size()));
+        if (first) {
+          t_first = t_enc + std::chrono::duration<double>(
+              std::chrono::high_resolution_clock::now() - tc0).count();
+          first = false;
+        }
+      }
+      // bit-exactness vs whole-utterance
+      double err = 0; size_t m = std::min(out.size(), ref.size());
+      for (size_t i = 0; i < m; i++) err = std::max(err, (double)fabsf(out[i] - ref[i]));
+      worst_err = std::max(worst_err, err);
+      double audio_s = (double)ref.size() / ctx->model->GetMeta().audio_sample_rate;
+      printf("[stream utt%02d] T=%df audio=%.2fs  first-audio=%.0fms (enc=%.0fms) "
+             "whole-utt-first=%.0fms  err=%.1e\n", u.idx, T, audio_s,
+             t_first * 1e3, t_enc * 1e3, t_full * 1e3, err);
+      sum_first += t_first; sum_full += t_full; n++;
+    }
+    printf("[stream] mean first-audio=%.0fms  vs whole-utt=%.0fms  (%.1fx sooner)  "
+           "worst-err=%.1e\n", sum_first / n * 1e3, sum_full / n * 1e3,
+           sum_full / sum_first, worst_err);
   }
 
   rs_free(ctx);
