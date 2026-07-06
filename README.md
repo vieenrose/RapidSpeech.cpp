@@ -61,6 +61,7 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 - [x] MeloTTS (VITS acoustic model; 8 kHz zh/en build runs on Jetson Nano gen1)
 - [x] Matcha-TTS (CFM/flow-matching; 8 kHz zh-tw/en, built-in **zh+en** text frontend (en via espeak, `-DRS_MATCHA_ESPEAK=ON`), CUDA warm-persistent demo on Jetson Nano gen1 sm_53 — see [matcha-server](examples/matcha_server/))
 - [x] OmniVoice (single-stage non-autoregressive diffusion TTS, multilingual + voice cloning)
+- [x] MOSS-TTS-Nano-100M **autoregressive LLM-TTS** (OpenMOSS) — the first ggml port of the `MossTTSNanoForCausalLM` model (stock llama.cpp can't load it). Two-level AR: 12-layer GPT-2 global transformer (interleaved RoPE, gelu_new) + 1-layer local decoder over **16 RVQ codebooks** (tied heads), then the MOSS-Audio-Tokenizer-Nano codec (12.5 fps → 48 kHz). Torch-free / ORT-free — converters + parity harnesses validate every stage against the reference ONNX: global prefill + KV-cache decode **MSE 1.4e-6**, and the assembled greedy generation loop matches ONNX **bit-exact** (frames 0–5, 16/16 codebooks, F32). Voice cloning (incl. zh-TW/台湾腔 accent) from a reference clip, temperature/top-k sampling. Jetson Nano gen1 (Tegra X1, sm_53): Q8_0 weights, **RTF 0.86** stock ggml-CUDA → **~0.35** with a custom warp-reduce `mul_mat_vec` kernel (2.6× over stock on Maxwell; see [`tools/moss_cuda/`](tools/moss_cuda/)). GGUF: [Luigi/MOSS-TTS-Nano-100M-GGUF](https://huggingface.co/Luigi/MOSS-TTS-Nano-100M-GGUF) (codec from [hans00/MOSS-TTS-Nano-GGUF](https://huggingface.co/hans00/MOSS-TTS-Nano-GGUF) via [codec.cpp](https://github.com/mybigday/codec.cpp)); convert with `scripts/convert_moss_nano_to_gguf.py`. See [`docs/moss_streaming_integration.md`](docs/moss_streaming_integration.md).
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
 
@@ -74,7 +75,7 @@ RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speec
   A `ggml`-based computation backend supporting mixed-precision inference from INT4 to FP32.
 
 - **Architecture Layer**
-  A plugin-style model construction and loading system, with support for FunASR-nano, SenseVoice, X-ASR, Qwen3-ASR, and planned support for CosyVoice, Qwen3-TTS, and more.
+  A plugin-style model construction and loading system, with support for FunASR-nano, SenseVoice, X-ASR, Qwen3-ASR, MeloTTS, Matcha-TTS, OmniVoice, MOSS-TTS-Nano, and planned support for CosyVoice, Qwen3-TTS, and more.
 
 - **Business Logic Layer**
   Built-in ring buffers, VAD (voice activity detection), text frontend processing (e.g., phonemization), and multi-session management.
