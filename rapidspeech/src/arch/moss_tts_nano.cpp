@@ -16,8 +16,12 @@ struct MossState : public RSState {
   std::vector<int> text_tokens;              // input text (streaming)
   std::vector<std::vector<int>> ref_codes;   // reference audio codes [n_codebooks][T]
   std::string ref_text;
+  std::vector<int> prompt17;                 // 17-wide prompt, flattened [L*17] (tokenizer stage populates)
+  std::vector<std::vector<int>> gen_frames;  // generated codebook frames [N][16]
   std::vector<float> audio_out;              // produced waveform (streaming drain)
   size_t audio_drained = 0;
+  int max_frames = 750;                      // ~60s cap
+  bool do_sample = true;
 };
 
 std::shared_ptr<RSState> MossTTSNanoModel::CreateState() {
@@ -336,12 +340,56 @@ bool MossTTSNanoModel::PushReferenceText(RSState &state, const char *ref_text) {
   static_cast<MossState &>(state).ref_text = ref_text ? ref_text : "";
   return true;
 }
-// Decode: run the AR frame loop; store generated codebook frames (codec decode = codec.cpp stage)
+// 17-wide prompt -> [H, L] embedding = token_embd[col0] + Sum_k audio_embd_k[col_{k+1}] (pad -> 0)
+std::vector<float> MossTTSNanoModel::PromptEmbed(const std::vector<int> &p17, int L) {
+  const int H = hp_.n_embd, NCB = hp_.n_codebooks;
+  std::vector<float> emb((size_t)H * L, 0.0f);
+  for (int p = 0; p < L; p++) {
+    int base = p * (NCB + 1);
+    std::vector<float> t = emb_row(backend_, token_embd_, p17[base], H);
+    for (int j = 0; j < H; j++) emb[(size_t)p * H + j] = t[j];
+    for (int k = 0; k < NCB; k++) {
+      int c = p17[base + 1 + k];
+      if (c == hp_.audio_pad || c >= (int)hp_.codebook_size) continue;
+      std::vector<float> a = emb_row(backend_, audio_embd_[k], c, H);
+      for (int j = 0; j < H; j++) emb[(size_t)p * H + j] += a[j];
+    }
+  }
+  return emb;
+}
+
+// Decode: prefill prompt -> AR frame loop (GenFrame + decode_step feedback) -> gen_frames.
+// Codec decode (frames -> 48kHz) is the codec.cpp bridge (frames handed off / decoded separately).
 bool MossTTSNanoModel::Decode(RSState &state, ggml_backend_sched_t) {
   auto &s = static_cast<MossState &>(state);
   if (!kv_ctx_ && !AllocKV()) { RS_LOG_ERR("moss: KV alloc failed"); return false; }
-  (void)s;
-  RS_LOG_INFO("moss: Decode ready (RunGlobal/RunLocal/GenFrame wired; prompt-embed + codec.cpp bridge pending)");
+  if (s.prompt17.empty()) { RS_LOG_ERR("moss: no prompt (tokenizer stage must populate prompt17)"); return false; }
+  const int H = hp_.n_embd, NCB = hp_.n_codebooks;
+  int L = (int)s.prompt17.size() / (NCB + 1);
+  uint32_t rng = (uint32_t)(seed_ ? seed_ : 1234u);
+  // prefill
+  std::vector<float> pe = PromptEmbed(s.prompt17, L);
+  std::vector<float> gh = RunGlobal(pe, L, 0);
+  std::vector<float> hidden(gh.begin() + (size_t)(L - 1) * H, gh.end());
+  int n_past = L;
+  s.gen_frames.clear();
+  for (int fi = 0; fi < s.max_frames; fi++) {
+    std::vector<int> frame = GenFrame(hidden, rng, s.do_sample);
+    if ((int)frame.size() < NCB) break;               // end token
+    s.gen_frames.push_back(frame);
+    // feedback: next 17-wide row embed = wte(assistant_slot) + Sum audio_embd_k(code_k)
+    std::vector<float> row = emb_row(backend_, token_embd_, hp_.audio_assistant_slot, H);
+    for (int k = 0; k < NCB; k++) {
+      std::vector<float> a = emb_row(backend_, audio_embd_[k], frame[k], H);
+      for (int j = 0; j < H; j++) row[j] += a[j];
+    }
+    std::vector<float> nh = RunGlobal(row, 1, n_past);
+    hidden.assign(nh.begin(), nh.begin() + H);
+    n_past++;
+    if (n_past >= kMaxSeq - 1) break;
+  }
+  RS_LOG_INFO("moss: generated %zu frames (%.1fs). Codec decode via codec.cpp bridge.",
+              s.gen_frames.size(), s.gen_frames.size() / 12.5);
   return true;
 }
 int MossTTSNanoModel::GetAudioOutput(RSState &state, float **out) {

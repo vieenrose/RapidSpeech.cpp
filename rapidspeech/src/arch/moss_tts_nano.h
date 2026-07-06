@@ -98,4 +98,5 @@ private:
   std::vector<float> RunGlobal(const std::vector<float> &emb, int n_new, int n_past);
   std::vector<float> RunLocal(const std::vector<float> &seq, int L);
   std::vector<int> GenFrame(const std::vector<float> &hidden, uint32_t &rng, bool do_sample);
+  std::vector<float> PromptEmbed(const std::vector<int> &p17, int L);
 };
