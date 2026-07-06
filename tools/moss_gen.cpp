@@ -5,6 +5,9 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -106,7 +109,12 @@ static std::vector<float> run_local(const std::vector<float>&seq,int L){
 int main(int argc,char**argv){
   const char*gg=argc>1?argv[1]:"/home/luigi/moss-port/moss_nano_full.gguf";
   gguf_init_params gp{false,&wctx}; if(!gguf_init_from_file(gg,gp)){printf("gguf\n");return 1;}
+#ifdef GGML_USE_CUDA
+  if(getenv("RS_CUDA")){ be=ggml_backend_cuda_init(0); printf("[backend] CUDA\n"); }
+  else be=ggml_backend_cpu_init();
+#else
   be=ggml_backend_cpu_init();
+#endif
   ggml_init_params kp{(size_t)(2*NL+4)*ggml_tensor_overhead(),nullptr,true}; ggml_context*kvc=ggml_init(kp);
   for(int i=0;i<NL;i++){Kc[i]=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,512);Vc[i]=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,512);}
   ggml_backend_alloc_ctx_tensors(kvc,be);
