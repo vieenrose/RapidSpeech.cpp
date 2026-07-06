@@ -10,6 +10,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 static const int H=768,NH=12,HD=64,NL=12,FF=3072,VOCAB=16384,CB=1024,NCB=16;
 static const int AUDIO_ASSIST=9, AUDIO_END=7;
@@ -117,6 +118,19 @@ int main(int argc,char**argv){
   auto aud_emb=[&](int k,int c){return &AUD[((size_t)k*CB+c)*H];};
   // logits = W(rows,H) . h ; argmax
   auto argmax_logit=[&](const float*Wm,int rows,const float*h){int best=0;float bm=-1e30f;for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];if(d>bm){bm=d;best=r;}}return best;};
+  // temperature + top-k sampling over W.h logits
+  unsigned rng = argc>3?(unsigned)atoi(argv[3]):1234u;
+  auto sample_logit=[&](const float*Wm,int rows,const float*h,float temp,int topk){
+    std::vector<float> lg(rows); for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];lg[r]=d;}
+    std::vector<int> idx(rows); for(int r=0;r<rows;r++)idx[r]=r;
+    if(topk>0&&topk<rows){std::partial_sort(idx.begin(),idx.begin()+topk,idx.end(),[&](int a,int b){return lg[a]>lg[b];});idx.resize(topk);}
+    float mx=-1e30f; for(int i:idx) mx=std::max(mx,lg[i]);
+    double sum=0; std::vector<double> pr(idx.size()); for(size_t i=0;i<idx.size();i++){pr[i]=exp((lg[idx[i]]-mx)/temp);sum+=pr[i];}
+    rng=rng*1664525u+1013904223u; double u=(double)(rng>>8)/16777216.0*sum; double c=0;
+    for(size_t i=0;i<idx.size();i++){c+=pr[i]; if(u<=c) return idx[i];}
+    return idx.back();
+  };
+  bool do_sample = argc>4 && std::string(argv[4])=="sample";
 
   int L=177, NFRAMES=argc>2?atoi(argv[2]):12;
   std::vector<float> pe=lb("/home/luigi/moss-port/gg_prompt_emb.bin",(size_t)L*H);
@@ -140,7 +154,7 @@ int main(int argc,char**argv){
     for(int k=0;k<NCB;k++){
       lseq.insert(lseq.end(),cur,cur+H); Lc++;
       hl=run_local(lseq,Lc);
-      int cb=argmax_logit(aud_emb(k,0),CB,hl.data());
+      int cb=do_sample?sample_logit(aud_emb(k,0),CB,hl.data(),0.8f,25):argmax_logit(aud_emb(k,0),CB,hl.data());
       frame.push_back(cb); cur=aud_emb(k,cb);
     }
     gen.push_back(frame);
