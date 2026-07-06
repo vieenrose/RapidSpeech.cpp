@@ -184,6 +184,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/mbistft_vits.cpp
         rapidspeech/src/arch/matcha.cpp
         rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/arch/moss_tts_nano.cpp
         rapidspeech/src/arch/campplus.cpp
         rapidspeech/src/arch/bert.cpp
         rapidspeech/src/arch/bert.h
@@ -470,6 +471,18 @@ if (RS_BUILD_CLI)
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
             ${GGML_PATH}/include ${GGML_PATH}/src)
+    add_executable(moss-local-parity tools/moss_local_parity.cpp)
+    target_link_libraries(moss-local-parity PRIVATE rapidspeech-core ggml)
+    target_include_directories(moss-local-parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src ${GGML_PATH}/include ${GGML_PATH}/src)
+    add_executable(moss-parity tools/moss_parity.cpp)
+    target_link_libraries(moss-parity PRIVATE rapidspeech-core ggml)
+    target_include_directories(moss-parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src ${GGML_PATH}/include ${GGML_PATH}/src)
+    add_executable(moss-load-test tools/moss_load_test.cpp)
+    target_link_libraries(moss-load-test PRIVATE rapidspeech-core ggml)
+    target_include_directories(moss-load-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include ${GGML_PATH}/src)
     endif()
     if (RS_XASR_DEV_TEST)
         add_executable(xasr-dev-test tools/xasr_dev_test.cpp)
