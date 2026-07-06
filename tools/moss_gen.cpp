@@ -118,28 +118,46 @@ int main(int argc,char**argv){
   // logits = W(rows,H) . h ; argmax
   auto argmax_logit=[&](const float*Wm,int rows,const float*h){int best=0;float bm=-1e30f;for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];if(d>bm){bm=d;best=r;}}return best;};
 
-  int L=177;
+  int L=177, NFRAMES=argc>2?atoi(argv[2]):12;
   std::vector<float> pe=lb("/home/luigi/moss-port/gg_prompt_emb.bin",(size_t)L*H);
   std::vector<float> gh=run_global(pe,L,0);              // prefill, KV filled [0..L)
   std::vector<float> hidden(gh.begin()+(size_t)(L-1)*H, gh.end());  // last position [H]
+  int n_past=L;
 
-  // ---- frame 0: local greedy ----
-  std::vector<float> lseq(hidden);                       // pos0 = global hidden
-  int Lc=1;
-  std::vector<float> hl=run_local(lseq,Lc);
-  int text_tok=argmax_logit(TOK.data(),VOCAB,hl.data()); // text_lm_head tied = token_embd
-  printf("frame0 predicted text_tok=%d (assist=%d end=%d)\n",text_tok,AUDIO_ASSIST,AUDIO_END);
-  std::vector<int> frame;
-  const float* cur=tok_emb(text_tok);
-  for(int k=0;k<NCB;k++){
-    lseq.insert(lseq.end(),cur,cur+H); Lc++;
-    hl=run_local(lseq,Lc);
-    int cb=argmax_logit(aud_emb(k,0),CB,hl.data());      // audio_lm_heads[k] tied = audio_embd[k]
-    frame.push_back(cb);
-    cur=aud_emb(k,cb);
+  // reference frames [NFRAMES,16]
+  std::vector<int32_t> ref((size_t)NFRAMES*NCB);
+  { FILE*f=fopen("/home/luigi/moss-port/gg_frames.bin","rb"); if(f){fread(ref.data(),4,ref.size(),f);fclose(f);} }
+
+  std::vector<std::vector<int>> gen;
+  int total_ok=0, total=0;
+  for(int fi=0; fi<NFRAMES; fi++){
+    // ---- local greedy frame ----
+    std::vector<float> lseq(hidden); int Lc=1;
+    std::vector<float> hl=run_local(lseq,Lc);
+    int text_tok=argmax_logit(TOK.data(),VOCAB,hl.data());
+    if(text_tok==AUDIO_END){ printf("frame %d: text_tok=END, stop\n",fi); break; }
+    std::vector<int> frame; const float* cur=tok_emb(text_tok);
+    for(int k=0;k<NCB;k++){
+      lseq.insert(lseq.end(),cur,cur+H); Lc++;
+      hl=run_local(lseq,Lc);
+      int cb=argmax_logit(aud_emb(k,0),CB,hl.data());
+      frame.push_back(cb); cur=aud_emb(k,cb);
+    }
+    gen.push_back(frame);
+    // compare to ref
+    int ok=0; for(int c=0;c<NCB;c++){ if(frame[c]==ref[(size_t)fi*NCB+c]) ok++; }
+    total_ok+=ok; total+=NCB;
+    printf("frame %2d: %2d/16 match (text_tok=%d)\n",fi,ok,text_tok);
+    // ---- feedback: build next 17-wide row embed = wte(assist) + Σ audio_embd_k(code_k) ----
+    std::vector<float> row(tok_emb(AUDIO_ASSIST),tok_emb(AUDIO_ASSIST)+H);
+    for(int k=0;k<NCB;k++){ const float*e=aud_emb(k,frame[k]); for(int j=0;j<H;j++) row[j]+=e[j]; }
+    std::vector<float> nh=run_global(row,1,n_past);  // decode_step [KV]
+    hidden.assign(nh.begin(),nh.begin()+H); n_past++;
   }
-  // load gg_frames row 0 (int32) — read raw after npy header is messy; compare printed
-  printf("ggml frame0: "); for(int c=0;c<NCB;c++) printf("%d ",frame[c]); printf("\n");
-  printf("ref  frame0: 55 709 378 1019 128 800 794 632 682 556 585 76 245 636 225 226\n");
+  printf("=== TOTAL %d/%d codebooks match (%.1f%%) over %zu frames ===\n",total_ok,total,100.0*total_ok/total,gen.size());
+  // dump generated tokens for codec decode
+  FILE*of=fopen("/home/luigi/moss-port/gg_gen_ggml.bin","wb");
+  for(auto&fr:gen) for(int c=0;c<NCB;c++){int32_t t=fr[c];fwrite(&t,4,1,of);} fclose(of);
+  printf("wrote %zu frames -> gg_gen_ggml.bin\n",gen.size());
   return 0;
 }
