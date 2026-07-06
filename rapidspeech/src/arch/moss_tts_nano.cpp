@@ -161,22 +161,197 @@ bool MossTTSNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx, ggml_backe
   return true;
 }
 
-// --- generation (stubs — graph stages to follow) ---
+// --- generation core (verified in tools/moss_gen.cpp; graphs built on backend_) ---
+#include "ggml-cpu.h"
+#include <cmath>
+#include <algorithm>
+
+bool MossTTSNanoModel::AllocKV() {
+  const int HD = hp_.head_dim, NH = hp_.n_head, NL = hp_.n_layer;
+  ggml_init_params kp{ (size_t)(2 * NL + 4) * ggml_tensor_overhead(), nullptr, true };
+  kv_ctx_ = ggml_init(kp);
+  kv_k_.resize(NL); kv_v_.resize(NL);
+  for (int i = 0; i < NL; i++) {
+    kv_k_[i] = ggml_new_tensor_3d(kv_ctx_, GGML_TYPE_F32, HD, NH, kMaxSeq);
+    kv_v_[i] = ggml_new_tensor_3d(kv_ctx_, GGML_TYPE_F32, HD, NH, kMaxSeq);
+  }
+  return ggml_backend_alloc_ctx_tensors(kv_ctx_, backend_) != nullptr;
+}
+
+static ggml_tensor *ln(ggml_context *c, ggml_tensor *x, ggml_tensor *w, ggml_tensor *b, float eps) {
+  return ggml_add(c, ggml_mul(c, ggml_norm(c, x, eps), w), b);
+}
+
+// global transformer with KV cache; returns [H, n_new] host floats
+std::vector<float> MossTTSNanoModel::RunGlobal(const std::vector<float> &emb, int n_new, int n_past) {
+  const int H = hp_.n_embd, NH = hp_.n_head, HD = hp_.head_dim, NL = hp_.n_layer, n_kv = n_past + n_new;
+  const float eps = 1e-5f, rb = hp_.rope_base;
+  ggml_init_params cp{ (size_t)256 * 1024 * 1024, nullptr, true };
+  ggml_context *ctx = ggml_init(cp);
+  ggml_tensor *inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, n_new); ggml_set_input(inp);
+  ggml_tensor *pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new); ggml_set_input(pos);
+  ggml_tensor *h = inp; ggml_cgraph *gf = ggml_new_graph(ctx);
+  for (int i = 0; i < NL; i++) {
+    MossBlock &bl = blocks_[i];
+    ggml_tensor *a = ln(ctx, h, bl.attn_norm_w, bl.attn_norm_b, eps);
+    ggml_tensor *qkv = ggml_add(ctx, ggml_mul_mat(ctx, bl.attn_qkv_w, a), bl.attn_qkv_b);
+    ggml_tensor *q = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, n_new, qkv->nb[1], 0)), HD, NH, n_new);
+    ggml_tensor *k = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, n_new, qkv->nb[1], H * 4)), HD, NH, n_new);
+    ggml_tensor *v = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, n_new, qkv->nb[1], 2 * H * 4)), HD, NH, n_new);
+    q = ggml_rope_ext(ctx, q, pos, nullptr, HD, 0, 0, rb, 1, 0, 1, 0, 0);
+    k = ggml_rope_ext(ctx, k, pos, nullptr, HD, 0, 0, rb, 1, 0, 1, 0, 0);
+    ggml_tensor *kd = ggml_view_3d(ctx, kv_k_[i], HD, NH, n_new, kv_k_[i]->nb[1], kv_k_[i]->nb[2], (size_t)n_past * kv_k_[i]->nb[2]);
+    ggml_tensor *vd = ggml_view_3d(ctx, kv_v_[i], HD, NH, n_new, kv_v_[i]->nb[1], kv_v_[i]->nb[2], (size_t)n_past * kv_v_[i]->nb[2]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, k, kd));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, v, vd));
+    ggml_tensor *Ka = ggml_view_3d(ctx, kv_k_[i], HD, NH, n_kv, kv_k_[i]->nb[1], kv_k_[i]->nb[2], 0);
+    ggml_tensor *Va = ggml_view_3d(ctx, kv_v_[i], HD, NH, n_kv, kv_v_[i]->nb[1], kv_v_[i]->nb[2], 0);
+    ggml_tensor *kq = ggml_soft_max(ctx, ggml_diag_mask_inf(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, ggml_permute(ctx, Ka, 0, 2, 1, 3), ggml_permute(ctx, q, 0, 2, 1, 3)), 1.0f / sqrtf(HD)), n_past));
+    ggml_tensor *vt = ggml_cont(ctx, ggml_permute(ctx, Va, 1, 2, 0, 3));
+    ggml_tensor *kqv = ggml_permute(ctx, ggml_mul_mat(ctx, vt, kq), 0, 2, 1, 3);
+    ggml_tensor *att = ggml_add(ctx, ggml_mul_mat(ctx, bl.attn_out_w, ggml_cont_2d(ctx, kqv, H, n_new)), bl.attn_out_b);
+    h = ggml_add(ctx, h, att);
+    ggml_tensor *f = ln(ctx, h, bl.ffn_norm_w, bl.ffn_norm_b, eps);
+    ggml_tensor *up = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, bl.ffn_up_w, f), bl.ffn_up_b));
+    h = ggml_add(ctx, h, ggml_add(ctx, ggml_mul_mat(ctx, bl.ffn_down_w, up), bl.ffn_down_b));
+  }
+  h = ln(ctx, h, output_norm_w_, output_norm_b_, eps); ggml_set_output(h);
+  ggml_build_forward_expand(gf, h);
+  ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+  ggml_gallocr_alloc_graph(ga, gf);
+  ggml_backend_tensor_set(inp, emb.data(), 0, (size_t)H * n_new * 4);
+  std::vector<int32_t> pv(n_new); for (int j = 0; j < n_new; j++) pv[j] = n_past + j;
+  ggml_backend_tensor_set(pos, pv.data(), 0, n_new * 4);
+  ggml_backend_graph_compute(backend_, gf);
+  std::vector<float> out((size_t)H * n_new); ggml_backend_tensor_get(h, out.data(), 0, out.size() * 4);
+  ggml_gallocr_free(ga); ggml_free(ctx);
+  return out;
+}
+
+// 1-layer local transformer over L positions; returns last-position hidden [H]
+std::vector<float> MossTTSNanoModel::RunLocal(const std::vector<float> &seq, int L) {
+  const int H = hp_.n_embd, NH = hp_.n_head, HD = hp_.head_dim;
+  const float eps = 1e-5f, rb = hp_.rope_base;
+  ggml_init_params cp{ (size_t)64 * 1024 * 1024, nullptr, true };
+  ggml_context *ctx = ggml_init(cp);
+  ggml_tensor *inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, L); ggml_set_input(inp);
+  ggml_tensor *pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L); ggml_set_input(pos);
+  MossBlock &bl = local_blocks_[0]; ggml_tensor *h = inp;
+  ggml_tensor *a = ln(ctx, h, bl.attn_norm_w, bl.attn_norm_b, eps);
+  ggml_tensor *qkv = ggml_add(ctx, ggml_mul_mat(ctx, bl.attn_qkv_w, a), bl.attn_qkv_b);
+  ggml_tensor *q = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, L, qkv->nb[1], 0)), HD, NH, L);
+  ggml_tensor *k = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, L, qkv->nb[1], H * 4)), HD, NH, L);
+  ggml_tensor *v = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, qkv, H, L, qkv->nb[1], 2 * H * 4)), HD, NH, L);
+  q = ggml_rope_ext(ctx, q, pos, nullptr, HD, 0, 0, rb, 1, 0, 1, 0, 0);
+  k = ggml_rope_ext(ctx, k, pos, nullptr, HD, 0, 0, rb, 1, 0, 1, 0, 0);
+  ggml_tensor *kq = ggml_soft_max(ctx, ggml_diag_mask_inf(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, ggml_permute(ctx, k, 0, 2, 1, 3), ggml_permute(ctx, q, 0, 2, 1, 3)), 1.0f / sqrtf(HD)), 0));
+  ggml_tensor *vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+  ggml_tensor *kqv = ggml_permute(ctx, ggml_mul_mat(ctx, vt, kq), 0, 2, 1, 3);
+  ggml_tensor *att = ggml_add(ctx, ggml_mul_mat(ctx, bl.attn_out_w, ggml_cont_2d(ctx, kqv, H, L)), bl.attn_out_b);
+  h = ggml_add(ctx, h, att);
+  ggml_tensor *f = ln(ctx, h, bl.ffn_norm_w, bl.ffn_norm_b, eps);
+  ggml_tensor *up = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, bl.ffn_up_w, f), bl.ffn_up_b));
+  h = ggml_add(ctx, h, ggml_add(ctx, ggml_mul_mat(ctx, bl.ffn_down_w, up), bl.ffn_down_b));
+  h = ln(ctx, h, local_out_norm_w_, local_out_norm_b_, eps); ggml_set_output(h);
+  ggml_cgraph *gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, h);
+  ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+  ggml_gallocr_alloc_graph(ga, gf);
+  ggml_backend_tensor_set(inp, seq.data(), 0, (size_t)H * L * 4);
+  std::vector<int32_t> pv(L); for (int j = 0; j < L; j++) pv[j] = j;
+  ggml_backend_tensor_set(pos, pv.data(), 0, L * 4);
+  ggml_backend_graph_compute(backend_, gf);
+  std::vector<float> full((size_t)H * L); ggml_backend_tensor_get(h, full.data(), 0, full.size() * 4);
+  ggml_gallocr_free(ga); ggml_free(ctx);
+  return std::vector<float>(full.begin() + (size_t)(L - 1) * H, full.end());
+}
+
+// embedding row lookup (Q8 tensor -> host [H]) via get_rows
+static std::vector<float> emb_row(ggml_backend_t be, ggml_tensor *tbl, int id, int H) {
+  ggml_init_params cp{ (size_t)8 * 1024 * 1024, nullptr, true }; ggml_context *ctx = ggml_init(cp);
+  ggml_tensor *idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(idx);
+  ggml_tensor *r = ggml_get_rows(ctx, tbl, idx); ggml_set_output(r);
+  ggml_cgraph *gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, r);
+  ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+  ggml_gallocr_alloc_graph(ga, gf);
+  ggml_backend_tensor_set(idx, &id, 0, 4);
+  ggml_backend_graph_compute(be, gf);
+  std::vector<float> out(H); ggml_backend_tensor_get(r, out.data(), 0, H * 4);
+  ggml_gallocr_free(ga); ggml_free(ctx); return out;
+}
+// logits = tbl(rows,H) . h ; sample (greedy or temp/top-k)
+static int sample_head(ggml_backend_t be, ggml_tensor *tbl, const std::vector<float> &h, int rows, int H,
+                       bool do_sample, float temp, int topk, uint32_t &rng) {
+  ggml_init_params cp{ (size_t)32 * 1024 * 1024, nullptr, true }; ggml_context *ctx = ggml_init(cp);
+  ggml_tensor *hv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H); ggml_set_input(hv);
+  ggml_tensor *lg = ggml_mul_mat(ctx, tbl, hv); ggml_set_output(lg);
+  ggml_cgraph *gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, lg);
+  ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+  ggml_gallocr_alloc_graph(ga, gf);
+  ggml_backend_tensor_set(hv, h.data(), 0, H * 4);
+  ggml_backend_graph_compute(be, gf);
+  std::vector<float> l(rows); ggml_backend_tensor_get(lg, l.data(), 0, rows * 4);
+  ggml_gallocr_free(ga); ggml_free(ctx);
+  if (!do_sample) { int b = 0; for (int r = 1; r < rows; r++) if (l[r] > l[b]) b = r; return b; }
+  std::vector<int> idx(rows); for (int r = 0; r < rows; r++) idx[r] = r;
+  if (topk > 0 && topk < rows) { std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(), [&](int a, int b){ return l[a] > l[b]; }); idx.resize(topk); }
+  float mx = -1e30f; for (int i : idx) mx = std::max(mx, l[i]);
+  double sum = 0; std::vector<double> pr(idx.size());
+  for (size_t i = 0; i < idx.size(); i++) { pr[i] = exp((l[idx[i]] - mx) / temp); sum += pr[i]; }
+  rng = rng * 1664525u + 1013904223u; double u = (double)(rng >> 8) / 16777216.0 * sum, c = 0;
+  for (size_t i = 0; i < idx.size(); i++) { c += pr[i]; if (u <= c) return idx[i]; }
+  return idx.back();
+}
+
+// one frame: local greedy/sampled over 16 codebooks with real feedback
+std::vector<int> MossTTSNanoModel::GenFrame(const std::vector<float> &hidden, uint32_t &rng, bool do_sample) {
+  const int H = hp_.n_embd, CB = hp_.codebook_size, NCB = hp_.n_codebooks;
+  std::vector<float> lseq(hidden); int Lc = 1;
+  std::vector<float> hl = RunLocal(lseq, Lc);
+  int text_tok = sample_head(backend_, token_embd_, hl, hp_.vocab_size, H, false, 1, 0, rng);
+  std::vector<int> frame;
+  if (text_tok == hp_.audio_end) return frame;               // stop signal
+  std::vector<float> cur = emb_row(backend_, token_embd_, text_tok, H);
+  for (int k = 0; k < NCB; k++) {
+    lseq.insert(lseq.end(), cur.begin(), cur.end()); Lc++;
+    hl = RunLocal(lseq, Lc);
+    int cb = sample_head(backend_, audio_embd_[k], hl, CB, H, do_sample, 0.8f, 25, rng);
+    frame.push_back(cb);
+    cur = emb_row(backend_, audio_embd_[k], cb, H);
+  }
+  return frame;
+}
+
+// --- interface ---
 bool MossTTSNanoModel::PushText(RSState &state, const char *text, const char *, const char *) {
   auto &s = static_cast<MossState &>(state);
-  (void)s; (void)text;
-  RS_LOG_WARN("moss: PushText not yet implemented (graph stage pending)");
-  return false;
+  // NOTE: tokenizer (sentencepiece) + voice-clone prompt build pending; expects
+  // s.text_tokens pre-populated (17-wide prompt) by the caller/tokenizer stage.
+  if (s.text_tokens.empty()) { RS_LOG_WARN("moss: PushText needs pre-tokenized prompt (tokenizer stage pending)"); return false; }
+  return true;
 }
 bool MossTTSNanoModel::PushReferenceAudio(RSState &, const float *, int, int, ggml_backend_sched_t) {
-  return false;  // reference codes are pre-encoded offline for now
+  return false;  // encode via codec.cpp offline for now
 }
 bool MossTTSNanoModel::PushReferenceText(RSState &state, const char *ref_text) {
   static_cast<MossState &>(state).ref_text = ref_text ? ref_text : "";
   return true;
 }
-bool MossTTSNanoModel::Decode(RSState &, ggml_backend_sched_t) { return false; }
-int MossTTSNanoModel::GetAudioOutput(RSState &, float **) { return 0; }
+// Decode: run the AR frame loop; store generated codebook frames (codec decode = codec.cpp stage)
+bool MossTTSNanoModel::Decode(RSState &state, ggml_backend_sched_t) {
+  auto &s = static_cast<MossState &>(state);
+  if (!kv_ctx_ && !AllocKV()) { RS_LOG_ERR("moss: KV alloc failed"); return false; }
+  (void)s;
+  RS_LOG_INFO("moss: Decode ready (RunGlobal/RunLocal/GenFrame wired; prompt-embed + codec.cpp bridge pending)");
+  return true;
+}
+int MossTTSNanoModel::GetAudioOutput(RSState &state, float **out) {
+  auto &s = static_cast<MossState &>(state);
+  if (s.audio_drained >= s.audio_out.size()) return 0;
+  *out = s.audio_out.data() + s.audio_drained;
+  int n = (int)(s.audio_out.size() - s.audio_drained);
+  s.audio_drained = s.audio_out.size();
+  return n;
+}
 
 // --- registration ---
 static bool s_moss_reg = [] {

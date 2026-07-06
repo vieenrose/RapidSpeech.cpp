@@ -85,7 +85,17 @@ private:
   ggml_tensor *codec_q_out_w_ = nullptr, *codec_q_out_b_ = nullptr;
   std::vector<MossRVQ> codec_rvq_;
 
+  // KV cache (persistent per-layer global K/V on backend); max context positions
+  static const int kMaxSeq = 2048;
+  ggml_context *kv_ctx_ = nullptr;
+  std::vector<ggml_tensor *> kv_k_, kv_v_;   // [n_layer]
+
   bool LoadHParams(const rs_context_t &ctx);
   bool LoadTensors(const rs_context_t &ctx);
   bool LoadCodec(const rs_context_t &ctx);
+  bool AllocKV();
+  // generation core (verified in tools/moss_gen.cpp)
+  std::vector<float> RunGlobal(const std::vector<float> &emb, int n_new, int n_past);
+  std::vector<float> RunLocal(const std::vector<float> &seq, int L);
+  std::vector<int> GenFrame(const std::vector<float> &hidden, uint32_t &rng, bool do_sample);
 };
