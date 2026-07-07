@@ -54,6 +54,13 @@ class RapidSpeechWASM {
     this._setPrompt     = module.cwrap('rs_wasm_set_user_input_prompt',  'number', ['string']);
     this._setUseLlm     = module.cwrap('rs_wasm_set_use_llm',            'number', ['number']);
     this._setCtcPrecheck= module.cwrap('rs_wasm_set_ctc_precheck',       'number', ['number']);
+
+    // ── true streaming ASR (X-ASR) ──
+    this._streamSupported  = module.cwrap('rs_wasm_asr_stream_supported',     'number', []);
+    this._streamSetChunkLen= module.cwrap('rs_wasm_asr_stream_set_chunk_len', 'number', ['number']);
+    this._streamPush       = module.cwrap('rs_wasm_asr_stream_push',          'number', ['number', 'number']);
+    this._streamFinish     = module.cwrap('rs_wasm_asr_stream_finish',        'number', []);
+    this._streamReset      = module.cwrap('rs_wasm_asr_stream_reset',         'number', []);
     this._setTtsParams  = module.cwrap('rs_wasm_set_tts_params',         'number', ['string','string','number']);
     this._setTtsSteps   = module.cwrap('rs_wasm_set_tts_diffusion_steps','number', ['number']);
 
@@ -150,6 +157,38 @@ class RapidSpeechWASM {
     const status = await this._redecode();
     return { status, text: status > 0 ? this._getText() : '' };
   }
+
+  // ── true streaming ASR (X-ASR) ─────────────────────────────
+  /** True if the loaded model supports chunked streaming (X-ASR). */
+  streamSupported() { return this._ready && this._streamSupported() === 1; }
+
+  /**
+   * Set streaming chunk length in fbank frames (16/32/48/96/192, a multiple
+   * of 16). Larger = higher latency, lower RTF. Call before the first push.
+   */
+  setChunkLen(nFbankFrames) { this._streamSetChunkLen(nFbankFrames | 0); }
+
+  /**
+   * Push 16 kHz mono float32 PCM in [-1,1]. Processes all complete chunks and
+   * extends the running hypothesis.
+   * @returns {{updated: boolean, text: string}} updated=true if the partial
+   *          changed; text is the current running transcription.
+   */
+  streamPush(pcm) {
+    if (!this._ready) return { updated: false, text: '' };
+    const n = pcm.length;
+    const ptr = this._mod._malloc(n * 4);
+    this._mod.HEAPF32.set(pcm, ptr / 4);
+    const ret = this._streamPush(ptr, n);
+    this._mod._free(ptr);
+    return { updated: ret === 1, text: this._getText() };
+  }
+
+  /** Flush the tail (pads silence) so trailing speech is emitted. */
+  streamFinish() { this._streamFinish(); return this._getText(); }
+
+  /** Reset streaming state to start a fresh utterance. */
+  streamReset() { this._streamReset(); }
 
   // ── TTS ───────────────────────────────────────────────────
   /** Set TTS generation params (OmniVoice). */

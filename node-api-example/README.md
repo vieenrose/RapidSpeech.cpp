@@ -130,9 +130,30 @@ module. The bridge handles:
 | `rs_wasm_redecode()` | Re-run decoder only (2-pass ASR, async) |
 | `rs_wasm_get_text() / get_audio_ptr() / get_audio_len()` | Read outputs |
 | `rs_wasm_set_use_llm / set_ctc_precheck / set_user_input_prompt` | ASR knobs |
+| `rs_wasm_asr_stream_supported / set_chunk_len / push / finish / reset` | X-ASR true streaming |
 | `rs_wasm_set_tts_params / set_tts_diffusion_steps` | TTS knobs |
 | `rs_wasm_get_sample_rate / get_arch_name / get_version` | Metadata |
 | `rs_wasm_vad_init / push_audio / drain_segments / drain_frames` | VAD streaming API |
+
+### True streaming ASR (X-ASR)
+
+For X-ASR the bridge exposes a chunked-streaming path (continuous transducer,
+sub-second partials) distinct from the `pushAudio`/`process` cadence:
+
+```js
+const rs = new RapidSpeechWASM(module);
+await rs.init('xasr-q4_k_m.gguf', RS_TASK.ASR_OFFLINE);
+if (rs.streamSupported()) {           // false for SenseVoice/FunASR
+  rs.setChunkLen(32);                  // fbank frames: 16/32/48/96/192 (×16)
+  for (const chunk of pcmChunks) {     // Float32Array, 16 kHz mono [-1,1]
+    const { updated, text } = rs.streamPush(chunk);
+    if (updated) process.stdout.write('\r' + text);
+  }
+  console.log('\n' + rs.streamFinish()); // flush tail, final text
+  rs.streamReset();
+}
+```
+
 
 ## Notes
 

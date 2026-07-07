@@ -7,7 +7,8 @@ and streaming use of every task type the library exposes (ASR / TTS / VAD).
 python-api-examples/
 ├── asr/
 │   ├── asr-offline.py    # File-based ASR, optional VAD pre-segmentation, 2-pass
-│   └── asr-online.py     # Microphone or WAV replay → neural VAD → ASR, 2-pass
+│   ├── asr-online.py     # Microphone or WAV replay → neural VAD → ASR, 2-pass
+│   └── asr-streaming.py  # X-ASR true chunked streaming, live partials
 └── tts/
     ├── tts-offline.py    # text → WAV (OmniVoice / OpenVoice2), voice cloning
     └── tts-streaming.py  # text → chunked PCM stream, low-latency consumption
@@ -106,6 +107,37 @@ Notes:
 - `--two-pass` and `--no-llm` are mutually exclusive.
 - A rolling 60-second 16 kHz buffer is kept so segments can be sliced out of
   history once the VAD closes them.
+
+### True streaming — `asr/asr-streaming.py` (X-ASR only)
+
+Unlike `asr-online.py` (VAD-segmented, each segment decoded offline), this
+drives X-ASR's chunked encoder + continuous transducer directly: fixed audio
+chunks in, partial text out with sub-second latency, hypothesis continuous
+across chunks. Uses `asr_offline.stream_*` — no VAD needed.
+
+```bash
+# Replay a WAV as a stream (no microphone)
+python asr/asr-streaming.py --model xasr-q4_k_m.gguf --simulate test.wav
+
+# Live microphone (needs sounddevice)
+python asr/asr-streaming.py --model xasr-q4_k_m.gguf
+
+# Latency vs throughput: 16 = 160 ms chunks, 96 = 960 ms chunks
+python asr/asr-streaming.py --model xasr-q4_k_m.gguf --simulate test.wav --chunk-len 16
+```
+
+API (on the `asr_offline` handle):
+
+```python
+asr = rapidspeech.asr_offline("xasr-q4_k_m.gguf", n_threads=4, use_gpu=True)
+assert asr.stream_supported()      # False for SenseVoice/FunASR — use process()
+asr.set_chunk_len(32)              # fbank frames; 16/32/48/96/192 (×16)
+if asr.stream_push(pcm_16k_mono):  # True when the partial changed
+    print(asr.stream_get_text())   # running hypothesis
+asr.stream_finish()                # flush the tail
+print(asr.stream_get_text())       # final
+asr.stream_reset()                 # next utterance
+```
 
 ## TTS
 

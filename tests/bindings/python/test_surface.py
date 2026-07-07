@@ -70,6 +70,13 @@ def test_asr_methods_present():
         "set_ctc_precheck",
         "get_model_meta",
         "get_backend_name",
+        # true streaming ASR (X-ASR)
+        "stream_supported",
+        "set_chunk_len",
+        "stream_push",
+        "stream_get_text",
+        "stream_finish",
+        "stream_reset",
     }
     missing = expected - set(dir(rapidspeech.asr_offline))
     assert not missing, f"asr_offline missing methods: {missing}"

@@ -169,6 +169,18 @@ cmake -B build
 cmake --build build --config Release
 ```
 
+**Self-contained executables** (no runtime DLL/.so dependencies) — build the
+core and ggml statically into each CLI with `-DRS_STATIC_EXE=ON`:
+
+```bash
+# Windows / MSVC
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DRS_STATIC_EXE=ON
+cmake --build build --config Release --parallel
+# Linux / macOS
+cmake -B build -DRS_STATIC_EXE=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
 Build artifacts are located in the `build/` directory:
 - `rs-asr-offline` — Offline ASR command-line tool
 - `rs-asr-vad-online` — VAD-segmented quasi-streaming ASR command-line tool
