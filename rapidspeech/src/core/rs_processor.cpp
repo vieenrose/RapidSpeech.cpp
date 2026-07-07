@@ -2,6 +2,7 @@
 #ifndef __EMSCRIPTEN__
 #include "arch/cosyvoice3.h"
 #endif
+#include "arch/xasr.h"
 #include "ggml-backend.h"
 #include "utils/rs_log.h"
 #include <chrono>
@@ -156,6 +157,44 @@ int RSProcessor::DecodeOnly() {
 std::string RSProcessor::GetTextResult() {
   text_accumulator_ = model_->GetTranscription(*state_);
   return text_accumulator_;
+}
+
+// ---------------------------------------------------------------------------
+// True streaming ASR (X-ASR)
+// ---------------------------------------------------------------------------
+
+bool RSProcessor::SupportsStreaming() const {
+  return dynamic_cast<XASRModel *>(model_.get()) != nullptr;
+}
+
+void RSProcessor::SetStreamChunkLen(int decode_chunk_len) {
+  auto *xasr = dynamic_cast<XASRModel *>(model_.get());
+  if (xasr) xasr->SetChunkLen(decode_chunk_len);
+}
+
+int RSProcessor::PushAudioStream(const float *pcm, size_t n_samples) {
+  auto *xasr = dynamic_cast<XASRModel *>(model_.get());
+  if (!xasr || !state_ || !sched_) return -1;
+  auto &st = static_cast<XASRState &>(*state_);
+  const size_t before = st.tokens.size();
+  if (!xasr->EncodeStreamingChunk(pcm, n_samples, st, sched_)) return -1;
+  return st.tokens.size() != before ? 1 : 0;
+}
+
+int RSProcessor::FinishStream() {
+  auto *xasr = dynamic_cast<XASRModel *>(model_.get());
+  if (!xasr || !state_ || !sched_) return -1;
+  auto &st = static_cast<XASRState &>(*state_);
+  return xasr->FinishStream(st, sched_) ? 1 : -1;
+}
+
+std::string RSProcessor::GetStreamText() {
+  if (!model_ || !state_) return {};
+  return model_->GetTranscription(*state_);
+}
+
+void RSProcessor::ResetStream() {
+  if (model_) state_ = model_->CreateState();
 }
 
 void RSProcessor::Reset() {

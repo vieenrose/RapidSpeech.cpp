@@ -77,6 +77,33 @@ public:
    */
   std::string GetTextResult();
 
+  // --- True streaming ASR (X-ASR only) ---
+  // These bypass the Encode/Decode Process() cadence and drive the model's
+  // chunked encoder + continuous transducer directly. SupportsStreaming()
+  // returns false for models without a streaming path.
+
+  /** True if the loaded model supports chunked streaming (X-ASR). */
+  bool SupportsStreaming() const;
+
+  /** Set streaming chunk length in fbank frames (16/32/48/96/192). */
+  void SetStreamChunkLen(int decode_chunk_len);
+
+  /**
+   * Push PCM ([-1,1] @ 16 kHz); processes all complete chunks and extends the
+   * running hypothesis. @return 1 if new tokens were emitted, 0 if not,
+   * -1 on error.
+   */
+  int PushAudioStream(const float *pcm, size_t n_samples);
+
+  /** Flush the tail (pads silence) so trailing speech is emitted. */
+  int FinishStream();
+
+  /** Current running transcription for the stream. */
+  std::string GetStreamText();
+
+  /** Reset the streaming state to start a fresh utterance. */
+  void ResetStream();
+
   // --- TTS methods ---
 
   /**
