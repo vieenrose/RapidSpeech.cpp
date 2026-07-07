@@ -16,6 +16,13 @@ option(RS_OPENCL "Enable OpenCL acceleration" OFF)
 option(RS_WEBGPU "Enable WebGPU acceleration (Dawn native / emdawnwebgpu for WASM)" OFF)
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
 option(RS_BUILD_CLI "Build command-line example executables" ON)
+option(RS_STATIC_EXE "Build fully self-contained executables (no DLL dependencies)" OFF)
+
+# RS_STATIC_EXE implies static linkage everywhere: static ggml + static
+# rapidspeech-core so the CLIs carry no runtime DLL/.so dependency.
+if (RS_STATIC_EXE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -224,7 +231,13 @@ set(RS_SOURCES
 
 
 # --- Library Compilation ---
-add_library(rapidspeech-core SHARED
+# STATIC for self-contained executables (RS_STATIC_EXE), otherwise SHARED.
+if (RS_STATIC_EXE)
+    set(RS_CORE_LIB_TYPE STATIC)
+else()
+    set(RS_CORE_LIB_TYPE SHARED)
+endif()
+add_library(rapidspeech-core ${RS_CORE_LIB_TYPE}
         ${RS_SOURCES}
         rapidspeech/src/c_api/rapidspeech_c.cpp
         rapidspeech/src/c_api/rs_vad.cpp
@@ -243,59 +256,66 @@ target_include_directories(rapidspeech-core PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cppjieba/include
 )
 
-# Define RAPIDSPEECH_BUILD for proper symbol export
-target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
-
-# MSVC portability: _USE_MATH_DEFINES enables M_PI from <cmath>,
-# _CRT_SECURE_NO_WARNINGS suppresses getenv deprecation,
-# /wd4244 suppresses int64→int truncation warnings from ggml API.
-if (MSVC)
-    target_compile_definitions(rapidspeech-core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(rapidspeech-core PRIVATE /wd4244)
-endif()
-
-# MSVC portability: _USE_MATH_DEFINES enables M_PI from <cmath>,
-# _CRT_SECURE_NO_WARNINGS suppresses getenv deprecation warning,
-# /wd4244 suppresses int64→int truncation warnings from ggml API.
-if (MSVC)
-    target_compile_definitions(rapidspeech-core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(rapidspeech-core PRIVATE /wd4244)
-endif()
-
-# Set library version (skip SOVERSION for Python wheels to avoid auditwheel issues)
-if (NOT RS_ENABLE_PYTHON)
-    if (APPLE)
-        set_target_properties(rapidspeech-core PROPERTIES
-            VERSION ${PROJECT_VERSION}
-            SOVERSION 1
-            INSTALL_NAME_DIR "@rpath"
-            INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
-        )
-    else()
-        set_target_properties(rapidspeech-core PROPERTIES
-            VERSION ${PROJECT_VERSION}
-            SOVERSION 1
-            INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
-        )
-    endif()
+# Symbol-export macro. For a static build (RS_STATIC_EXE) define RS_STATIC so
+# rapidspeech.h expands RS_API to nothing (no __declspec(dllimport/dllexport));
+# for a shared build define RAPIDSPEECH_BUILD to export. RS_STATIC is PUBLIC so
+# the CLIs that link the static core see the same (empty) RS_API.
+if (RS_STATIC_EXE)
+    target_compile_definitions(rapidspeech-core PUBLIC RS_STATIC)
 else()
-    if (APPLE)
-        set_target_properties(rapidspeech-core PROPERTIES
-            INSTALL_NAME_DIR "@rpath"
-            INSTALL_RPATH "${RS_RPATH}"
-            BUILD_WITH_INSTALL_RPATH ON
-        )
-    else()
-        set_target_properties(rapidspeech-core PROPERTIES
-            INSTALL_RPATH "${RS_RPATH}"
-            BUILD_WITH_INSTALL_RPATH ON
-        )
-    endif()
+    target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
 endif()
-set_target_properties(rapidspeech-core PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-)
+
+# MSVC portability: /utf-8 forces UTF-8 for both source and execution
+# charsets (otherwise the system code page garbles Chinese comments/strings),
+# _USE_MATH_DEFINES enables M_PI from <cmath>, _CRT_SECURE_NO_WARNINGS
+# suppresses getenv deprecation, /wd4244 suppresses int64→int truncation
+# warnings from the ggml API.
+if (MSVC)
+    target_compile_definitions(rapidspeech-core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(rapidspeech-core PRIVATE /utf-8 /wd4244)
+endif()
+
+# Shared-library-only properties: SONAME/VERSION and hidden default visibility
+# only make sense for a .so/.dylib. A static build (RS_STATIC_EXE) skips them —
+# VERSION/SOVERSION are ignored for STATIC targets and hiding symbols would
+# strip the API the CLIs link against.
+if (NOT RS_STATIC_EXE)
+    # Set library version (skip SOVERSION for Python wheels to avoid auditwheel issues)
+    if (NOT RS_ENABLE_PYTHON)
+        if (APPLE)
+            set_target_properties(rapidspeech-core PROPERTIES
+                VERSION ${PROJECT_VERSION}
+                SOVERSION 1
+                INSTALL_NAME_DIR "@rpath"
+                INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
+            )
+        else()
+            set_target_properties(rapidspeech-core PROPERTIES
+                VERSION ${PROJECT_VERSION}
+                SOVERSION 1
+                INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
+            )
+        endif()
+    else()
+        if (APPLE)
+            set_target_properties(rapidspeech-core PROPERTIES
+                INSTALL_NAME_DIR "@rpath"
+                INSTALL_RPATH "${RS_RPATH}"
+                BUILD_WITH_INSTALL_RPATH ON
+            )
+        else()
+            set_target_properties(rapidspeech-core PROPERTIES
+                INSTALL_RPATH "${RS_RPATH}"
+                BUILD_WITH_INSTALL_RPATH ON
+            )
+        endif()
+    endif()
+    set_target_properties(rapidspeech-core PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+endif()
 
 target_link_libraries(rapidspeech-core PRIVATE ggml Threads::Threads)
 
@@ -531,6 +551,14 @@ if (RS_BUILD_CLI)
             set_target_properties(${_rs_cli_target} PROPERTIES
                     INSTALL_RPATH "${RS_EXECUTABLE_INSTALL_RPATH}"
             )
+        endforeach()
+    endif()
+
+    # /utf-8 so the CLIs' Chinese usage/help string literals are emitted as
+    # UTF-8 instead of the MSVC system code page (matches rapidspeech-core).
+    if (MSVC)
+        foreach(_rs_cli_target IN LISTS RS_CLI_TARGETS)
+            target_compile_options(${_rs_cli_target} PRIVATE /utf-8)
         endforeach()
     endif()
 

@@ -96,6 +96,46 @@ public:
         check_rs(rs_set_ctc_precheck(ctx_, enable), "rs_set_ctc_precheck failed");
     }
 
+    // --- true streaming ASR (X-ASR) ---
+
+    bool stream_supported() const { return rs_asr_stream_supported(ctx_); }
+
+    void set_chunk_len(int n_fbank_frames) {
+        check_rs(rs_asr_stream_set_chunk_len(ctx_, n_fbank_frames),
+                 "rs_asr_stream_set_chunk_len failed");
+    }
+
+    // Push PCM; returns True if new tokens were emitted (partial updated).
+    bool stream_push(py::array_t<float, py::array::c_style | py::array::forcecast> pcm) {
+        auto buf = pcm.request();
+        if (buf.ndim != 1) {
+            throw std::runtime_error("PCM must be a 1-D float32 array");
+        }
+        float *data = static_cast<float *>(buf.ptr);
+        int n = static_cast<int>(buf.shape[0]);
+        int r;
+        {
+            py::gil_scoped_release nogil;
+            r = rs_asr_stream_push(ctx_, data, n);
+        }
+        if (r < 0) throw std::runtime_error("rs_asr_stream_push failed");
+        return r == 1;
+    }
+
+    std::string stream_get_text() {
+        const char *res = rs_asr_stream_get_text(ctx_);
+        return res ? std::string(res) : std::string();
+    }
+
+    void stream_finish() {
+        py::gil_scoped_release nogil;
+        check_rs(rs_asr_stream_finish(ctx_), "rs_asr_stream_finish failed");
+    }
+
+    void stream_reset() {
+        check_rs(rs_asr_stream_reset(ctx_), "rs_asr_stream_reset failed");
+    }
+
     py::dict get_model_meta() const {
         rs_model_meta_t m = rs_get_model_meta(ctx_);
         py::dict d;
@@ -420,6 +460,23 @@ PYBIND11_MODULE(rapidspeech, m) {
         .def("set_ctc_precheck", &RSAsrOffline::set_ctc_precheck,
              py::arg("enable"),
              "Skip LLM decode on silence by running a quick CTC precheck first.")
+
+        // ── true streaming ASR (X-ASR) ──
+        .def("stream_supported", &RSAsrOffline::stream_supported,
+             "True if the model supports chunked streaming (X-ASR).")
+        .def("set_chunk_len", &RSAsrOffline::set_chunk_len,
+             py::arg("n_fbank_frames"),
+             "Streaming chunk length in fbank frames (16/32/48/96/192, "
+             "multiple of 16). Larger = higher latency, lower RTF.")
+        .def("stream_push", &RSAsrOffline::stream_push, py::arg("pcm"),
+             "Push 16 kHz mono float32 PCM in [-1,1]; returns True if the "
+             "partial was updated. Read it with stream_get_text().")
+        .def("stream_get_text", &RSAsrOffline::stream_get_text,
+             "Current running transcription for the stream.")
+        .def("stream_finish", &RSAsrOffline::stream_finish,
+             "Flush the tail (pads silence) so trailing speech is emitted.")
+        .def("stream_reset", &RSAsrOffline::stream_reset,
+             "Reset streaming state to start a fresh utterance.")
 
         .def("get_model_meta", &RSAsrOffline::get_model_meta,
              "Return a dict with arch_name, audio_sample_rate, n_mels, vocab_size.")

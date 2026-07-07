@@ -346,13 +346,20 @@ static inline ggml_tensor* kokoro_conv_1d_2d(ggml_context* ctx, ggml_tensor* w_2
     const int64_t N    = col->ne[2];
     const int64_t Cout = w_2d->ne[1];
     ggml_tensor* col_2d = ggml_reshape_2d(ctx, col, col->ne[0], Tout * N); // [K*Cin, Tout*N]
-    // mul_mat(w, col): keep the quantized weight in position A so the Metal
-    // backend can find a kernel — its `mul_mm_<quant>_f16` family only
-    // covers (A=quant, B=f16). The result has ne[0]=Cout, ne[1]=Tout*N
-    // (i.e., memory layout is Cout-fastest within each Tout*N row), so we
-    // view it as (Cout, Tout, N) and transpose the leading two dims back
-    // to (Tout, Cout, N) to match ggml_conv_1d's output contract.
-    ggml_tensor* out = ggml_mul_mat(ctx, w_2d, col_2d);                    // [Cout, Tout*N]
+    // mul_mat(w, col): keep the quantized weight in position A. The result has
+    // ne[0]=Cout, ne[1]=Tout*N (i.e., memory layout is Cout-fastest within each
+    // Tout*N row), so we view it as (Cout, Tout, N) and transpose the leading
+    // two dims back to (Tout, Cout, N) to match ggml_conv_1d's output contract.
+    //
+    // src1 (col) must be F32 for a quantized weight MUL_MAT on the CPU backend:
+    // the Metal `mul_mm_<quant>_f16` kernels accept an F16 B, but the CPU
+    // backend only implements (A=quant, B=F32 / vec_dot_type). Without this
+    // cast a CPU-only run aborts with "node (op=MUL_MAT) has no backend!".
+    // Metal has matching `mul_mm_<quant>_f32` kernels, so F32 works on both.
+    ggml_tensor* col_2d_cpu = (col_2d->type != GGML_TYPE_F32)
+                                  ? ggml_cast(ctx, col_2d, GGML_TYPE_F32)
+                                  : col_2d;
+    ggml_tensor* out = ggml_mul_mat(ctx, w_2d, col_2d_cpu);               // [Cout, Tout*N]
     out = ggml_reshape_3d(ctx, out, Cout, Tout, N);                       // (Cout, Tout, N)
     return ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));            // (Tout, Cout, N)
 }
