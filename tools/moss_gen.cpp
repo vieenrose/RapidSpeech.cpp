@@ -106,7 +106,12 @@ static std::vector<float> run_local(const std::vector<float>&seq,int L){
   return out;
 }
 
+static std::string basedir(){ const char*e=getenv("MOSS_DIR"); return e?e:"/home/luigi/moss-port"; }
+static std::string bp(const std::string&f){ return basedir()+"/"+f; }
+
 int main(int argc,char**argv){
+  // args: gguf nframes seed [greedy|sample] [prompt_emb.bin] [L] [out.bin]
+  // embedding tables (gg_tok_embd.bin, gg_audio_embd.bin) read from $MOSS_DIR
   const char*gg=argc>1?argv[1]:"/home/luigi/moss-port/moss_nano_full.gguf";
   gguf_init_params gp{false,&wctx}; if(!gguf_init_from_file(gg,gp)){printf("gguf\n");return 1;}
 #ifdef GGML_USE_CUDA
@@ -120,8 +125,8 @@ int main(int argc,char**argv){
   ggml_backend_alloc_ctx_tensors(kvc,be);
 
   // embedding tables (raw f32)
-  std::vector<float> TOK=lb("/home/luigi/moss-port/gg_tok_embd.bin",(size_t)VOCAB*H);      // [16384,768]
-  std::vector<float> AUD=lb("/home/luigi/moss-port/gg_audio_embd.bin",(size_t)NCB*CB*H);   // [16,1024,768]
+  std::vector<float> TOK=lb(bp("gg_tok_embd.bin").c_str(),(size_t)VOCAB*H);      // [16384,768]
+  std::vector<float> AUD=lb(bp("gg_audio_embd.bin").c_str(),(size_t)NCB*CB*H);   // [16,1024,768]
   auto tok_emb=[&](int id){return &TOK[(size_t)id*H];};
   auto aud_emb=[&](int k,int c){return &AUD[((size_t)k*CB+c)*H];};
   // logits = W(rows,H) . h ; argmax
@@ -140,15 +145,18 @@ int main(int argc,char**argv){
   };
   bool do_sample = argc>4 && std::string(argv[4])=="sample";
 
-  int L=177, NFRAMES=argc>2?atoi(argv[2]):12;
-  std::vector<float> pe=lb("/home/luigi/moss-port/gg_prompt_emb.bin",(size_t)L*H);
+  int NFRAMES=argc>2?atoi(argv[2]):12;
+  std::string pemb_path=argc>5?argv[5]:bp("gg_prompt_emb.bin");
+  int L=argc>6?atoi(argv[6]):177;
+  std::string out_path=argc>7?argv[7]:bp("gg_gen_ggml.bin");
+  std::vector<float> pe=lb(pemb_path.c_str(),(size_t)L*H);
   std::vector<float> gh=run_global(pe,L,0);              // prefill, KV filled [0..L)
   std::vector<float> hidden(gh.begin()+(size_t)(L-1)*H, gh.end());  // last position [H]
   int n_past=L;
 
   // reference frames [NFRAMES,16]
   std::vector<int32_t> ref((size_t)NFRAMES*NCB);
-  { FILE*f=fopen("/home/luigi/moss-port/gg_frames.bin","rb"); if(f){fread(ref.data(),4,ref.size(),f);fclose(f);} }
+  { FILE*f=fopen(bp("gg_frames.bin").c_str(),"rb"); if(f){fread(ref.data(),4,ref.size(),f);fclose(f);} }
 
   std::vector<std::vector<int>> gen;
   int total_ok=0, total=0;
@@ -178,7 +186,7 @@ int main(int argc,char**argv){
   }
   printf("=== TOTAL %d/%d codebooks match (%.1f%%) over %zu frames ===\n",total_ok,total,100.0*total_ok/total,gen.size());
   // dump generated tokens for codec decode
-  FILE*of=fopen("/home/luigi/moss-port/gg_gen_ggml.bin","wb");
+  FILE*of=fopen(out_path.c_str(),"wb");
   for(auto&fr:gen) for(int c=0;c<NCB;c++){int32_t t=fr[c];fwrite(&t,4,1,of);} fclose(of);
   printf("wrote %zu frames -> gg_gen_ggml.bin\n",gen.size());
   return 0;
