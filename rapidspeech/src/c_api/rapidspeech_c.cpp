@@ -628,6 +628,87 @@ RS_API int32_t rs_redecode(rs_context_t *ctx) {
 }
 
 // ============================================
+// True Streaming ASR (X-ASR)
+// ============================================
+
+RS_API bool rs_asr_stream_supported(const rs_context_t *ctx) {
+  if (!ctx || !ctx->processor) return false;
+  return ctx->processor->SupportsStreaming();
+}
+
+RS_API rs_error_t rs_asr_stream_set_chunk_len(rs_context_t *ctx,
+                                              int32_t n_fbank_frames) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  if (!ctx->processor->SupportsStreaming()) {
+    set_error(RS_ERR_NOT_IMPLEMENTED, "Model does not support streaming");
+    return RS_ERR_NOT_IMPLEMENTED;
+  }
+  if (n_fbank_frames <= 0 || n_fbank_frames % 16 != 0) {
+    set_error(RS_ERR_INVALID_ARGS, "chunk_len must be a positive multiple of 16");
+    return RS_ERR_INVALID_ARGS;
+  }
+  ctx->processor->SetStreamChunkLen(n_fbank_frames);
+  return RS_OK;
+}
+
+RS_API int32_t rs_asr_stream_push(rs_context_t *ctx, const float *pcm,
+                                  int32_t n_samples) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return -1;
+  }
+  try {
+    int r = ctx->processor->PushAudioStream(pcm, (size_t)n_samples);
+    if (r < 0) set_error(RS_ERR_INFERENCE_FAILED, "Streaming push failed");
+    return r;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "Streaming push exception: %s", e.what());
+    return -1;
+  }
+}
+
+RS_API const char *rs_asr_stream_get_text(rs_context_t *ctx) {
+  static THREAD_LOCAL std::string temp_res;
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    temp_res.clear();
+    return temp_res.c_str();
+  }
+  try {
+    temp_res = ctx->processor->GetStreamText();
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "GetStreamText failed: %s", e.what());
+    temp_res.clear();
+  }
+  return temp_res.c_str();
+}
+
+RS_API rs_error_t rs_asr_stream_finish(rs_context_t *ctx) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    return ctx->processor->FinishStream() >= 0 ? RS_OK : RS_ERR_INFERENCE_FAILED;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "FinishStream exception: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
+RS_API rs_error_t rs_asr_stream_reset(rs_context_t *ctx) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  ctx->processor->ResetStream();
+  return RS_OK;
+}
+
+// ============================================
 // Utility Functions
 // ============================================
 

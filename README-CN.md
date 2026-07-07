@@ -162,6 +162,18 @@ cmake -B build
 cmake --build build --config Release
 ```
 
+**独立可执行文件**（无 DLL/.so 运行时依赖）—— 用 `-DRS_STATIC_EXE=ON` 把 core 和
+ggml 静态编译进每个 CLI：
+
+```bash
+# Windows / MSVC
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DRS_STATIC_EXE=ON
+cmake --build build --config Release --parallel
+# Linux / macOS
+cmake -B build -DRS_STATIC_EXE=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
 构建产物位于 `build/` 目录：
 - `rs-asr-offline` — 离线 ASR 命令行工具
 - `rs-asr-vad-online` — VAD 切段的伪流式 ASR 命令行工具

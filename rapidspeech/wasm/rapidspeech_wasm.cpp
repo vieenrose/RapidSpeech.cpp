@@ -229,6 +229,54 @@ int rs_wasm_set_user_input_prompt(const char *prompt) {
   return (int)rs_set_user_input_prompt(g_ctx, prompt);
 }
 
+// ── True streaming ASR (X-ASR) ──────────────────────────────
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_asr_stream_supported(void) {
+  return (g_ctx && rs_asr_stream_supported(g_ctx)) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_asr_stream_set_chunk_len(int n_fbank_frames) {
+  if (!g_ctx) return -1;
+  return (int)rs_asr_stream_set_chunk_len(g_ctx, n_fbank_frames);
+}
+
+// Returns 1 if new tokens were emitted, 0 if not, -1 on error. On new tokens
+// the running hypothesis is cached for rs_wasm_get_text().
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_asr_stream_push(const float *pcm, int n_samples) {
+  if (!g_ctx) return -1;
+  int ret = rs_asr_stream_push(g_ctx, pcm, n_samples);
+  const char *text = rs_asr_stream_get_text(g_ctx);
+  if (text) {
+    int i = 0;
+    while (text[i] && i < 4095) { g_last_text[i] = text[i]; i++; }
+    g_last_text[i] = '\0';
+  }
+  return ret;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_asr_stream_finish(void) {
+  if (!g_ctx) return -1;
+  int ret = (int)rs_asr_stream_finish(g_ctx);
+  const char *text = rs_asr_stream_get_text(g_ctx);
+  if (text) {
+    int i = 0;
+    while (text[i] && i < 4095) { g_last_text[i] = text[i]; i++; }
+    g_last_text[i] = '\0';
+  }
+  return ret;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_asr_stream_reset(void) {
+  if (!g_ctx) return -1;
+  g_last_text[0] = '\0';
+  return (int)rs_asr_stream_reset(g_ctx);
+}
+
 EMSCRIPTEN_KEEPALIVE
 int rs_wasm_set_use_llm(int enable) {
   if (!g_ctx) return -1;
