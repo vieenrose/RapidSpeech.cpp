@@ -26,6 +26,7 @@ static std::vector<float> lb(const char*p,size_t n){std::vector<float> v(n);FILE
 static ggml_backend_t be;
 static ggml_context* wctx;
 static ggml_tensor* Kc[NL]; static ggml_tensor* Vc[NL];
+static ggml_tensor* LKc; static ggml_tensor* LVc;   // local (1-layer) KV cache, up to 17 pos
 static ggml_tensor* Wt(const std::string&n){ggml_tensor*t=ggml_get_tensor(wctx,n.c_str());if(!t){printf("missing %s\n",n.c_str());exit(1);}return t;}
 
 // --- global transformer forward with KV cache (verified in moss_kv.cpp) ---
@@ -108,6 +109,45 @@ static std::vector<float> run_local(const std::vector<float>&seq,int L){
   return out;
 }
 
+// --- local transformer, ONE token at position `pos`, KV-cached (O(L) vs run_local's O(L^2)) ---
+static std::vector<float> run_local_step(const std::vector<float>&x1,int pos){
+  int n_kv=pos+1;
+  ggml_init_params cp{(size_t)16*1024*1024,nullptr,true}; ggml_context*ctx=ggml_init(cp);
+  auto LN=[&](ggml_tensor*x,ggml_tensor*w,ggml_tensor*b){return ggml_add(ctx,ggml_mul(ctx,ggml_norm(ctx,x,EPS),w),b);};
+  ggml_tensor*inp=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,H,1); ggml_set_input(inp);
+  ggml_tensor*posv=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,1); ggml_set_input(posv);
+  std::string p="local.blk.0."; ggml_tensor*h=inp; ggml_cgraph*gf=ggml_new_graph(ctx);
+  ggml_tensor*ln1=LN(h,Wt(p+"attn_norm.weight"),Wt(p+"attn_norm.bias"));
+  ggml_tensor*qkv=ggml_add(ctx,ggml_mul_mat(ctx,Wt(p+"attn_qkv.weight"),ln1),Wt(p+"attn_qkv.bias"));
+  ggml_tensor*q=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_view_2d(ctx,qkv,H,1,qkv->nb[1],0)),HD,NH,1);
+  ggml_tensor*k=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_view_2d(ctx,qkv,H,1,qkv->nb[1],H*4)),HD,NH,1);
+  ggml_tensor*v=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_view_2d(ctx,qkv,H,1,qkv->nb[1],2*H*4)),HD,NH,1);
+  q=ggml_rope_ext(ctx,q,posv,nullptr,HD,0,0,ROPE,1,0,1,0,0); k=ggml_rope_ext(ctx,k,posv,nullptr,HD,0,0,ROPE,1,0,1,0,0);
+  ggml_tensor*kdst=ggml_view_3d(ctx,LKc,HD,NH,1,LKc->nb[1],LKc->nb[2],(size_t)pos*LKc->nb[2]);
+  ggml_tensor*vdst=ggml_view_3d(ctx,LVc,HD,NH,1,LVc->nb[1],LVc->nb[2],(size_t)pos*LVc->nb[2]);
+  ggml_build_forward_expand(gf,ggml_cpy(ctx,k,kdst));
+  ggml_build_forward_expand(gf,ggml_cpy(ctx,v,vdst));
+  ggml_tensor*Kall=ggml_view_3d(ctx,LKc,HD,NH,n_kv,LKc->nb[1],LKc->nb[2],0);
+  ggml_tensor*Vall=ggml_view_3d(ctx,LVc,HD,NH,n_kv,LVc->nb[1],LVc->nb[2],0);
+  ggml_tensor*kq=ggml_soft_max(ctx,ggml_scale(ctx,ggml_mul_mat(ctx,ggml_permute(ctx,Kall,0,2,1,3),ggml_permute(ctx,q,0,2,1,3)),1.0f/sqrtf(HD)));
+  ggml_tensor*vt=ggml_cont(ctx,ggml_permute(ctx,Vall,1,2,0,3));
+  ggml_tensor*kqv=ggml_permute(ctx,ggml_mul_mat(ctx,vt,kq),0,2,1,3);
+  ggml_tensor*att=ggml_add(ctx,ggml_mul_mat(ctx,Wt(p+"attn_out.weight"),ggml_cont_2d(ctx,kqv,H,1)),Wt(p+"attn_out.bias"));
+  h=ggml_add(ctx,h,att);
+  ggml_tensor*ln2=LN(h,Wt(p+"ffn_norm.weight"),Wt(p+"ffn_norm.bias"));
+  ggml_tensor*up=ggml_gelu(ctx,ggml_add(ctx,ggml_mul_mat(ctx,Wt(p+"ffn_up.weight"),ln2),Wt(p+"ffn_up.bias")));
+  h=ggml_add(ctx,h,ggml_add(ctx,ggml_mul_mat(ctx,Wt(p+"ffn_down.weight"),up),Wt(p+"ffn_down.bias")));
+  h=LN(h,Wt("local.output_norm.weight"),Wt("local.output_norm.bias")); ggml_set_output(h);
+  ggml_build_forward_expand(gf,h);
+  ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_get_default_buffer_type(be)); ggml_gallocr_alloc_graph(ga,gf);
+  ggml_backend_tensor_set(inp,x1.data(),0,(size_t)H*4);
+  int32_t pv=pos; ggml_backend_tensor_set(posv,&pv,0,4);
+  ggml_backend_graph_compute(be,gf);
+  std::vector<float> out(H); ggml_backend_tensor_get(h,out.data(),0,H*4);
+  ggml_gallocr_free(ga); ggml_free(ctx);
+  return out;
+}
+
 static std::string basedir(){ const char*e=getenv("MOSS_DIR"); return e?e:"/home/luigi/moss-port"; }
 static std::string bp(const std::string&f){ return basedir()+"/"+f; }
 
@@ -124,6 +164,7 @@ int main(int argc,char**argv){
 #endif
   ggml_init_params kp{(size_t)(2*NL+4)*ggml_tensor_overhead(),nullptr,true}; ggml_context*kvc=ggml_init(kp);
   for(int i=0;i<NL;i++){Kc[i]=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,512);Vc[i]=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,512);}
+  LKc=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,18); LVc=ggml_new_tensor_3d(kvc,GGML_TYPE_F32,HD,NH,18);
   ggml_backend_alloc_ctx_tensors(kvc,be);
 
   // embedding tables (raw f32)
@@ -132,11 +173,16 @@ int main(int argc,char**argv){
   auto tok_emb=[&](int id){return &TOK[(size_t)id*H];};
   auto aud_emb=[&](int k,int c){return &AUD[((size_t)k*CB+c)*H];};
   // logits = W(rows,H) . h ; argmax
-  auto argmax_logit=[&](const float*Wm,int rows,const float*h){int best=0;float bm=-1e30f;for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];if(d>bm){bm=d;best=r;}}return best;};
+  std::vector<float> _lgbuf(VOCAB);
+  auto argmax_logit=[&](const float*Wm,int rows,const float*h){
+    float*lg=_lgbuf.data();
+    for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];lg[r]=d;}
+    int best=0;float bm=lg[0];for(int r=1;r<rows;r++)if(lg[r]>bm){bm=lg[r];best=r;}return best;};
   // temperature + top-k sampling over W.h logits
   unsigned rng = argc>3?(unsigned)atoi(argv[3]):1234u;
   auto sample_logit=[&](const float*Wm,int rows,const float*h,float temp,int topk){
-    std::vector<float> lg(rows); for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];lg[r]=d;}
+    std::vector<float> lg(rows);
+    for(int r=0;r<rows;r++){const float*wr=Wm+(size_t)r*H;float d=0;for(int j=0;j<H;j++)d+=wr[j]*h[j];lg[r]=d;}
     std::vector<int> idx(rows); for(int r=0;r<rows;r++)idx[r]=r;
     if(topk>0&&topk<rows){std::partial_sort(idx.begin(),idx.begin()+topk,idx.end(),[&](int a,int b){return lg[a]>lg[b];});idx.resize(topk);}
     float mx=-1e30f; for(int i:idx) mx=std::max(mx,lg[i]);
@@ -154,16 +200,14 @@ int main(int argc,char**argv){
     int n_past=L;
     std::vector<std::vector<int>> gen;
     for(int fi=0; fi<NFRAMES && n_past<500; fi++){
-      std::vector<float> lseq(hidden); int Lc=1;
-      std::vector<float> hl=run_local(lseq,Lc);
+      std::vector<float> hl=run_local_step(hidden,0);                 // pos0 = global hidden (KV-cached)
       int text_tok=argmax_logit(TOK.data(),VOCAB,hl.data());
       if(text_tok==AUDIO_END) break;
-      std::vector<int> frame; const float* cur=tok_emb(text_tok);
+      std::vector<int> frame; std::vector<float> cur(tok_emb(text_tok),tok_emb(text_tok)+H);
       for(int k=0;k<NCB;k++){
-        lseq.insert(lseq.end(),cur,cur+H); Lc++;
-        hl=run_local(lseq,Lc);
+        hl=run_local_step(cur,k+1);                                   // pos k+1
         int cb=do_sample?sample_logit(aud_emb(k,0),CB,hl.data(),0.8f,25):argmax_logit(aud_emb(k,0),CB,hl.data());
-        frame.push_back(cb); cur=aud_emb(k,cb);
+        frame.push_back(cb); const float* e=aud_emb(k,cb); cur.assign(e,e+H);
       }
       gen.push_back(frame);
       std::vector<float> row(tok_emb(AUDIO_ASSIST),tok_emb(AUDIO_ASSIST)+H);
