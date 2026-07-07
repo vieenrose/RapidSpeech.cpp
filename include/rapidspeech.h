@@ -5,7 +5,12 @@
 #include <stdbool.h>
 
 // --- API Export Macro ---
-#if defined(_WIN32)
+// RS_STATIC: fully static build (no shared library). RS_API expands to nothing
+// so callers get plain symbols with no __declspec(dllimport/dllexport), which
+// is required when the core is linked statically into an executable.
+#if defined(RS_STATIC)
+#define RS_API
+#elif defined(_WIN32)
 #if defined(RAPIDSPEECH_BUILD)
 #define RS_API __declspec(dllexport)
 #else
@@ -273,6 +278,48 @@ RS_API rs_error_t rs_set_ctc_precheck(rs_context_t* ctx, bool enable);
 // Caller must have completed at least one rs_process() first.
 // Returns: 0=No output, 1=Has output, -1=Error
 RS_API int32_t rs_redecode(rs_context_t* ctx);
+
+// ============================================
+// True Streaming ASR (X-ASR only)
+//
+// These drive the model's chunked encoder + continuous transducer directly,
+// bypassing the rs_push_audio/rs_process cadence. Feed PCM incrementally and
+// read the running hypothesis with sub-second latency. For models without a
+// streaming path (SenseVoice/FunASR/...), rs_asr_stream_supported returns
+// false and the other calls are no-ops returning RS_ERROR.
+//
+// Typical loop:
+//   if (!rs_asr_stream_supported(ctx)) { ... use rs_process instead ... }
+//   rs_asr_stream_set_chunk_len(ctx, 32);           // 320 ms chunks
+//   while (have_audio)                               // 16 kHz mono, [-1,1]
+//     if (rs_asr_stream_push(ctx, pcm, n) == 1)
+//       printf("\r%s", rs_asr_stream_get_text(ctx)); // updated partial
+//   rs_asr_stream_finish(ctx);                        // flush the tail
+//   printf("%s\n", rs_asr_stream_get_text(ctx));      // final
+//   rs_asr_stream_reset(ctx);                         // next utterance
+// ============================================
+
+// True if the loaded model supports chunked streaming (X-ASR).
+RS_API bool rs_asr_stream_supported(const rs_context_t* ctx);
+
+// Set the streaming chunk length in fbank frames (10 ms each): 16/32/48/96/192
+// ≈ 160/320/480/960/1920 ms. Must be a multiple of 16. Larger = higher latency
+// but lower RTF. Call before the first push. Returns RS_OK on success.
+RS_API rs_error_t rs_asr_stream_set_chunk_len(rs_context_t* ctx, int32_t n_fbank_frames);
+
+// Push PCM (16 kHz mono, [-1,1]); processes all complete chunks and extends
+// the running hypothesis. Returns: 1=new tokens emitted, 0=none, -1=error.
+RS_API int32_t rs_asr_stream_push(rs_context_t* ctx, const float* pcm, int32_t n_samples);
+
+// Current running transcription (UTF-8, do not free; valid until the next
+// stream call).
+RS_API const char* rs_asr_stream_get_text(rs_context_t* ctx);
+
+// Flush the tail (pads silence) so trailing speech is emitted. Returns RS_OK.
+RS_API rs_error_t rs_asr_stream_finish(rs_context_t* ctx);
+
+// Reset the streaming state to start a fresh utterance. Returns RS_OK.
+RS_API rs_error_t rs_asr_stream_reset(rs_context_t* ctx);
 
 // ============================================
 // Voice Activity Detection (VAD)
