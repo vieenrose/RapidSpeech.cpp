@@ -85,6 +85,8 @@ set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/llm_kv_cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/qwen3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/qwen3_asr.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/xasr.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/xasr_zipformer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/omnivoice.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/openvoice2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/bert.cpp
