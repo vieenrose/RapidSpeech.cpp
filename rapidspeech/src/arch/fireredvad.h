@@ -220,6 +220,12 @@ private:
     ggml_backend_t backend_ = nullptr;
     std::unique_ptr<AudioProcessor> audio_processor_;
 
+    // Host-side copies of CMVN stats. The GGUF tensors may live in a device
+    // (e.g. CUDA) buffer whose ->data is not host-addressable, so we copy them
+    // out once at load time and read from these in ApplyCmvn().
+    std::vector<float> cmvn_means_host_;
+    std::vector<float> cmvn_inv_std_host_;
+
     bool MapTensors(ggml_context* gguf_data);
     bool LoadHParams(gguf_context* ctx_gguf);
     void InitAudioProcessor();

@@ -533,6 +533,9 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
+    add_executable(rs-server
+            examples/server/rs-server.cpp
+    )
     set(RS_CLI_TARGETS
             rs-asr-offline
             rs-asr-vad-online
@@ -544,6 +547,7 @@ if (RS_BUILD_CLI)
             rs-imatrix
             rs-speaker-id
             rs-kws
+            rs-server
     )
 
     if (NOT WIN32)
@@ -572,6 +576,20 @@ if (RS_BUILD_CLI)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml Threads::Threads)
+
+    # rs-server: cpp-httplib needs threads; Windows needs Winsock.
+    target_link_libraries(rs-server PRIVATE rapidspeech-core ggml Threads::Threads)
+    if (WIN32)
+        target_link_libraries(rs-server PRIVATE ws2_32)
+    endif()
+    target_include_directories(rs-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/server
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
 
 
     if (NOT MSVC)
@@ -683,6 +701,9 @@ if (RS_BUILD_CLI)
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-imatrix
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-server
             RUNTIME DESTINATION bin
     )
 

@@ -127,6 +127,15 @@ bool FireRedVadModel::MapTensors(ggml_context* gguf_data) {
         RS_LOG_ERR("FireRedVAD: critical tensors missing");
         return false;
     }
+
+    // Copy CMVN stats to host. On the CUDA build these tensors live in a device
+    // buffer, so reading ->data directly segfaults; use ggml_backend_tensor_get.
+    cmvn_means_host_.resize(ggml_nelements(weights_.cmvn_means));
+    cmvn_inv_std_host_.resize(ggml_nelements(weights_.cmvn_inv_std));
+    ggml_backend_tensor_get(weights_.cmvn_means, cmvn_means_host_.data(), 0,
+                            ggml_nbytes(weights_.cmvn_means));
+    ggml_backend_tensor_get(weights_.cmvn_inv_std, cmvn_inv_std_host_.data(), 0,
+                            ggml_nbytes(weights_.cmvn_inv_std));
     return true;
 }
 
@@ -196,8 +205,8 @@ void FireRedVadModel::Reset(RSState& state) {
 void FireRedVadModel::ApplyCmvn(std::vector<float>& feat, int T) const {
     const int D = hparams_.idim;
     if ((int)feat.size() < T * D) return;
-    const float* means = (const float*)weights_.cmvn_means->data;
-    const float* inv_std = (const float*)weights_.cmvn_inv_std->data;
+    const float* means = cmvn_means_host_.data();
+    const float* inv_std = cmvn_inv_std_host_.data();
     for (int t = 0; t < T; ++t) {
         float* row = feat.data() + (size_t)t * D;
         for (int d = 0; d < D; ++d) {

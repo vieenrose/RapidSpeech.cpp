@@ -179,6 +179,7 @@ cmake --build build -j
 - `rs-asr-vad-online` — VAD 切段的伪流式 ASR 命令行工具
 - `rs-asr-online` — 真正的分 chunk 流式 ASR（X-ASR；麦克风或 WAV，实时出字）
 - `rs-tts-offline` — 离线 TTS 命令行工具
+- `rs-server` — OpenAI 兼容 HTTP API + MCP 服务器（ASR + TTS）
 - `rs-quantize` — 模型量化工具
 
 ### 核心命令
@@ -233,6 +234,22 @@ cmake --build build -j
 ```bash
 ./build/rs-quantize /path/to/input-f16.gguf /path/to/output-q4_k.gguf q4_k
 ```
+
+**服务器（OpenAI API + MCP）**
+
+```bash
+# 用 OpenAI 兼容 HTTP API 和 MCP 同时提供 ASR + TTS
+./build/rs-server --asr-model xasr.gguf --tts-model omnivoice.gguf --port 8080
+
+curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@audio.wav -F model=rapidspeech-asr
+curl http://127.0.0.1:8080/v1/audio/speech -H 'content-type: application/json' \
+     -d '{"input":"你好","voice":"female","language":"Chinese"}' --output out.wav
+```
+
+也可作为 MCP 服务器运行（stdio 给 Claude Desktop，或 `POST /mcp`），并提供
+WebSocket 流式接口（带 partial/final 的流式 ASR、VAD 切段 ASR、分段与纯流式
+TTS），以及一个浏览器测试台（`--web-dir examples/server` →
+`http://host:port/webui.html`）。详见 [examples/server/README.md](examples/server/README.md)。
 
 ### Python
 

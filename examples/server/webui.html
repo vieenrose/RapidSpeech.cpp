@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RapidSpeech Server — Test Console</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef; --mut:#9aa4b2;
+          --acc:#4f8cff; --ok:#3ecf8e; --warn:#e0a33e; --err:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,
+         BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
+           gap:16px; align-items:center; flex-wrap:wrap; background:var(--card); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .st { font-size:12px; color:var(--mut); }
+  header .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+                background:var(--err); margin-right:5px; vertical-align:middle; }
+  header .dot.up { background:var(--ok); }
+  main { max-width:1100px; margin:0 auto; padding:18px; display:grid;
+         grid-template-columns:1fr 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--acc); font-weight:600;
+             text-transform:uppercase; letter-spacing:.04em; }
+  .card h2 .tag { float:right; font-size:10px; color:var(--mut); text-transform:none; letter-spacing:0; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  input[type=text], textarea, select {
+    width:100%; background:#0d1017; border:1px solid var(--line); color:var(--fg);
+    border-radius:7px; padding:7px 9px; font:inherit; }
+  textarea { resize:vertical; min-height:52px; }
+  input[type=file] { font-size:12px; color:var(--mut); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:7px;
+           padding:7px 13px; font:inherit; font-weight:600; cursor:pointer; margin:8px 6px 0 0; }
+  button.sec { background:#2a3140; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+  .row > * { flex:1; min-width:0; }
+  .out { margin-top:10px; background:#0b0e14; border:1px solid var(--line);
+         border-radius:7px; padding:9px 11px; min-height:38px; font-size:13px;
+         white-space:pre-wrap; word-break:break-word; }
+  .partial { color:var(--warn); }
+  .final { color:var(--ok); }
+  .seg { border-left:2px solid var(--line); padding-left:8px; margin:3px 0; }
+  .muted { color:var(--mut); font-size:12px; }
+  audio { width:100%; margin-top:10px; }
+  .full { grid-column:1 / -1; }
+  #log { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
+         color:var(--mut); max-height:150px; overflow:auto; }
+  code { color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RapidSpeech Server — Test Console</h1>
+  <div><span id="dot" class="dot"></span><span id="status" class="st">not connected</span></div>
+  <div style="flex:1"></div>
+  <div style="display:flex; gap:8px; align-items:center;">
+    <label style="margin:0">HTTP</label>
+    <input id="httpBase" type="text" style="width:190px" placeholder="http://127.0.0.1:8080">
+    <label style="margin:0">WS</label>
+    <input id="wsBase" type="text" style="width:190px" placeholder="ws://127.0.0.1:8081">
+    <button class="sec" onclick="ping()">Connect</button>
+  </div>
+</header>
+
+<main>
+  <!-- HTTP: transcription -->
+  <section class="card">
+    <h2>HTTP transcription <span class="tag">POST /v1/audio/transcriptions</span></h2>
+    <label>Audio file (WAV)</label>
+    <input id="trFile" type="file" accept="audio/*">
+    <div><button onclick="httpTranscribe()">Transcribe</button></div>
+    <div id="trOut" class="out"></div>
+  </section>
+
+  <!-- HTTP: speech -->
+  <section class="card">
+    <h2>HTTP speech <span class="tag">POST /v1/audio/speech</span></h2>
+    <label>Text</label>
+    <textarea id="spText">你好，欢迎使用 RapidSpeech。</textarea>
+    <div class="row">
+      <div><label>voice</label><input id="spVoice" type="text" value="female"></div>
+      <div><label>language</label><input id="spLang" type="text" value="Chinese"></div>
+    </div>
+    <div><button onclick="httpSpeech()">Synthesize</button></div>
+    <div id="spOut" class="out muted"></div>
+    <audio id="spAudio" controls></audio>
+  </section>
+
+  <!-- WS: streaming ASR -->
+  <section class="card">
+    <h2>WS streaming ASR <span class="tag">/asr/stream</span></h2>
+    <div class="row">
+      <div><label>chunk_len</label>
+        <select id="asChunk"><option>16</option><option selected>32</option><option>48</option><option>96</option></select></div>
+    </div>
+    <div>
+      <button id="asMic" onclick="asrStreamMic()">🎙 Mic</button>
+      <button class="sec" id="asStop" onclick="stopMic()" disabled>Stop</button>
+      <label style="display:inline">or file:</label>
+      <input id="asFile" type="file" accept="audio/*" style="display:inline; width:auto">
+      <button class="sec" onclick="asrStreamFile('/asr/stream','asOut',false)">Send file</button>
+    </div>
+    <div id="asOut" class="out"></div>
+  </section>
+
+  <!-- WS: VAD + ASR -->
+  <section class="card">
+    <h2>WS VAD + ASR <span class="tag">/asr/vad</span></h2>
+    <div>
+      <button id="vaMic" onclick="asrVadMic()">🎙 Mic</button>
+      <button class="sec" id="vaStop" onclick="stopMic()" disabled>Stop</button>
+      <label style="display:inline">or file:</label>
+      <input id="vaFile" type="file" accept="audio/*" style="display:inline; width:auto">
+      <button class="sec" onclick="asrStreamFile('/asr/vad','vaOut',true)">Send file</button>
+    </div>
+    <div id="vaOut" class="out"></div>
+  </section>
+
+  <!-- WS: TTS streaming -->
+  <section class="card">
+    <h2>WS TTS <span class="tag">/tts/stream · /tts/segmented</span></h2>
+    <label>Text</label>
+    <textarea id="ttText">第一句话。第二句话，稍微长一点。</textarea>
+    <div class="row">
+      <div><label>voice</label><input id="ttVoice" type="text" value="female"></div>
+      <div><label>language</label><input id="ttLang" type="text" value="Chinese"></div>
+    </div>
+    <div>
+      <button onclick="ttsWs('/tts/stream')">Pure stream</button>
+      <button onclick="ttsWs('/tts/segmented')">Segmented</button>
+    </div>
+    <div id="ttOut" class="out muted"></div>
+    <audio id="ttAudio" controls></audio>
+  </section>
+
+  <!-- log -->
+  <section class="card full">
+    <h2>Log</h2>
+    <div id="log" class="out"></div>
+  </section>
+</main>
+
+<script>
+// ── config ──────────────────────────────────────────────────────────────
+(function init() {
+  const loc = location;
+  const served = loc.protocol.startsWith("http");
+  httpBase.value = served ? loc.origin : "http://127.0.0.1:8080";
+  const wsPort = served ? (Number(loc.port || 80) + 1) : 8081;
+  const wsHost = served ? loc.hostname : "127.0.0.1";
+  wsBase.value = `ws://${wsHost}:${wsPort}`;
+})();
+const HTTP = () => httpBase.value.replace(/\/$/, "");
+const WS = () => wsBase.value.replace(/\/$/, "");
+function log(m) { const t = new Date().toLocaleTimeString();
+  document.getElementById("log").textContent += `[${t}] ${m}\n`;
+  document.getElementById("log").scrollTop = 1e9; }
+
+async function ping() {
+  try {
+    const h = await fetch(HTTP() + "/health").then(r => r.json());
+    const m = await fetch(HTTP() + "/v1/models").then(r => r.json());
+    const ids = m.data.map(d => `${d.id}(${d.arch})`).join(", ") || "none";
+    dot.classList.add("up");
+    status.textContent = `${h.status} · models: ${ids}`;
+    log("connected · models: " + ids);
+  } catch (e) { dot.classList.remove("up"); status.textContent = "unreachable";
+    log("health failed: " + e); }
+}
+
+// ── HTTP transcription ──────────────────────────────────────────────────
+async function httpTranscribe() {
+  const f = trFile.files[0];
+  if (!f) { trOut.textContent = "pick a WAV file"; return; }
+  trOut.textContent = "…"; log("POST /v1/audio/transcriptions " + f.name);
+  const fd = new FormData(); fd.append("file", f); fd.append("model", "rapidspeech-asr");
+  try {
+    const r = await fetch(HTTP() + "/v1/audio/transcriptions", { method:"POST", body:fd });
+    const j = await r.json();
+    trOut.textContent = j.text ?? JSON.stringify(j);
+  } catch (e) { trOut.textContent = "error: " + e; }
+}
+
+// ── HTTP speech ─────────────────────────────────────────────────────────
+async function httpSpeech() {
+  spOut.textContent = "synthesizing…"; log("POST /v1/audio/speech");
+  const body = { model:"rapidspeech-tts", input:spText.value,
+                 voice:spVoice.value, language:spLang.value };
+  try {
+    const t0 = performance.now();
+    const r = await fetch(HTTP() + "/v1/audio/speech",
+      { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify(body) });
+    if (!r.ok) { spOut.textContent = "error: " + (await r.text()); return; }
+    const blob = await r.blob();
+    spAudio.src = URL.createObjectURL(blob);
+    spOut.textContent = `${(blob.size/1024).toFixed(0)} KB WAV · ${(performance.now()-t0|0)} ms`;
+    spAudio.play().catch(()=>{});
+  } catch (e) { spOut.textContent = "error: " + e; }
+}
+
+// ── audio helpers ───────────────────────────────────────────────────────
+function floatToI16(f32) {
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    let s = Math.max(-1, Math.min(1, f32[i]));
+    i16[i] = s < 0 ? s * 32768 : s * 32767;
+  }
+  return i16;
+}
+function resample(f32, from, to) {
+  if (from === to) return f32;
+  const n = Math.round(f32.length * to / from), out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i * from / to, i0 = Math.floor(x), i1 = Math.min(i0 + 1, f32.length - 1);
+    out[i] = f32[i0] + (f32[i1] - f32[i0]) * (x - i0);
+  }
+  return out;
+}
+
+// ── microphone streaming (shared by both ASR endpoints) ─────────────────
+let micCtx = null, micNode = null, micStream = null, micWs = null;
+async function startMic(path, out, isVad) {
+  const ws = new WebSocket(WS() + path);
+  ws.binaryType = "arraybuffer";
+  micWs = ws;
+  const view = document.getElementById(out);
+  view.innerHTML = ""; const segs = {};
+  ws.onmessage = (e) => onAsrMsg(e, view, segs, isVad);
+  ws.onclose = () => log(path + " closed");
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+  log(path + " connected (mic)");
+  micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount:1 } });
+  const src = micCtx.createMediaStreamSource(micStream);
+  micNode = micCtx.createScriptProcessor(4096, 1, 1);
+  const rate = micCtx.sampleRate;
+  src.connect(micNode); micNode.connect(micCtx.destination);
+  micNode.onaudioprocess = (ev) => {
+    if (!micWs || micWs.readyState !== 1) return;
+    let ch = ev.inputBuffer.getChannelData(0);
+    if (rate !== 16000) ch = resample(ch, rate, 16000);
+    micWs.send(floatToI16(ch).buffer);
+  };
+  document.querySelectorAll("#asStop,#vaStop").forEach(b => b.disabled = false);
+  document.querySelectorAll("#asMic,#vaMic").forEach(b => b.disabled = true);
+}
+function stopMic() {
+  if (micNode) micNode.disconnect();
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (micCtx) micCtx.close();
+  if (micWs && micWs.readyState === 1) micWs.send(JSON.stringify({ type:"eos" }));
+  micCtx = micNode = micStream = null;
+  document.querySelectorAll("#asStop,#vaStop").forEach(b => b.disabled = true);
+  document.querySelectorAll("#asMic,#vaMic").forEach(b => b.disabled = false);
+}
+const asrStreamMic = () => startMic("/asr/stream", "asOut", false).catch(e => log("mic err: " + e));
+const asrVadMic = () => startMic("/asr/vad", "vaOut", true).catch(e => log("mic err: " + e));
+
+function onAsrMsg(e, view, segs, isVad) {
+  if (typeof e.data !== "string") return;
+  const d = JSON.parse(e.data);
+  if (d.type === "ready") { log("asr ready"); return; }
+  if (d.type === "error") { view.innerHTML = `<span style="color:var(--err)">${d.error}</span>`; return; }
+  if (!isVad) {
+    if (d.type === "partial") view.innerHTML = `<span class="partial">${d.text}</span>`;
+    if (d.type === "final") view.innerHTML = `<span class="final">${d.text}</span>`;
+    return;
+  }
+  // VAD: one line per segment, partial (amber) → final (green)
+  const s = d.segment;
+  if (d.type === "partial" || d.type === "final") {
+    if (!segs[s]) { segs[s] = document.createElement("div"); segs[s].className = "seg"; view.appendChild(segs[s]); }
+    const text = d.text || (d.type === "partial" ? "(listening)" : "");
+    segs[s].innerHTML = `<span class="muted">#${s}</span> <span class="${d.type}">${text}</span>`;
+  }
+  if (d.type === "done") log("vad done");
+}
+
+// ── ASR from a file over WS ─────────────────────────────────────────────
+async function asrStreamFile(path, out, isVad) {
+  const inp = isVad ? vaFile : asFile;
+  const f = inp.files[0];
+  if (!f) { log("pick a file"); return; }
+  const buf = await f.arrayBuffer();
+  const actx = new (window.AudioContext || window.webkitAudioContext)();
+  const ab = await actx.decodeAudioData(buf);
+  let pcm = ab.getChannelData(0);
+  pcm = resample(pcm, ab.sampleRate, 16000);
+  actx.close();
+  const ws = new WebSocket(WS() + path + (isVad ? "" : "?chunk_len=" + asChunk.value));
+  ws.binaryType = "arraybuffer";
+  const view = document.getElementById(out); view.innerHTML = ""; const segs = {};
+  ws.onmessage = (e) => onAsrMsg(e, view, segs, isVad);
+  ws.onopen = async () => {
+    log(path + " sending " + (pcm.length/16000).toFixed(1) + "s");
+    const step = 3200; // 200 ms
+    for (let i = 0; i < pcm.length; i += step) {
+      ws.send(floatToI16(pcm.subarray(i, i + step)).buffer);
+      await new Promise(r => setTimeout(r, 30));
+    }
+    ws.send(JSON.stringify({ type:"eos" }));
+  };
+  ws.onclose = () => log(path + " closed");
+}
+
+// ── TTS over WS (streaming playback) ────────────────────────────────────
+function ttsWs(path) {
+  const ws = new WebSocket(WS() + path);
+  ws.binaryType = "arraybuffer";
+  ttOut.textContent = "connecting…";
+  let sr = 24000, actx = null, playAt = 0, chunks = [], nSeg = 0, t0 = 0, firstAt = 0;
+  ws.onopen = () => {
+    t0 = performance.now();
+    ws.send(JSON.stringify({ type:"text", text:ttText.value,
+                             voice:ttVoice.value, language:ttLang.value }));
+    log(path + " sent text");
+  };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      const d = JSON.parse(e.data);
+      if (d.type === "audio_info") {
+        sr = d.sample_rate;
+        actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+        playAt = actx.currentTime + 0.1;
+      } else if (d.type === "segment") { nSeg++; }
+      else if (d.type === "error") { ttOut.textContent = "error: " + d.error; }
+      else if (d.type === "final") {
+        const total = chunks.reduce((a, c) => a + c.length, 0);
+        ttOut.textContent = `done · ${(total/sr).toFixed(2)}s · ${nSeg} segment(s) · ` +
+          `first audio ${(firstAt - t0)|0} ms`;
+        // build a WAV blob for the <audio> element too
+        ttAudio.src = URL.createObjectURL(wavBlob(chunks, sr));
+        ws.close();
+      }
+    } else {
+      // binary int16 PCM chunk → schedule for gapless streaming playback
+      const i16 = new Int16Array(e.data);
+      chunks.push(i16);
+      if (!firstAt) firstAt = performance.now();
+      if (actx) {
+        const f = new Float32Array(i16.length);
+        for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
+        const b = actx.createBuffer(1, f.length, sr); b.copyToChannel(f, 0);
+        const s = actx.createBufferSource(); s.buffer = b; s.connect(actx.destination);
+        playAt = Math.max(playAt, actx.currentTime);
+        s.start(playAt); playAt += b.duration;
+      }
+    }
+  };
+  ws.onerror = () => { ttOut.textContent = "ws error"; };
+}
+function wavBlob(chunks, sr) {
+  let n = chunks.reduce((a, c) => a + c.length, 0);
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const s = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+  s(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); s(8, "WAVE"); s(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); s(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44; for (const c of chunks) for (let i = 0; i < c.length; i++) { v.setInt16(o, c[i], true); o += 2; }
+  return new Blob([buf], { type:"audio/wav" });
+}
+
+ping();
+</script>
+</body>
+</html>

@@ -186,6 +186,7 @@ Build artifacts are located in the `build/` directory:
 - `rs-asr-vad-online` — VAD-segmented quasi-streaming ASR command-line tool
 - `rs-asr-online` — True chunked streaming ASR (X-ASR; mic or WAV, live partials)
 - `rs-tts-offline` — Offline TTS command-line tool
+- `rs-server` — OpenAI-compatible HTTP API + MCP server (ASR + TTS)
 - `rs-quantize` — Model quantization tool
 
 ### Core Commands
@@ -241,6 +242,23 @@ and GGUF conversion.
 ```bash
 ./build/rs-quantize /path/to/input-f16.gguf /path/to/output-q4_k.gguf q4_k
 ```
+
+**Server (OpenAI API + MCP)**
+
+```bash
+# Serve ASR + TTS over an OpenAI-compatible HTTP API and MCP
+./build/rs-server --asr-model xasr.gguf --tts-model omnivoice.gguf --port 8080
+
+curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@audio.wav -F model=rapidspeech-asr
+curl http://127.0.0.1:8080/v1/audio/speech -H 'content-type: application/json' \
+     -d '{"input":"hello","voice":"female"}' --output out.wav
+```
+
+Also runs as an MCP server (stdio for Claude Desktop, or `POST /mcp`) and
+exposes WebSocket streaming endpoints (streaming ASR with partial/final,
+VAD-segmented ASR, segmented + pure streaming TTS), plus a browser test console
+(`--web-dir examples/server` → `http://host:port/webui.html`). See
+[examples/server/README.md](examples/server/README.md).
 
 ### Python
 
