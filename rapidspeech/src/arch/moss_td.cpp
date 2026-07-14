@@ -969,6 +969,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     fprintf(stderr, "[prof] decoder prefill (%d ctx tokens, 28L): %.1f ms\n",
             total_T, ms);
   }
+  // Duration/repeat stop: the decoder must not transcribe past the real audio,
+  // and must not RESTART the transcript from the top (a WASM-numerics EOS-boundary
+  // divergence re-emits the whole thing → duplicated segments). Each merged audio
+  // token spans ~0.08 s. We track the max emitted timestamp; a new timestamp that
+  // jumps backward (repeat) or runs well past the audio length ends decoding.
+  const double audio_dur_s =
+      static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
+  double max_ts_seen = 0.0;
   auto _tdec = std::chrono::steady_clock::now();
   for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
@@ -1104,7 +1112,30 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       break;
     }
     st.token_ids.push_back(next_token);
-    if (on_token_) on_token_(llm_model_->vocab().detokenize(st.token_ids));
+    const std::string dtext = llm_model_->vocab().detokenize(st.token_ids);
+    if (on_token_) on_token_(dtext);
+    // Duration/repeat stop: inspect the last complete "[N.NN]" timestamp. A jump
+    // backward past what we've already emitted means the decoder restarted the
+    // transcript (WASM EOS-boundary divergence -> duplicated segments); a value
+    // well beyond the audio means it's hallucinating past the end.
+    if (audio_dur_s > 0.0) {
+      const size_t rb = dtext.rfind(']');
+      if (rb != std::string::npos && rb > 0) {
+        const size_t lb = dtext.rfind('[', rb);
+        if (lb != std::string::npos && rb - lb > 1) {
+          const std::string num = dtext.substr(lb + 1, rb - lb - 1);
+          char *endp = nullptr;
+          const double ts = std::strtod(num.c_str(), &endp);
+          if (endp != num.c_str() && *endp == '\0') {   // a pure-numeric [ts]
+            if (ts < max_ts_seen - 0.6 || ts > audio_dur_s + 2.0) {
+              ggml_backend_sched_reset(sched);
+              break;
+            }
+            if (ts > max_ts_seen) max_ts_seen = ts;
+          }
+        }
+      }
+    }
 
     // Loop breaker: the greedy decoder can cycle on silence-padded / short
     // audio (esp. under WASM SIMD numerics), repeating whole segments. The
