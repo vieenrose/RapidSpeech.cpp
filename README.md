@@ -111,9 +111,9 @@ faster than real time.
 
 | Task | Models | Status |
 | --- | --- | --- |
-| ASR | SenseVoice-small, FunASR-nano, X-ASR (Zipformer2, streaming) | Stable |
+| ASR | SenseVoice-small, FunASR-nano, X-ASR (Zipformer2, streaming), MOSS-Transcribe-Diarize | Stable |
 | VAD | Silero VAD, FireRedVAD | Stable |
-| TTS | OmniVoice, OpenVoice2, Kokoro, IndexTTS-2 | Active |
+| TTS | OmniVoice, OpenVoice2, Kokoro, IndexTTS-2, PrimeTTS (v2 / v2.1) | Active |
 | Speaker | CAMPPlus | Stable |
 
 **X-ASR** — Chinese/English Zipformer2 transducer (icefall/k2). One GGUF serves
@@ -121,6 +121,18 @@ both **offline** full-context decoding and **true chunked streaming** (per-layer
 left-context caches, sub-second partials, `--chunk-len 16/32/48/96/192` fbank
 frames). Punctuation and casing, greedy transducer decode, runs on CPU / Metal /
 CUDA / Vulkan and quantizes to q4_k_m (99.5 MB).
+
+**MOSS-Transcribe-Diarize** — transcription **with speaker diarization + word
+timestamps** in one pass (Whisper-Medium encoder + Qwen3-0.6B decoder, audio
+tokens spliced into the LLM). Emits `[start][Sxx]text[end]` segments; Q4_K GGUF
+(~700 MB). Runs on CPU / CUDA and **entirely in the browser via WebAssembly**
+(mel + encoder + streaming decoder in WASM, optional CAM++ cross-window speaker
+linking). zh-TW / English meetings.
+
+**PrimeTTS** (v2 / v2.1) — single-speaker MB-iSTFT-VITS: TextEncoder (windowed
+rel-pos transformer) → deterministic duration predictor → residual-coupling flow
+→ multiband-iSTFT + PQMF generator → 16 kHz waveform. Compact, fast, no BERT and
+no speaker embedding; backend-agnostic ggml graphs.
 
 **IndexTTS-2** — expressive zero-shot voice-cloning TTS (GPT + S2Mel CFM +
 BigVGAN-v2 vocoder) with 4-mode emotion control (reference audio / vector / text
