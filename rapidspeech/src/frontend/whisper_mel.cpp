@@ -235,7 +235,7 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
   // native/ORT regardless, so the default trims aggressively for speed and the
   // margin is an env-tunable accuracy knob (RS_ENC_MARGIN=800 for best timestamps).
   const char *menv = std::getenv("RS_ENC_MARGIN");
-  const int margin = menv ? std::atoi(menv) : 0;
+  const int margin = menv ? std::atoi(menv) : 800;
   int n_out_frames;
   if (n_eff <= chunk && !no_trunc) {
     int want = n_eff + margin;

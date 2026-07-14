@@ -856,6 +856,16 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   ggml_backend_sched_reset(sched);
 
   // -------- (c) GPU-persistent KV buffers & gallocr pre-warm --------
+  // RS_KV_Q8 (MOSS-only, this file is the MOSS decoder): store the persistent
+  // KV cache as q8_0 instead of f32 to cut peak memory on long windows. q8_0 is
+  // near-lossless for attention. kv_dim (=head_dim*n_head_kv=128*8=1024) is a
+  // multiple of QK8_0=32, so q8_0 row quantization is exact-shape. Other archs
+  // (qwen3_asr, funasr-nano) don't run this code path and are unaffected.
+  const bool use_q8_kv = getenv("RS_KV_Q8") != nullptr;
+  const ggml_type kv_type = use_q8_kv ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+  if (use_q8_kv) {
+    RS_LOG_INFO("MossTD: RS_KV_Q8 set — persistent KV cache stored as q8_0");
+  }
   const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
@@ -868,9 +878,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     ctx_kv = ggml_init(kv_buf_params);
     for (int il = 0; il < n_layer; ++il) {
       gpu_kv_k_vec[il] =
-          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+          ggml_new_tensor_2d(ctx_kv, kv_type, kv_dim, n_kv_max);
       gpu_kv_v_vec[il] =
-          ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+          ggml_new_tensor_2d(ctx_kv, kv_type, kv_dim, n_kv_max);
       ggml_set_name(gpu_kv_k_vec[il],
                     ("qwen3asr_kv_k_" + std::to_string(il)).c_str());
       ggml_set_name(gpu_kv_v_vec[il],
@@ -883,12 +893,45 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     if (!kv_gpu_buf) {
       RS_LOG_ERR("Qwen3ASR: failed to allocate GPU KV buffers");
     }
+    // Upload the prefill KV (n_cached_tokens_ columns) from the f32 host mirror.
+    // For q8_0, ggml_backend_tensor_set does a raw byte copy and will NOT
+    // quantize, so quantize the whole prefill block f32->q8_0 first, then set
+    // the q8_0 bytes (row_size(q8_0,kv_dim) per column). For f32 this is the
+    // original raw copy.
+    std::vector<uint8_t> q8_tmp;
+    if (use_q8_kv) {
+      q8_tmp.resize(ggml_row_size(GGML_TYPE_Q8_0, kv_dim) *
+                    (size_t)n_cached_tokens_);
+    }
     for (int il = 0; il < n_layer; ++il) {
-      size_t bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
-      ggml_backend_tensor_set(gpu_kv_k_vec[il],
-                              host_kv_cache_k_[il].data(), 0, bytes);
-      ggml_backend_tensor_set(gpu_kv_v_vec[il],
-                              host_kv_cache_v_[il].data(), 0, bytes);
+      if (use_q8_kv) {
+        const size_t qbytes = ggml_quantize_chunk(
+            GGML_TYPE_Q8_0, host_kv_cache_k_[il].data(), q8_tmp.data(),
+            /*start=*/0, /*nrows=*/n_cached_tokens_, /*n_per_row=*/kv_dim,
+            /*imatrix=*/nullptr);
+        ggml_backend_tensor_set(gpu_kv_k_vec[il], q8_tmp.data(), 0, qbytes);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, host_kv_cache_v_[il].data(),
+                            q8_tmp.data(), 0, n_cached_tokens_, kv_dim, nullptr);
+        ggml_backend_tensor_set(gpu_kv_v_vec[il], q8_tmp.data(), 0, qbytes);
+      } else {
+        size_t bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
+        ggml_backend_tensor_set(gpu_kv_k_vec[il],
+                                host_kv_cache_k_[il].data(), 0, bytes);
+        ggml_backend_tensor_set(gpu_kv_v_vec[il],
+                                host_kv_cache_v_[il].data(), 0, bytes);
+      }
+    }
+    // The f32 host mirror (~883MB for a 280s window) is not read again during
+    // decode — the new column is staged from the decode graph's GPU output,
+    // not from this mirror. Under RS_KV_Q8, free it now to reclaim the memory.
+    // (Left intact in the default path so default behavior is unchanged.)
+    if (use_q8_kv) {
+      for (int il = 0; il < n_layer; ++il) {
+        std::vector<float>().swap(host_kv_cache_k_[il]);
+        std::vector<float>().swap(host_kv_cache_v_[il]);
+      }
+      std::vector<std::vector<float>>().swap(host_kv_cache_k_);
+      std::vector<std::vector<float>>().swap(host_kv_cache_v_);
     }
   }
   {
@@ -1013,16 +1056,35 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
 
     // Stage new KV column to host + persistent GPU buffer.
+    // k_out/v_out are the f32 concat outputs [kv_dim, n_cached+1]; the NEW
+    // column lives at f32 offset n_cached_tokens_*kv_dim. For q8_0 storage we
+    // must quantize that one f32 column to q8_0 and write it at the q8_0 row
+    // offset (raw ggml_backend_tensor_set does not quantize).
+    const size_t new_bytes_f32 = (size_t)kv_dim * sizeof(float);
+    const size_t off_f32       = (size_t)n_cached_tokens_ * kv_dim * sizeof(float);
+    const size_t q8_row        = ggml_row_size(GGML_TYPE_Q8_0, kv_dim);
+    const size_t off_q8        = (size_t)n_cached_tokens_ * q8_row;
+    std::vector<uint8_t> q8_col;
+    if (use_q8_kv) q8_col.resize(q8_row);
     for (int il = 0; il < n_layer; ++il) {
       ggml_tensor *k_out = dec->get_kv_output_k(il);
       ggml_tensor *v_out = dec->get_kv_output_v(il);
       if (!k_out || !v_out) continue;
-      const size_t new_bytes = (size_t)kv_dim * sizeof(float);
-      const size_t off       = (size_t)n_cached_tokens_ * kv_dim * sizeof(float);
-      ggml_backend_tensor_get(k_out, kv_stage_k.data(), off, new_bytes);
-      ggml_backend_tensor_get(v_out, kv_stage_v.data(), off, new_bytes);
-      ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(), off, new_bytes);
-      ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(), off, new_bytes);
+      ggml_backend_tensor_get(k_out, kv_stage_k.data(), off_f32, new_bytes_f32);
+      ggml_backend_tensor_get(v_out, kv_stage_v.data(), off_f32, new_bytes_f32);
+      if (use_q8_kv) {
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, kv_stage_k.data(), q8_col.data(),
+                            0, 1, kv_dim, nullptr);
+        ggml_backend_tensor_set(gpu_kv_k_vec[il], q8_col.data(), off_q8, q8_row);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, kv_stage_v.data(), q8_col.data(),
+                            0, 1, kv_dim, nullptr);
+        ggml_backend_tensor_set(gpu_kv_v_vec[il], q8_col.data(), off_q8, q8_row);
+      } else {
+        ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(), off_f32,
+                                new_bytes_f32);
+        ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(), off_f32,
+                                new_bytes_f32);
+      }
     }
     n_cached_tokens_++;
 

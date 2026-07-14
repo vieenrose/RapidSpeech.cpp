@@ -520,6 +520,19 @@ llm_graph_builder::build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
           ggml_view_2d(ctx, v_gpu, kv_dim_2d, n_cached, v_gpu->nb[1], 0);
       // No ggml_set_input needed — the data is already in GPU memory
 
+      // RS_KV_Q8: when the persistent KV buffer is quantized (q8_0), the cached
+      // view is q8_0 but k_cur below is f32. ggml_concat requires matching
+      // types, so dequantize the cached columns to f32 first. This materializes
+      // only [kv_dim, n_cached] f32 transiently (freed per layer by gallocr);
+      // STORAGE in k_gpu/v_gpu stays q8_0. The F32 fast-path (other archs) is
+      // unchanged because the cast is skipped when the buffer is already F32.
+      if (k_gpu->type != GGML_TYPE_F32) {
+        k_cached_view = ggml_cast(ctx, k_cached_view, GGML_TYPE_F32);
+      }
+      if (v_gpu->type != GGML_TYPE_F32) {
+        v_cached_view = ggml_cast(ctx, v_cached_view, GGML_TYPE_F32);
+      }
+
       // Reshape current K/V to 2D: [kv_dim, 1]
       ggml_tensor *k_cur_2d =
           ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur), kv_dim_2d, k_cur->ne[2]);

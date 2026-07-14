@@ -182,6 +182,12 @@ const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
   } else {
     m->SetOnToken(nullptr);
   }
+  // For long (multi-chunk) windows the f32 KV cache would blow past the WASM
+  // 4 GB budget (300 s ~= 3854 ctx tokens -> ~1 GB f32 KV, 3.7 GB peak). q8_0 KV
+  // is near-lossless and cuts ~0.7 GB. Short clips stay f32 (fully lossless).
+  if (n_audio_tokens > 1500) setenv("RS_KV_Q8", "1", 1);
+  else                       unsetenv("RS_KV_Q8");
+
   std::vector<float> pcmv(pcm, pcm + n_samples);
   auto st = m->CreateState();
   // Encode() runs the C++ WhisperMelExtractor (mel) + encoder graph. The encoder
@@ -723,6 +729,47 @@ int rs_wasm_kws_get_sample_rate(void) {
 EMSCRIPTEN_KEEPALIVE
 const char *rs_wasm_kws_get_arch_name(void) {
   return g_kws_arch;
+}
+
+// ── Speaker embedding (CAM++, independent of g_ctx) ──
+//
+// Single CAM++ handle per WASM module. Mirrors the VAD/KWS pattern: its own
+// global so speaker-id runs independently of the MOSS ASR context.
+
+static rs_speaker_t *g_spk = nullptr;
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_speaker_init(const char *model_path, int n_threads) {
+  if (g_spk) { rs_speaker_free(g_spk); g_spk = nullptr; }
+  // use_gpu = 0: WASM has no GPU backend compiled in; CAM++ is CPU-only here.
+  g_spk = rs_speaker_init_from_file(model_path, n_threads, /*use_gpu=*/false);
+  if (!g_spk) {
+    rs_error_info_t err = rs_get_last_error();
+    EM_ASM({
+      console.error("rs_speaker_init_from_file failed: " + UTF8ToString($0), $1);
+    }, err.message, err.code);
+    return -1;
+  }
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_speaker_embed(const float *pcm, int n_samples, float *out_emb,
+                          int out_size) {
+  if (!g_spk || !pcm || n_samples <= 0 || !out_emb) return -1;
+  rs_error_t rc = rs_speaker_embed(g_spk, pcm, n_samples, out_emb, out_size);
+  return (rc == RS_OK) ? 0 : (int)rc;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_speaker_dim(void) {
+  if (!g_spk) return 0;
+  return (int)rs_speaker_dim(g_spk);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void rs_wasm_speaker_free(void) {
+  if (g_spk) { rs_speaker_free(g_spk); g_spk = nullptr; }
 }
 
 #ifdef __cplusplus

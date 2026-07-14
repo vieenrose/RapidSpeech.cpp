@@ -21,12 +21,15 @@ const $ = (id) => document.getElementById(id);
 /* ---------------------------- configuration ------------------------------ */
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
   "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v5kl-q4_k_m.gguf";
+// CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
+// linking. Absent -> falls back to per-window [Sxx] tags.
+const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
 const PROMPT = "请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。";
 const EXAMPLES =
   "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-onnx/resolve/main/demo/";
 
 const SR = 16000, N_MEL = 80, N_FRAMES = 3000;
-const WINDOW_S = 28;      // real-audio seconds per pass (< 30 s Whisper chunk)
+const WINDOW_S = 300;     // 5-min window (multi-chunk); matches the ORT demo default
 const MIC_MAX_S = 120;
 const WASM_BASE = "rapidspeech-wasm-mt";
 
@@ -44,6 +47,8 @@ const yieldToLoop = () => new Promise((r) => setTimeout(r));
 let busy = false, aborted = false;
 let segs = [], rows = [], activeIdx = -1, hiddenSpk = new Set();
 let tokenCount = 0;   // decoder tokens streamed this run (for tok/s)
+let diarSegs = [];    // accumulated segments (with CAM++ embeddings) across windows
+let diarize = false;  // true once the CAM++ speaker model loaded (cross-window linking)
 
 function acquireBusy() {
   if (busy) return false;
@@ -294,7 +299,9 @@ function ensureModel() {
         setModelState("loading", m.text);
       } else if (m.type === "ready") {
         modelReady = true; dlState = null; $("dl-bars").innerHTML = "";
-        setModelState("ready", `Model ready · Q4_K · WASM · ${m.threads} threads`);
+        diarize = !!m.diarize;
+        setModelState("ready", `Model ready · Q4_K · WASM · ${m.threads} threads` +
+          (diarize ? " · CAM++ diarization" : ""));
         resolve();
       } else if (m.type === "moss_token") {
         tailProvisional = s2tw(m.text);      // live partial (Traditional)
@@ -308,7 +315,7 @@ function ensureModel() {
         else { modelPromise = null; reject(new Error(m.error)); }
       }
     };
-    worker.postMessage({ type: "init", ggufUrl: GGUF_URL });
+    worker.postMessage({ type: "init", ggufUrl: GGUF_URL, spkUrl: SPK_GGUF_URL });
   }).catch((e) => { modelPromise = null; throw e; });
   return modelPromise;
 }
@@ -322,39 +329,106 @@ function scheduleTailRender() {
   requestAnimationFrame(() => { tailRafPending = false; renderTranscript(tailProvisional); });
 }
 
-function parseWindowSegs(text, base, durS) {
-  const re = /\[(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\](?:\[(S\d+)\])?([^\[]*)/g;
-  const out = []; let m;
-  while ((m = re.exec(text))) {
-    const start = parseFloat(m[1]);
-    if (!m[4] || !m[4].trim() || start > durS + 0.5) continue; // drop tail hallucinations
-    out.push({
-      start: base + start,
-      rawEnd: m[2] !== undefined ? base + parseFloat(m[2]) : null,
-      spk: m[3] || "",
-      text: s2tw(m[4].trim()),   // Simplified -> Traditional (q4 emits zh-CN)
-    });
-  }
-  return out;
+// Map the worker's window-local segments (with CAM++ embeddings) to absolute
+// time + Traditional/ITN'd text, keeping the embedding for cross-window linking.
+function mapWindowSegs(m, base) {
+  return (m.segs || []).map((s) => ({
+    start: base + s.start,
+    rawEnd: s.rawEnd != null ? base + s.rawEnd : null,
+    spk: s.spk || "",
+    text: s2tw(s.text),          // s2tw() also applies number ITN
+    emb: s.emb || null,          // 192-d CAM++ embedding (or null if too short)
+  }));
 }
 
-/* ---- one ≤28 s window: send PCM to the worker; tokens stream via onmessage ---- */
-// The worker computes the Whisper mel in WASM and streams tokens; this resolves
-// with the window's parsed segments when it finishes. nAudioTokens =
-// floor((len-1)/1280)+1 for THIS window's real samples.
+/* ---- one window: send PCM to the worker; tokens stream via onmessage -------- */
+// Resolves with the window's segments (absolute time, ITN'd text, + embeddings).
 function transcribeWindow(wav, base, durS) {
   return new Promise((resolve) => {
     const nTok = Math.floor((wav.length - 1) / 1280) + 1;
     tailProvisional = "";
     onWindowResolve = (m) => {
       tailProvisional = "";
-      resolve(m ? parseWindowSegs(m.text, base, durS) : []);
+      resolve(m ? mapWindowSegs(m, base) : []);
     };
     const w = wav.slice();                 // copy just this window's samples
     worker.postMessage(
       { type: "run", pcm: w.buffer, nTok, base, durS, prompt: PROMPT },
       [w.buffer]);
   });
+}
+
+/* ---- cross-window speaker linking (ported from the ORT demo pipeline.js) ----
+ * Core-segment average-linkage AHC @ cosine 0.45; segments < 3 s snap to the
+ * nearest cluster centroid; no-embedding segments inherit the previous label.
+ * Gives globally-consistent S01/S02… across windows via CAM++ embeddings. */
+function linkSpeakers(segs, threshold = 0.45, minCoreDur = 3.0) {
+  const withEmb = [];
+  segs.forEach((s, i) => { if (s.emb) withEmb.push(i); });
+  const core = withEmb.filter((i) => segs[i].end - segs[i].start >= minCoreDur);
+  const labOf = new Map();
+  if (core.length >= 2) {
+    const n = core.length;
+    const D = new Float64Array(n * n);
+    for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) {
+      let dot = 0; const ea = segs[core[a]].emb, eb = segs[core[b]].emb;
+      for (let k = 0; k < ea.length; k++) dot += ea[k] * eb[k];
+      D[a * n + b] = D[b * n + a] = 1 - dot;
+    }
+    const clusters = core.map((_, i) => [i]);
+    const active = new Set(clusters.map((_, i) => i));
+    for (;;) {
+      let bi = -1, bj = -1, bd = threshold;
+      for (const i of active) for (const j of active) {
+        if (j <= i) continue;
+        const d = D[i * n + j];
+        if (d < bd) { bd = d; bi = i; bj = j; }
+      }
+      if (bi < 0) break;
+      const ni = clusters[bi].length, nj = clusters[bj].length;
+      for (const k of active) {
+        if (k === bi || k === bj) continue;
+        const d = (ni * D[bi * n + k] + nj * D[bj * n + k]) / (ni + nj);
+        D[bi * n + k] = D[k * n + bi] = d;
+      }
+      clusters[bi] = clusters[bi].concat(clusters[bj]);
+      active.delete(bj);
+    }
+    const cents = [];
+    for (const ci of active) {
+      const members = clusters[ci];
+      const dim = segs[core[0]].emb.length;
+      const c = new Float64Array(dim);
+      for (const mm of members) { const e = segs[core[mm]].emb; for (let k = 0; k < dim; k++) c[k] += e[k]; }
+      let nrm = 0; for (let k = 0; k < dim; k++) nrm += c[k] * c[k];
+      nrm = Math.sqrt(nrm) || 1;
+      for (let k = 0; k < dim; k++) c[k] /= nrm;
+      cents.push(c);
+      for (const mm of members) labOf.set(core[mm], cents.length - 1);
+    }
+    for (const i of withEmb) {
+      if (labOf.has(i)) continue;
+      let best = 0, bestDot = -2;
+      for (let c = 0; c < cents.length; c++) {
+        let dot = 0; const e = segs[i].emb;
+        for (let k = 0; k < e.length; k++) dot += cents[c][k] * e[k];
+        if (dot > bestDot) { bestDot = dot; best = c; }
+      }
+      labOf.set(i, best);
+    }
+  } else if (withEmb.length) {
+    for (const i of withEmb) labOf.set(i, 0);
+  }
+  const canon = new Map();
+  const out = []; let prev = "S01";
+  segs.forEach((s, i) => {
+    let spk; const l = labOf.get(i);
+    if (l === undefined) spk = prev;
+    else { if (!canon.has(l)) canon.set(l, `S${String(canon.size + 1).padStart(2, "0")}`); spk = canon.get(l); }
+    prev = spk;
+    out.push({ start: s.start, end: s.end, speaker: spk, text: s.text });
+  });
+  return out;
 }
 
 // Fill each segment's display `end`: prefer the model's own end timestamp,
@@ -430,6 +504,7 @@ async function transcribe(wav) {
   }
 
   segs = [];
+  diarSegs = [];
   tokenCount = 0;
   $("status").textContent =
     `${fmt(secs)} of audio → ${nWin} × ${WINDOW_S}s window(s)`;
@@ -452,8 +527,11 @@ async function transcribe(wav) {
       finish();
       return;
     }
-    for (const s of winSegs) segs.push(s);
-    normalizeSegs(segs);
+    for (const s of winSegs) diarSegs.push(s);
+    normalizeSegs(diarSegs);                 // fill end + window-local speaker
+    // Re-link speakers globally across all windows so far (CAM++ AHC), or fall
+    // back to the model's per-window [Sxx] tags when the speaker model is absent.
+    segs = diarize ? linkSpeakers(diarSegs) : diarSegs;
     renderLegend();
     renderTranscript();
 
