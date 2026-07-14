@@ -196,6 +196,8 @@ set(RS_SOURCES
         rapidspeech/src/frontend/qwen3_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
+        rapidspeech/src/arch/moss_td.h
+        rapidspeech/src/arch/moss_td.cpp
         rapidspeech/src/utils/rs_wav.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.h
@@ -477,6 +479,9 @@ if (RS_BUILD_CLI)
     add_executable(moss-gen tools/moss_gen.cpp)
     target_link_libraries(moss-gen PRIVATE rapidspeech-core ggml)
     target_include_directories(moss-gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src ${GGML_PATH}/include ${GGML_PATH}/src)
+    add_executable(moss-td-test tools/moss_td_test.cpp)
+    target_link_libraries(moss-td-test PRIVATE rapidspeech-core ggml)
+    target_include_directories(moss-td-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src ${GGML_PATH}/include ${GGML_PATH}/src)
     if(GGML_CUDA)
         target_compile_definitions(moss-gen PRIVATE GGML_USE_CUDA)
     endif()

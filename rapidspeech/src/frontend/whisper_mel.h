@@ -29,8 +29,8 @@ struct WhisperMelConfig {
   // Chunk size in mel frames. Output is padded to a multiple of this.
   // Qwen3-ASR: chunk_size = 100 (2 * n_window with n_window=50).
   int chunk_size  = 100;
-  // Mel scale: false = Slaney (librosa htk=False, default), true = HTK
-  // (2595*log10(1+hz/700)). Qwen3-ASR's reference frontend uses HTK.
+  // Mel scale: false = Slaney (librosa htk=False, Whisper/MOSS default),
+  // true = HTK (2595*log10(1+hz/700)). Qwen3-ASR's reference frontend uses HTK.
   bool use_htk    = false;
 };
 
@@ -62,6 +62,10 @@ private:
   std::vector<float>  mel_filters_;        // [n_mels, n_fft/2 + 1] (row-major)
   std::vector<int>    fft_ip_;             // Ooura rdft workspace
   std::vector<double> fft_w_;              // Ooura rdft workspace
+  // Direct-DFT basis [n_bins * n_fft]. Ooura's rdft only supports power-of-2
+  // lengths, but Whisper uses n_fft=400 — a direct DFT matches HF exactly.
+  std::vector<float>  dft_cos_;
+  std::vector<float>  dft_sin_;
 
   void InitTables();
   void InitMelFilters();
