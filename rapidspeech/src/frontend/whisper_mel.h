@@ -59,6 +59,10 @@ private:
   std::vector<float>  mel_filters_;        // [n_mels, n_fft/2 + 1] (row-major)
   std::vector<int>    fft_ip_;             // Ooura rdft workspace
   std::vector<double> fft_w_;              // Ooura rdft workspace
+  // Direct-DFT basis [n_bins * n_fft]. Ooura's rdft only supports power-of-2
+  // lengths, but Whisper uses n_fft=400 — a direct DFT matches HF exactly.
+  std::vector<float>  dft_cos_;
+  std::vector<float>  dft_sin_;
 
   void InitTables();
   void InitMelFilters();

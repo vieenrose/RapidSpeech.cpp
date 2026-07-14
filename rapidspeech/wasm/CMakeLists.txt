@@ -42,6 +42,21 @@ if (RS_WASM_PTHREADS)
     # Must be set before add_subdirectory(ggml) so ggml's targets pick it up.
     add_compile_options(-pthread)
     add_link_options(-pthread)
+else()
+    # Single-threaded build: ggml's `find_package(Threads REQUIRED)` +
+    # `Threads::Threads` would otherwise add -pthread on Emscripten, pulling the
+    # multi-threaded libc (libc-mt) and clashing with the single-threaded stub
+    # (duplicate emscripten_futex_* / __lock / __wait symbols at link time).
+    # Pre-create an EMPTY Threads::Threads so ggml's find_package sees the
+    # requirement already satisfied and emits no -pthread flag anywhere.
+    if (NOT TARGET Threads::Threads)
+        add_library(Threads::Threads INTERFACE IMPORTED GLOBAL)
+    endif()
+    set(Threads_FOUND TRUE CACHE INTERNAL "")
+    set(CMAKE_THREAD_LIBS_INIT "" CACHE INTERNAL "")
+    set(CMAKE_HAVE_THREADS_LIBRARY 1 CACHE INTERNAL "")
+    set(CMAKE_USE_PTHREADS_INIT 0 CACHE INTERNAL "")
+    set(THREADS_PREFER_PTHREAD_FLAG OFF CACHE BOOL "" FORCE)
 endif()
 
 set(GGML_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml")
@@ -55,6 +70,17 @@ add_compile_definitions(GGML_MAX_NAME=128)
 if(NOT EXISTS "${GGML_PATH}/CMakeLists.txt")
     message(FATAL_ERROR "ggml not found at ${GGML_PATH}")
 endif()
+
+# Performance flags for the WHOLE tree (ggml + rapidspeech), set BEFORE
+# add_subdirectory(ggml) so ggml's targets inherit them.
+#   -msimd128       : 128-bit WASM SIMD (ggml's vectorized quant/mul_mat kernels).
+#   -mrelaxed-simd  : lets LLVM fuse mul+add into relaxed FMA and use relaxed
+#                     integer dot-products in the hot quantized matmul loops.
+#   -O3 at LINK     : REQUIRED for emscripten to run the Binaryen wasm-opt pass;
+#                     CMAKE_BUILD_TYPE=Release only sets -O3 for COMPILE, so
+#                     without this the final .wasm is left largely unoptimized.
+add_compile_options(-msimd128 -mrelaxed-simd)
+add_link_options(-O3 -msimd128 -mrelaxed-simd)
 
 # Pass Emscripten flags to ggml
 set(GGML_WASM_SINGLE_FILE ON CACHE BOOL "ggml: single-file WASM" FORCE)
@@ -85,6 +111,7 @@ set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/llm_kv_cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/qwen3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/qwen3_asr.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/moss_td.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/xasr.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/xasr_zipformer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/omnivoice.cpp
@@ -142,11 +169,13 @@ target_link_options(rapidspeech-wasm PRIVATE
     # Enable WASM SIMD for better performance
     -msimd128
 
-    # Filesystem support (for reading .gguf model)
+    # Filesystem support (for reading .gguf model). -lnodefs.js exposes NODEFS
+    # so Node harnesses can stream the model from disk (browser uses MEMFS).
     -sFORCE_FILESYSTEM=1
+    -lnodefs.js
 
     # Export the WASM entry-point functions to JS
-    -sEXPORTED_FUNCTIONS=[_rs_wasm_init,_rs_wasm_init_ex,_rs_wasm_free,_rs_wasm_push_audio,_rs_wasm_push_text,_rs_wasm_push_reference_audio,_rs_wasm_push_reference_text,_rs_wasm_process,_rs_wasm_redecode,_rs_wasm_get_text,_rs_wasm_get_audio_ptr,_rs_wasm_get_audio_len,_rs_wasm_reset,_rs_wasm_get_sample_rate,_rs_wasm_get_arch_name,_rs_wasm_is_ready,_rs_wasm_get_version,_rs_wasm_set_user_input_prompt,_rs_wasm_set_use_llm,_rs_wasm_set_ctc_precheck,_rs_wasm_asr_stream_supported,_rs_wasm_asr_stream_set_chunk_len,_rs_wasm_asr_stream_push,_rs_wasm_asr_stream_finish,_rs_wasm_asr_stream_reset,_rs_wasm_set_tts_params,_rs_wasm_set_tts_diffusion_steps,_rs_wasm_vad_init,_rs_wasm_vad_free,_rs_wasm_vad_reset,_rs_wasm_vad_set_threshold,_rs_wasm_vad_push_audio,_rs_wasm_vad_is_speech,_rs_wasm_vad_get_probability,_rs_wasm_vad_get_arch,_rs_wasm_vad_drain_segments,_rs_wasm_vad_drain_frames,_rs_wasm_kws_init,_rs_wasm_kws_free,_rs_wasm_kws_reset,_rs_wasm_kws_push_audio,_rs_wasm_kws_poll,_rs_wasm_kws_get_hits_ptr,_rs_wasm_kws_get_hits_count,_rs_wasm_kws_get_phrase_pool_ptr,_rs_wasm_kws_get_phrase_pool_len,_rs_wasm_kws_get_sample_rate,_rs_wasm_kws_get_arch_name,_malloc,_free]
+    -sEXPORTED_FUNCTIONS=[_rs_wasm_init,_rs_wasm_init_ex,_rs_wasm_free,_rs_wasm_push_audio,_rs_wasm_push_text,_rs_wasm_push_reference_audio,_rs_wasm_push_reference_text,_rs_wasm_process,_rs_wasm_redecode,_rs_wasm_get_text,_rs_wasm_get_audio_ptr,_rs_wasm_get_audio_len,_rs_wasm_reset,_rs_wasm_get_sample_rate,_rs_wasm_get_arch_name,_rs_wasm_is_ready,_rs_wasm_get_version,_rs_wasm_set_user_input_prompt,_rs_wasm_moss_transcribe_mel,_rs_wasm_moss_transcribe_pcm,_rs_wasm_set_use_llm,_rs_wasm_set_ctc_precheck,_rs_wasm_asr_stream_supported,_rs_wasm_asr_stream_set_chunk_len,_rs_wasm_asr_stream_push,_rs_wasm_asr_stream_finish,_rs_wasm_asr_stream_reset,_rs_wasm_set_tts_params,_rs_wasm_set_tts_diffusion_steps,_rs_wasm_vad_init,_rs_wasm_vad_free,_rs_wasm_vad_reset,_rs_wasm_vad_set_threshold,_rs_wasm_vad_push_audio,_rs_wasm_vad_is_speech,_rs_wasm_vad_get_probability,_rs_wasm_vad_get_arch,_rs_wasm_vad_drain_segments,_rs_wasm_vad_drain_frames,_rs_wasm_kws_init,_rs_wasm_kws_free,_rs_wasm_kws_reset,_rs_wasm_kws_push_audio,_rs_wasm_kws_poll,_rs_wasm_kws_get_hits_ptr,_rs_wasm_kws_get_hits_count,_rs_wasm_kws_get_phrase_pool_ptr,_rs_wasm_kws_get_phrase_pool_len,_rs_wasm_kws_get_sample_rate,_rs_wasm_kws_get_arch_name,_malloc,_free]
     -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8,getValue,setValue,FS,HEAPF32,HEAP32,HEAPU8,HEAPU32]
 
     # No closure compiler (easier debugging)
@@ -166,8 +195,10 @@ if (RS_WASM_PTHREADS)
     target_link_options(rapidspeech-wasm PRIVATE
         -pthread
         -sUSE_PTHREADS=1
-        -sPTHREAD_POOL_SIZE=4
-        -sMAXIMUM_MEMORY=2GB
+        # Size the worker pool to the machine's core count (was fixed at 4) so
+        # the encoder FFN / prefill / decode matmuls can use every core.
+        "SHELL:-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency"
+        -sMAXIMUM_MEMORY=4GB
     )
 endif()
 

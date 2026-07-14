@@ -221,6 +221,8 @@ set(RS_SOURCES
         rapidspeech/src/frontend/seamless_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
+        rapidspeech/src/arch/moss_td.h
+        rapidspeech/src/arch/moss_td.cpp
         rapidspeech/src/utils/rs_wav.cpp
         rapidspeech/src/utils/rs_data_paths.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
@@ -533,6 +535,9 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
+    add_executable(moss-td-test
+            tools/moss_td_test.cpp
+    )
     add_executable(rs-server
             examples/server/rs-server.cpp
     )
@@ -548,6 +553,7 @@ if (RS_BUILD_CLI)
             rs-speaker-id
             rs-kws
             rs-server
+            moss-td-test
     )
 
     if (NOT WIN32)
@@ -567,6 +573,8 @@ if (RS_BUILD_CLI)
     endif()
 
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
+    target_link_libraries(moss-td-test PRIVATE rapidspeech-core ggml)
+    target_include_directories(moss-td-test PRIVATE rapidspeech/src)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-asr-online PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)

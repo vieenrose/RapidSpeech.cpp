@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -58,20 +60,26 @@ WhisperMelExtractor::WhisperMelExtractor(const WhisperMelConfig &config)
 WhisperMelExtractor::~WhisperMelExtractor() = default;
 
 void WhisperMelExtractor::InitTables() {
-  // Symmetric Hann window over n_fft samples (matches torch.hann_window with
-  // periodic=False, which is what WhisperFeatureExtractor uses).
+  // Periodic Hann window (torch.hann_window default periodic=True) — this is
+  // what WhisperFeatureExtractor uses: denominator is n_fft, NOT n_fft-1.
   hann_window_.resize(cfg_.n_fft);
   for (int i = 0; i < cfg_.n_fft; ++i) {
     hann_window_[i] =
-        0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)(cfg_.n_fft - 1));
+        0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)cfg_.n_fft);
   }
 
-  // Ooura rdft workspace.
-  fft_ip_.assign(2 + (int)std::sqrt((double)cfg_.n_fft / 2) + 1, 0);
-  fft_w_.assign(cfg_.n_fft / 2, 0.0);
-  fft_ip_[0] = 0;
-  std::vector<double> dummy(cfg_.n_fft, 0.0);
-  rdft(cfg_.n_fft, 1, dummy.data(), fft_ip_.data(), fft_w_.data());
+  // Direct DFT basis [n_bins][n_fft] (Whisper n_fft=400 is not a power of 2, so
+  // Ooura's rdft cannot be used; a direct DFT matches WhisperFeatureExtractor).
+  const int n_bins = cfg_.n_fft / 2 + 1;
+  dft_cos_.assign((size_t)n_bins * cfg_.n_fft, 0.0f);
+  dft_sin_.assign((size_t)n_bins * cfg_.n_fft, 0.0f);
+  for (int k = 0; k < n_bins; ++k) {
+    for (int n = 0; n < cfg_.n_fft; ++n) {
+      const double a = 2.0 * M_PI * k * n / (double)cfg_.n_fft;
+      dft_cos_[(size_t)k * cfg_.n_fft + n] = (float)std::cos(a);
+      dft_sin_[(size_t)k * cfg_.n_fft + n] = (float)std::sin(a);
+    }
+  }
 }
 
 void WhisperMelExtractor::InitMelFilters() {
@@ -158,15 +166,15 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
       for (int j = 0; j < n_fft; ++j) {
         buf[j] = (double)padded[offset + j] * hann_window_[j];
       }
-      rdft(n_fft, 1, buf.data(),
-           const_cast<int *>(fft_ip_.data()),
-           const_cast<double *>(fft_w_.data()));
-      // Ooura layout: a[0]=Re(0), a[1]=Re(N/2), a[2k]=Re(k), a[2k+1]=Im(k).
-      power[0]         = buf[0] * buf[0];
-      power[n_bins - 1] = buf[1] * buf[1];
-      for (int k = 1; k < n_bins - 1; ++k) {
-        const double re = buf[2 * k];
-        const double im = buf[2 * k + 1];
+      // Direct DFT |X[k]|^2 for k in [0, n_bins) (matches HF; n_fft=400).
+      for (int k = 0; k < n_bins; ++k) {
+        const float *cs = &dft_cos_[(size_t)k * n_fft];
+        const float *sn = &dft_sin_[(size_t)k * n_fft];
+        double re = 0.0, im = 0.0;
+        for (int j = 0; j < n_fft; ++j) {
+          re += (double)cs[j] * buf[j];
+          im -= (double)sn[j] * buf[j];  // e^{-i...} convention
+        }
         power[k] = re * re + im * im;
       }
       for (int m = 0; m < n_mels; ++m) {
@@ -208,13 +216,34 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
     v = (v + 4.0f) / 4.0f;
   }
 
-  // 5. Pad frame count up to a multiple of chunk_size; copy data and zero-fill
-  //    the trailing frames. Output layout: frame fast, mel-bin slow, so the
-  //    encoder graph can view it as [chunk_size, n_mel, 1, n_chunks] with
-  //    nb[1] = n_out_frames * sizeof(float).
+  // 5. Pad the frame count. Output layout: frame fast, mel-bin slow, so the
+  //    encoder graph can view it as [n_out_frames, n_mel, 1, n_chunks].
+  //    For audio that fits in a single chunk (<= chunk frames), pad only to the
+  //    next multiple of 8 rather than the full chunk: the MOSS encoder is
+  //    variable-length, and 8-alignment satisfies conv2 (stride 2) + merge-4 so
+  //    it produces exactly ceil(real/8) tokens without processing silence.
+  //    For longer audio keep uniform chunk-sized chunks.
   const int n_eff   = std::min(n_frames, (int)pcm.size() / hop + 1);
-  const int n_chunks = (n_eff + chunk - 1) / chunk;
-  const int n_out_frames = std::max(1, n_chunks) * chunk;
+  const int ENC_ALIGN = 8;   // conv2 stride-2 (even) * merge-4
+  // RS_NO_ENC_TRUNC=1 restores full chunk-sized padding (30 s) for A/B accuracy
+  // comparison against the encoder-truncation optimization.
+  const bool no_trunc = std::getenv("RS_NO_ENC_TRUNC") != nullptr;
+  // Trailing context margin (frames) past the last speech. The MOSS timestamp/EOS
+  // head was trained with the full 30 s Whisper chunk, so more trailing context
+  // = timestamps closer to the full-30 s (== ORT) reference (native: ~800 frames
+  // reproduces it byte-for-byte). On WASM, Q4_K/ggml numerics still diverge from
+  // native/ORT regardless, so the default trims aggressively for speed and the
+  // margin is an env-tunable accuracy knob (RS_ENC_MARGIN=800 for best timestamps).
+  const char *menv = std::getenv("RS_ENC_MARGIN");
+  const int margin = menv ? std::atoi(menv) : 0;
+  int n_out_frames;
+  if (n_eff <= chunk && !no_trunc) {
+    int want = n_eff + margin;
+    n_out_frames = std::min(chunk, std::max(ENC_ALIGN, ((want + ENC_ALIGN - 1) / ENC_ALIGN) * ENC_ALIGN));
+  } else {
+    const int n_chunks = (n_eff + chunk - 1) / chunk;
+    n_out_frames = n_chunks * chunk;
+  }
 
   out.assign((size_t)n_mels * n_out_frames, 0.0f);
   const int n_copy = std::min(n_eff, n_frames);
