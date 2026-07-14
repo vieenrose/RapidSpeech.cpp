@@ -172,9 +172,13 @@ target_link_options(rapidspeech-wasm PRIVATE
     -msimd128
 
     # Filesystem support (for reading .gguf model). -lnodefs.js exposes NODEFS
-    # so Node harnesses can stream the model from disk (browser uses MEMFS).
+    # so Node harnesses can stream the model from disk. -lworkerfs.js exposes
+    # WORKERFS so the browser worker can mount the downloaded gguf as a Blob —
+    # ggml then reads it lazily WITHOUT a ~700 MB in-heap MEMFS copy (critical
+    # for memory-capped iOS).
     -sFORCE_FILESYSTEM=1
     -lnodefs.js
+    -lworkerfs.js
 
     # Export the WASM entry-point functions to JS
     -sEXPORTED_FUNCTIONS=[_rs_wasm_init,_rs_wasm_init_ex,_rs_wasm_free,_rs_wasm_push_audio,_rs_wasm_push_text,_rs_wasm_push_reference_audio,_rs_wasm_push_reference_text,_rs_wasm_process,_rs_wasm_redecode,_rs_wasm_get_text,_rs_wasm_get_audio_ptr,_rs_wasm_get_audio_len,_rs_wasm_reset,_rs_wasm_get_sample_rate,_rs_wasm_get_arch_name,_rs_wasm_is_ready,_rs_wasm_get_version,_rs_wasm_set_user_input_prompt,_rs_wasm_moss_transcribe_mel,_rs_wasm_moss_transcribe_pcm,_rs_wasm_set_use_llm,_rs_wasm_set_ctc_precheck,_rs_wasm_asr_stream_supported,_rs_wasm_asr_stream_set_chunk_len,_rs_wasm_asr_stream_push,_rs_wasm_asr_stream_finish,_rs_wasm_asr_stream_reset,_rs_wasm_set_tts_params,_rs_wasm_set_tts_diffusion_steps,_rs_wasm_vad_init,_rs_wasm_vad_free,_rs_wasm_vad_reset,_rs_wasm_vad_set_threshold,_rs_wasm_vad_push_audio,_rs_wasm_vad_is_speech,_rs_wasm_vad_get_probability,_rs_wasm_vad_get_arch,_rs_wasm_vad_drain_segments,_rs_wasm_vad_drain_frames,_rs_wasm_kws_init,_rs_wasm_kws_free,_rs_wasm_kws_reset,_rs_wasm_kws_push_audio,_rs_wasm_kws_poll,_rs_wasm_kws_get_hits_ptr,_rs_wasm_kws_get_hits_count,_rs_wasm_kws_get_phrase_pool_ptr,_rs_wasm_kws_get_phrase_pool_len,_rs_wasm_kws_get_sample_rate,_rs_wasm_kws_get_arch_name,_rs_wasm_speaker_init,_rs_wasm_speaker_embed,_rs_wasm_speaker_dim,_rs_wasm_speaker_free,_malloc,_free]
@@ -191,6 +195,13 @@ target_link_options(rapidspeech-wasm PRIVATE
     -sASYNCIFY=1
 )
 
+# Maximum WASM memory. With pthreads the memory is SHARED, and shared
+# WebAssembly.Memory cannot be re-reserved, so browsers reserve the MAXIMUM up
+# front at instantiation. iOS WebKit refuses large reservations (~>1.5 GB), so
+# an iOS-targeted build must use a small maximum (e.g. 1536MB) — see the
+# rapidspeech-wasm-ios variant built by the demo.
+set(RS_WASM_MAX_MEMORY "4GB" CACHE STRING "WASM -sMAXIMUM_MEMORY (shared memory is reserved up front)")
+
 if (RS_WASM_PTHREADS)
     # ALLOW_MEMORY_GROWTH + pthreads requires MAXIMUM_MEMORY to be set so the
     # SharedArrayBuffer can be reallocated safely across workers.
@@ -200,7 +211,7 @@ if (RS_WASM_PTHREADS)
         # Size the worker pool to the machine's core count (was fixed at 4) so
         # the encoder FFN / prefill / decode matmuls can use every core.
         "SHELL:-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency"
-        -sMAXIMUM_MEMORY=4GB
+        -sMAXIMUM_MEMORY=${RS_WASM_MAX_MEMORY}
     )
 endif()
 

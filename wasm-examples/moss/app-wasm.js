@@ -29,7 +29,20 @@ const EXAMPLES =
   "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-onnx/resolve/main/demo/";
 
 const SR = 16000, N_MEL = 80, N_FRAMES = 3000;
-const WINDOW_S = 300;     // 5-min window (multi-chunk); matches the ORT demo default
+// iOS WebKit refuses the desktop build's 4 GB shared-memory reservation and
+// caps tab memory ~1.5 GB, so iOS gets a small-max WASM variant + short windows
+// (cross-window CAM++ linking keeps speaker IDs consistent regardless).
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const WASM_VARIANT = IS_IOS ? "ios" : "mt";
+// Window size: user-selectable 90/180/300 s (default 180, like the ORT demo —
+// 300 s peaks ~3 GB in-WASM and can fail on long meetings). iOS is memory-capped
+// so it always uses a single 28 s chunk; cross-window CAM++ linking keeps
+// speaker IDs consistent regardless of window size.
+function currentWindowS() {
+  if (IS_IOS) return 28;
+  return +(document.querySelector('input[name="win"]:checked')?.value || 180);
+}
 const MIC_MAX_S = 120;
 const WASM_BASE = "rapidspeech-wasm-mt";
 
@@ -282,7 +295,7 @@ function ensureModel() {
     setModelState("loading", "Loading WASM runtime…");
     $("dl-bars").innerHTML =
       `<div>Q4_K GGUF<progress id="pg-model" max="100" value="0"></progress></div>`;
-    worker = new Worker("./moss-worker.js");
+    worker = new Worker(`./moss-worker.js?wasm=${WASM_VARIANT}`);
     worker.onerror = () => {
       setModelState("", "Worker failed to start."); modelPromise = null;
       reject(new Error("worker error"));
@@ -486,6 +499,7 @@ async function transcribe(wav) {
   aborted = false;
   $("btn-abort").style.display = "";
   const secs = wav.length / SR;
+  const WINDOW_S = currentWindowS();   // snapshot the selector for this run
   const nWin = Math.max(1, Math.ceil(secs / WINDOW_S));
   const t0 = Date.now();
   hbStart();
@@ -864,6 +878,9 @@ function markReload() { try { sessionStorage.setItem("coiReloads", "1"); } catch
 async function init() {
   // Mel is computed in the worker (C++ WhisperMelExtractor), so nothing to
   // preload on the main thread.
+  if (IS_IOS) {
+    const wr = $("win-row"); if (wr) wr.style.display = "none"; // fixed 28 s on iOS
+  }
   $("input-note").textContent = "CPU · multi-threaded WASM · live token streaming";
   $("btn-load").disabled = false;
   setControlsEnabled(true);

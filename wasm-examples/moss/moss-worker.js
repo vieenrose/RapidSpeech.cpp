@@ -17,7 +17,13 @@
  * onmessage. We must NOT run our own init/onmessage in that role, or we clobber
  * the handshake and the pool never comes up (it recursively re-spawns instead).
  */
-importScripts("./rapidspeech-wasm-mt.js");
+// Runtime variant: "mt" (desktop, 4 GB max) or "ios" (1.5 GB max — iOS WebKit
+// refuses large shared-memory reservations). Passed by the page as
+// moss-worker.js?wasm=ios; pthread re-spawns reuse the same URL, so every
+// pthread worker loads the same variant.
+const WASM_VARIANT =
+  new URLSearchParams(self.location.search).get("wasm") === "ios" ? "ios" : "mt";
+importScripts(`./rapidspeech-wasm-${WASM_VARIANT}.js`);
 
 if (globalThis.name !== "em-pthread") {
   // ── main worker role ────────────────────────────────────────────────────
@@ -28,8 +34,14 @@ if (globalThis.name !== "em-pthread") {
   // raw [start(-end)][Sxx]text parser (embedding boundaries; s2tw/ITN done on page)
   const SEG_RE = /\[(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\](?:\[(S\d+)\])?([^\[]*)/g;
 
-  // Stream a GGUF from a URL into MEMFS at `path`, reporting progress with `tag`.
-  async function fetchToFS(url, path, tag) {
+  // Stream a GGUF from a URL and expose it to the module's FS, reporting
+  // progress with `tag`. Preferred path: mount the bytes as a Blob via WORKERFS
+  // — the Blob lives OUTSIDE the WASM heap (the browser may even disk-back it)
+  // and ggml reads it lazily, avoiding a ~700 MB in-heap MEMFS copy. Critical
+  // on iOS, where heap + copy + weight buffers would exceed the memory cap.
+  // Returns the FS path to pass to the model init.
+  let wfsCount = 0;
+  async function fetchToFS(url, name, tag) {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(tag + " fetch " + resp.status);
     const total = +resp.headers.get("content-length") || 0;
@@ -41,9 +53,20 @@ if (globalThis.name !== "em-pthread") {
       chunks.push(value); got += value.length;
       postMessage({ type: "dl", tag, got, total });
     }
+    const WORKERFS = Module.FS.filesystems && Module.FS.filesystems.WORKERFS;
+    if (WORKERFS) {
+      const dir = `/wfs${wfsCount++}`;
+      Module.FS.mkdir(dir);
+      Module.FS.mount(WORKERFS, { blobs: [{ name, data: new Blob(chunks) }] }, dir);
+      chunks.length = 0;
+      return `${dir}/${name}`;
+    }
+    // Fallback: MEMFS copy (in-heap).
     const buf = new Uint8Array(got);
     let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
-    Module.FS.writeFile(path, buf);
+    chunks.length = 0;
+    Module.FS.writeFile(`/${name}`, buf);
+    return `/${name}`;
   }
 
   // Embed one PCM slice -> Array(spkDim) L2-normalized, or null if too short/failed.
@@ -67,14 +90,15 @@ if (globalThis.name !== "em-pthread") {
     try {
       if (msg.type === "init") {
         Module = await globalThis.RapidSpeechModule({
-          locateFile: (p) => (p.endsWith(".wasm") ? "./rapidspeech-wasm-mt.wasm" : p),
+          locateFile: (p) =>
+            (p.endsWith(".wasm") ? `./rapidspeech-wasm-${WASM_VARIANT}.wasm` : p),
         });
         // 1. MOSS transcription model (~700 MB).
-        await fetchToFS(msg.ggufUrl, "/model.gguf", "asr");
+        const modelPath = await fetchToFS(msg.ggufUrl, "model.gguf", "asr");
         postMessage({ type: "status", text: "Loading transcription model…" });
         const init = Module.cwrap("rs_wasm_init_ex", "number",
                                   ["string", "number", "number"]);
-        let rc = init("/model.gguf", 0, N_THREADS);
+        let rc = init(modelPath, 0, N_THREADS);
         if (rc instanceof Promise) rc = await rc;
         if (rc !== 0) throw new Error("model init returned " + rc);
         transcribePcm = Module.cwrap("rs_wasm_moss_transcribe_pcm", "string",
@@ -83,10 +107,10 @@ if (globalThis.name !== "em-pthread") {
         // 2. CAM++ speaker-embedding model (~14 MB) for cross-window diarization.
         if (msg.spkUrl) {
           try {
-            await fetchToFS(msg.spkUrl, "/spk.gguf", "spk");
+            const spkPath = await fetchToFS(msg.spkUrl, "spk.gguf", "spk");
             postMessage({ type: "status", text: "Loading speaker model…" });
             const sInit = Module.cwrap("rs_wasm_speaker_init", "number", ["string", "number"]);
-            let src = sInit("/spk.gguf", N_THREADS);
+            let src = sInit(spkPath, N_THREADS);
             if (src instanceof Promise) src = await src;
             if (src === 0) {
               speakerEmbed = Module.cwrap("rs_wasm_speaker_embed", "number",
