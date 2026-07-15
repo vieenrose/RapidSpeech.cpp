@@ -1,11 +1,49 @@
 diff --git a/src/ggml-webgpu/ggml-webgpu.cpp b/src/ggml-webgpu/ggml-webgpu.cpp
-index 401c75c1..65a220c4 100644
+index 401c75c1..6148c412 100644
 --- a/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/src/ggml-webgpu/ggml-webgpu.cpp
-@@ -3732,6 +3732,17 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
+@@ -181,6 +181,11 @@ struct webgpu_capabilities {
+     wgpu::Limits limits;
+     bool         supports_subgroups       = false;
+     bool         supports_subgroup_matrix = false;
++    // Use the legacy (f32-accumulating) mul_mat pipeline: the fast tiled
++    // shaders stage tiles in f16 shared memory, which miscomputes on Intel
++    // xe-lpg/ANV (bisected on-device; same signature as the Vulkan backend's
++    // known Intel f16 issues). Defaults on for Intel adapters.
++    bool         prefer_legacy_mulmat     = false;
+ 
+     uint32_t sg_mat_m = 0;
+     uint32_t sg_mat_n = 0;
+@@ -1431,6 +1436,10 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
+             break;
+     }
+ 
++    if (ctx->global_ctx->capabilities.prefer_legacy_mulmat) {
++        use_fast = false;
++    }
++
+     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+ 
+     shader_lib_ctx.src0                     = src0;
+@@ -3732,6 +3741,32 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
  #endif
      ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix = valid_subgroup_matrix_config;
  
++    {
++        std::string vendor = std::string(info.vendor);
++        for (auto & c : vendor) c = tolower(c);
++        if (vendor.find("intel") != std::string::npos) {
++            GGML_LOG_INFO("ggml_webgpu: Intel adapter — using legacy (f32-acc) mul_mat shaders\n");
++            ctx->webgpu_global_ctx->capabilities.prefer_legacy_mulmat = true;
++        }
++    }
++    if (getenv("GGML_WEBGPU_LEGACY_MULMAT")) {
++        ctx->webgpu_global_ctx->capabilities.prefer_legacy_mulmat = true;
++    }
++    if (getenv("GGML_WEBGPU_FAST_MULMAT")) {   // override the Intel default
++        ctx->webgpu_global_ctx->capabilities.prefer_legacy_mulmat = false;
++    }
++
 +    // Runtime kill switches for bisecting driver-specific miscompute (e.g.
 +    // subgroup reductions on some Vulkan drivers): force the portable
 +    // non-subgroup shader variants.
@@ -20,7 +58,7 @@ index 401c75c1..65a220c4 100644
      // Runtime subgroup size can be any supported size in this range. Shaders
      // that allocate per-lane register arrays must size them for the minimum.
      ctx->webgpu_global_ctx->capabilities.min_subgroup_size = info.subgroupMinSize;
-@@ -3938,6 +3949,25 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
+@@ -3938,6 +3973,25 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
  static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
  
