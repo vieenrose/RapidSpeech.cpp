@@ -449,6 +449,7 @@ function scheduleTailRender() {
 function mapWindowSegs(m, base) {
   return (m.segs || []).map((s) => ({
     start: base + s.start,
+    end: s.end != null ? base + s.end : null,
     rawEnd: s.rawEnd != null ? base + s.rawEnd : null,
     spk: s.spk || "",
     text: s2tw(s.text),          // s2tw() also applies number ITN
@@ -613,7 +614,30 @@ async function transcribe(source) {
   aborted = false;
   $("btn-abort").style.display = "";
   const WINDOW_S = currentWindowS();   // snapshot the selector for this run
-  let nWin = Math.max(1, Math.ceil(source.durS / WINDOW_S));
+  // Window boundaries are PAUSE-SNAPPED: each window is trimmed at the
+  // quietest 400 ms in its last 12 s, and the next window starts exactly
+  // there. Windows stay disjoint (no duplicated seam text, no filter) and —
+  // critically — every window OPENS at a natural pause: a window that starts
+  // mid-sentence can flip the q4 decode into a degenerate mode (observed:
+  // 148 s window opening mid-word emitted one 3 s fragment).
+  const SNAP_S = WINDOW_S >= 90 ? 12 : 5;
+  let nWin = Math.max(1, Math.ceil(source.durS / (WINDOW_S - SNAP_S / 2)));
+
+  // Seconds from piece start at which to cut: centre of the quietest 400 ms
+  // in the final SNAP_S seconds (RMS scan at 100 ms hops).
+  function pauseCut(piece) {
+    const n = piece.length;
+    if (n < WINDOW_S * SR) return n / SR;          // final window: keep all
+    const from = Math.max(0, n - SNAP_S * SR);
+    const win = Math.round(0.4 * SR), hop = Math.round(0.1 * SR);
+    let best = n - win, bestE = Infinity;
+    for (let o = from; o + win <= n; o += hop) {
+      let e = 0;
+      for (let i = o; i < o + win; i++) e += piece[i] * piece[i];
+      if (e < bestE) { bestE = e; best = o; }
+    }
+    return (best + win / 2) / SR;
+  }
   const t0 = Date.now();
   hbStart();
   $("bar").style.display = "";
@@ -643,18 +667,42 @@ async function transcribe(source) {
 
   // Unbounded: nWin is an estimate for compressed audio; we stop when the
   // source runs dry (short/empty window).
+  let cursorS = 0;                       // pause-snapped: windows are disjoint
   for (let w = 0; ; w++) {
     if (aborted) break;
     beat(`decoding window ${w + 1}`);
     let piece;
     try {
-      piece = await source.getWindow(w * WINDOW_S * SR, WINDOW_S * SR);
+      piece = await source.getWindow(Math.round(cursorS * SR), WINDOW_S * SR);
     } catch (e) {
       $("status").textContent = "Audio decode failed: " + e.message;
       break;
     }
+    if (piece.length / SR < 0.3) break;
+    const isLastWin = piece.length / SR < WINDOW_S - 0.5;   // source ran short
+    const winStartS = cursorS;
+    const cut = pauseCut(piece);
+    piece = piece.subarray(0, Math.round(cut * SR));
+    cursorS = winStartS + cut;
     const durS = piece.length / SR;
     if (durS < 0.3) break;
+
+    // Silence gate: a window with no meaningful energy (recess, dead air at
+    // the end of a recording) costs minutes of decode and tends to make the
+    // model hallucinate. -54 dBFS RMS is far below any real speech, incl.
+    // quiet off-mic chatter.
+    {
+      let sum = 0;
+      for (let i = 0; i < piece.length; i++) sum += piece[i] * piece[i];
+      const rms = Math.sqrt(sum / Math.max(1, piece.length));
+      if (rms < 0.002) {
+        processedS = cursorS;
+        $("status").textContent =
+          `Window ${w + 1}/${nWin} · skipped (silence)`;
+        if (isLastWin) break;
+        continue;
+      }
+    }
     nWin = Math.max(nWin, w + 1);          // durS was an estimate for mp3 etc.
     beat(`window ${w + 1}/${nWin}`);
     phaseWin = `Window ${w + 1}/${nWin} · `;
@@ -664,13 +712,13 @@ async function transcribe(source) {
 
     let winSegs;
     try {
-      winSegs = await transcribeWindow(piece, w * WINDOW_S, durS);
+      winSegs = await transcribeWindow(piece, winStartS, durS);
     } catch (e) {
       $("status").textContent = "Inference failed: " + e.message;
       finish();
       return;
     }
-    processedS = w * WINDOW_S + durS;
+    processedS = cursorS;
     for (const s of winSegs) diarSegs.push(s);
     normalizeSegs(diarSegs);                 // fill end + window-local speaker
     // Re-link speakers globally across all windows so far (CAM++ AHC), or fall

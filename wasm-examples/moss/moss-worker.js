@@ -257,7 +257,7 @@ if (globalThis.name !== "em-pthread") {
           const end = s.rawEnd != null && s.rawEnd > s.start ? s.rawEnd
                     : (i + 1 < raw.length ? raw[i + 1].start : Math.min(durS, s.start + 3));
           return {
-            start: s.start, rawEnd: s.rawEnd, spk: s.spk, text: s.text,
+            start: s.start, end, rawEnd: s.rawEnd, spk: s.spk, text: s.text,
             emb: embedSlice(pcm, s.start * SR, end * SR),
           };
         });
