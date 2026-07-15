@@ -473,16 +473,38 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
     char k_name[64], v_name[64];
     snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
     snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
-    ggml_set_name(k_3d, k_name);
-    ggml_set_name(v_3d, v_name);
 
-    // Mark the 3D contiguous tensors as output for host-side extraction
-    ggml_set_output(k_3d);
-    ggml_set_output(v_3d);
-    tmp_kv_outputs_k_.push_back(k_3d);
-    tmp_kv_outputs_v_.push_back(v_3d);
+    ggml_tensor *k_out = k_3d;
+    ggml_tensor *v_out = v_3d;
+    if (current_opts_.kv_outputs_q8) {
+      // Pin q8_0 casts as the extraction outputs instead of the f32 tensors.
+      // The f32 k_3d/v_3d still feed attention but become reclaimable by
+      // gallocr, so a long-prompt prefill pins ~34/128 of the KV bytes.
+      // head_dim (ne[0]) is a multiple of QK8_0=32 and Q8_0 blocks are
+      // independent per 32 elems, so the [head_dim, n_head_kv, T] cast is
+      // byte-identical to quantizing rows of kv_dim = head_dim*n_head_kv.
+      k_out = ggml_cast(ctx, k_3d, GGML_TYPE_Q8_0);
+      v_out = ggml_cast(ctx, v_3d, GGML_TYPE_Q8_0);
+      // ORDERING IS THE POINT: expand the casts into the graph NOW, so they
+      // execute right after this layer and the f32 K/V become reusable by
+      // gallocr. Expanding them only at the end of the build (the kv-output
+      // transfer loop) would keep every layer's f32 K/V alive until the tail
+      // of the graph — pinning ~845 MB at ~3.8k ctx and defeating the cast.
+      if (gf_) {
+        ggml_build_forward_expand(gf_, k_out);
+        ggml_build_forward_expand(gf_, v_out);
+      }
+    }
+    ggml_set_name(k_out, k_name);
+    ggml_set_name(v_out, v_name);
 
-    // Return 3D tensors for attention computation
+    // Mark the extraction outputs for host-side readout
+    ggml_set_output(k_out);
+    ggml_set_output(v_out);
+    tmp_kv_outputs_k_.push_back(k_out);
+    tmp_kv_outputs_v_.push_back(v_out);
+
+    // Return 3D f32 tensors for attention computation
     return {k_3d, v_3d};
   }
 
@@ -558,12 +580,30 @@ llm_graph_builder::build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
         char k_name[64], v_name[64];
         snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
         snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
-        ggml_set_name(k_cont_2d, k_name);
-        ggml_set_name(v_cont_2d, v_name);
-        ggml_set_output(k_cont_2d);
-        ggml_set_output(v_cont_2d);
-        tmp_kv_outputs_k_.push_back(k_cont_2d);
-        tmp_kv_outputs_v_.push_back(v_cont_2d);
+        if (current_opts_.kv_outputs_new_col_only) {
+          // Pin ONLY the new column(s) [kv_dim, n_tokens] (~4 KB) instead of
+          // the full concat: the full-width pinned outputs would hold
+          // ~2*n_layer*kv_dim*n_kv_max f32 (~940 MB at ~4k ctx) in the decode
+          // graph buffer for the whole decode. The full concat k_cont_2d stays
+          // transient (gallocr reclaims it after attention). Readers fetch the
+          // column at offset 0. (These tiny conts have no graph consumer — the
+          // builder expands all kv outputs into the graph explicitly.)
+          ggml_tensor *k_new_out = ggml_cont(ctx, k_cur_2d);
+          ggml_tensor *v_new_out = ggml_cont(ctx, v_cur_2d);
+          ggml_set_name(k_new_out, k_name);
+          ggml_set_name(v_new_out, v_name);
+          ggml_set_output(k_new_out);
+          ggml_set_output(v_new_out);
+          tmp_kv_outputs_k_.push_back(k_new_out);
+          tmp_kv_outputs_v_.push_back(v_new_out);
+        } else {
+          ggml_set_name(k_cont_2d, k_name);
+          ggml_set_name(v_cont_2d, v_name);
+          ggml_set_output(k_cont_2d);
+          ggml_set_output(v_cont_2d);
+          tmp_kv_outputs_k_.push_back(k_cont_2d);
+          tmp_kv_outputs_v_.push_back(v_cont_2d);
+        }
       }
 
       return {k_final, v_final};

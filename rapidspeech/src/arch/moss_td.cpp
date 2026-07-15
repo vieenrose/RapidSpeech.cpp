@@ -588,6 +588,13 @@ bool MossTDModel::Encode(const std::vector<float> &input_frames,
     double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - _te).count();
     fprintf(stderr, "[prof] encoder(conv+24L transformer+adaptor): %.1f ms\n", ms);
+    int nb = ggml_backend_sched_get_n_backends(sched);
+    for (int bi = 0; bi < nb; ++bi) {
+      ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+      fprintf(stderr, "[prof] post-encoder sched buffer[%d] (%s): %.1f MB\n", bi,
+              ggml_backend_name(b),
+              ggml_backend_sched_get_buffer_size(sched, b) / 1048576.0);
+    }
   }
   return ok;
 }
@@ -755,11 +762,19 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   ggml_set_input(llm_input);
   ggml_set_name(llm_input, "llm_input");
 
+  // RS_KV_Q8: q8_0 persistent KV cache + q8_0-pinned prefill KV outputs.
+  // Checked once here; used by the prefill opts, the snapshot, and the upload.
+  const bool use_q8_kv = getenv("RS_KV_Q8") != nullptr;
+
   llm_build_opts opts;
   opts.output_mode    = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
   opts.use_kv_cache    = true;
   opts.causal_mask     = true;
+  // Pin the prefill's per-layer KV outputs as q8_0 casts: the f32 K/V become
+  // reclaimable by gallocr instead of ~885 MB pinned f32 at ~3.8k ctx. The
+  // snapshot below reads the q8 bytes directly.
+  opts.kv_outputs_q8   = use_q8_kv;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
       llm_input, total_T, nullptr, positions.data(), &opts);
@@ -788,6 +803,11 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     RS_LOG_ERR("Qwen3ASR: LLM prefill compute failed");
     ggml_free(ctx_llm);
     return false;
+  }
+  if (std::getenv("RS_PROFILE")) {
+    ggml_backend_t b0 = ggml_backend_sched_get_backend(sched, 0);
+    fprintf(stderr, "[prof] post-prefill-compute sched buffer: %.1f MB\n",
+            ggml_backend_sched_get_buffer_size(sched, b0) / 1048576.0);
   }
 
   ggml_tensor *logits = result->get_logits();
@@ -835,21 +855,53 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const int n_head_kv = lp.n_head_kv > 0 ? lp.n_head_kv : lp.n_head;
   const int head_dim = lp.head_dim;
   const int kv_dim = head_dim * n_head_kv;
+  n_cached_tokens_ = total_T;
+  // RS_KV_Q8: quantize each layer's K/V to q8_0 AT EXTRACTION, into a compact
+  // q8 host mirror (~34/128 the size), using a single reusable one-layer f32
+  // staging buffer. This avoids materializing the all-layer f32 mirror
+  // (~885 MB for a 280 s window) between the prefill graph teardown and the
+  // persistent-KV upload. The default f32 path is byte-identical to before.
+  const size_t q8_row = ggml_row_size(GGML_TYPE_Q8_0, kv_dim);
+  std::vector<std::vector<uint8_t>> host_q8_k, host_q8_v;
   host_kv_cache_k_.assign(n_layer, {});
   host_kv_cache_v_.assign(n_layer, {});
-  n_cached_tokens_ = total_T;
-  for (int il = 0; il < n_layer; ++il) {
-    ggml_tensor *k_out = result->get_kv_output_k(il);
-    ggml_tensor *v_out = result->get_kv_output_v(il);
-    if (!k_out || !v_out) {
-      RS_LOG_ERR("Qwen3ASR: prefill KV missing for layer %d", il);
-      continue;
+  {
+    std::vector<float> stage;   // one layer's f32 K or V, reused across layers
+    if (use_q8_kv) {
+      host_q8_k.assign(n_layer, {});
+      host_q8_v.assign(n_layer, {});
+      stage.resize((size_t)kv_dim * n_cached_tokens_);
     }
-    size_t kv_bytes = ggml_nbytes(k_out);
-    host_kv_cache_k_[il].resize(kv_bytes / sizeof(float));
-    host_kv_cache_v_[il].resize(kv_bytes / sizeof(float));
-    ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
-    ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
+    for (int il = 0; il < n_layer; ++il) {
+      ggml_tensor *k_out = result->get_kv_output_k(il);
+      ggml_tensor *v_out = result->get_kv_output_v(il);
+      if (!k_out || !v_out) {
+        RS_LOG_ERR("Qwen3ASR: prefill KV missing for layer %d", il);
+        continue;
+      }
+      size_t kv_bytes = ggml_nbytes(k_out);
+      if (use_q8_kv) {
+        host_q8_k[il].resize(q8_row * (size_t)n_cached_tokens_);
+        host_q8_v[il].resize(q8_row * (size_t)n_cached_tokens_);
+        if (k_out->type == GGML_TYPE_Q8_0) {
+          // kv_outputs_q8 graphs pin q8_0 casts: raw q8 byte readout.
+          ggml_backend_tensor_get(k_out, host_q8_k[il].data(), 0, kv_bytes);
+          ggml_backend_tensor_get(v_out, host_q8_v[il].data(), 0, kv_bytes);
+        } else {
+          ggml_backend_tensor_get(k_out, stage.data(), 0, kv_bytes);
+          ggml_quantize_chunk(GGML_TYPE_Q8_0, stage.data(), host_q8_k[il].data(),
+                              0, n_cached_tokens_, kv_dim, nullptr);
+          ggml_backend_tensor_get(v_out, stage.data(), 0, kv_bytes);
+          ggml_quantize_chunk(GGML_TYPE_Q8_0, stage.data(), host_q8_v[il].data(),
+                              0, n_cached_tokens_, kv_dim, nullptr);
+        }
+      } else {
+        host_kv_cache_k_[il].resize(kv_bytes / sizeof(float));
+        host_kv_cache_v_[il].resize(kv_bytes / sizeof(float));
+        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
+        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
+      }
+    }
   }
 
   ggml_free(ctx_llm);
@@ -861,7 +913,6 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // near-lossless for attention. kv_dim (=head_dim*n_head_kv=128*8=1024) is a
   // multiple of QK8_0=32, so q8_0 row quantization is exact-shape. Other archs
   // (qwen3_asr, funasr-nano) don't run this code path and are unaffected.
-  const bool use_q8_kv = getenv("RS_KV_Q8") != nullptr;
   const ggml_type kv_type = use_q8_kv ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
   if (use_q8_kv) {
     RS_LOG_INFO("MossTD: RS_KV_Q8 set — persistent KV cache stored as q8_0");
@@ -893,26 +944,19 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     if (!kv_gpu_buf) {
       RS_LOG_ERR("Qwen3ASR: failed to allocate GPU KV buffers");
     }
-    // Upload the prefill KV (n_cached_tokens_ columns) from the f32 host mirror.
-    // For q8_0, ggml_backend_tensor_set does a raw byte copy and will NOT
-    // quantize, so quantize the whole prefill block f32->q8_0 first, then set
-    // the q8_0 bytes (row_size(q8_0,kv_dim) per column). For f32 this is the
-    // original raw copy.
-    std::vector<uint8_t> q8_tmp;
-    if (use_q8_kv) {
-      q8_tmp.resize(ggml_row_size(GGML_TYPE_Q8_0, kv_dim) *
-                    (size_t)n_cached_tokens_);
-    }
+    // Upload the prefill KV (n_cached_tokens_ columns). Under RS_KV_Q8 the
+    // per-layer snapshot already produced q8_0 bytes (host_q8_k/v) — raw-copy
+    // them and free each layer as it lands. For f32 this is the original raw
+    // copy from the f32 host mirror (kept resident; default path unchanged).
     for (int il = 0; il < n_layer; ++il) {
       if (use_q8_kv) {
-        const size_t qbytes = ggml_quantize_chunk(
-            GGML_TYPE_Q8_0, host_kv_cache_k_[il].data(), q8_tmp.data(),
-            /*start=*/0, /*nrows=*/n_cached_tokens_, /*n_per_row=*/kv_dim,
-            /*imatrix=*/nullptr);
-        ggml_backend_tensor_set(gpu_kv_k_vec[il], q8_tmp.data(), 0, qbytes);
-        ggml_quantize_chunk(GGML_TYPE_Q8_0, host_kv_cache_v_[il].data(),
-                            q8_tmp.data(), 0, n_cached_tokens_, kv_dim, nullptr);
-        ggml_backend_tensor_set(gpu_kv_v_vec[il], q8_tmp.data(), 0, qbytes);
+        const size_t qbytes = q8_row * (size_t)n_cached_tokens_;
+        if (host_q8_k[il].size() == qbytes) {
+          ggml_backend_tensor_set(gpu_kv_k_vec[il], host_q8_k[il].data(), 0, qbytes);
+          ggml_backend_tensor_set(gpu_kv_v_vec[il], host_q8_v[il].data(), 0, qbytes);
+        }
+        std::vector<uint8_t>().swap(host_q8_k[il]);
+        std::vector<uint8_t>().swap(host_q8_v[il]);
       } else {
         size_t bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
         ggml_backend_tensor_set(gpu_kv_k_vec[il],
@@ -920,18 +964,6 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         ggml_backend_tensor_set(gpu_kv_v_vec[il],
                                 host_kv_cache_v_[il].data(), 0, bytes);
       }
-    }
-    // The f32 host mirror (~883MB for a 280s window) is not read again during
-    // decode — the new column is staged from the decode graph's GPU output,
-    // not from this mirror. Under RS_KV_Q8, free it now to reclaim the memory.
-    // (Left intact in the default path so default behavior is unchanged.)
-    if (use_q8_kv) {
-      for (int il = 0; il < n_layer; ++il) {
-        std::vector<float>().swap(host_kv_cache_k_[il]);
-        std::vector<float>().swap(host_kv_cache_v_[il]);
-      }
-      std::vector<std::vector<float>>().swap(host_kv_cache_k_);
-      std::vector<std::vector<float>>().swap(host_kv_cache_v_);
     }
   }
   {
@@ -945,6 +977,10 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     warmup_opts.causal_mask     = true;
     warmup_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     warmup_opts.gpu_kv_v        = gpu_kv_v_vec.data();
+    // Pin only the new K/V column as extraction output (see llm_build_opts):
+    // the warmup graph shapes the gallocr reserve for the decode loop, so it
+    // must match the decode graphs below.
+    warmup_opts.kv_outputs_new_col_only = true;
     llm_pos warmup_pos = (llm_pos)(n_kv_max - 1 + 2);
     int32_t dummy = 0;
     auto warmup = llm_graph_builder_->build_graph(
@@ -968,6 +1004,17 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
                     std::chrono::steady_clock::now() - _tprefill).count();
     fprintf(stderr, "[prof] decoder prefill (%d ctx tokens, 28L): %.1f ms\n",
             total_T, ms);
+    // Memory attribution: per-backend sched compute-buffer reserve + KV buffer.
+    int nb = ggml_backend_sched_get_n_backends(sched);
+    for (int bi = 0; bi < nb; ++bi) {
+      ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+      fprintf(stderr, "[prof] sched buffer[%d] (%s): %.1f MB\n", bi,
+              ggml_backend_name(b),
+              ggml_backend_sched_get_buffer_size(sched, b) / 1048576.0);
+    }
+    if (kv_gpu_buf)
+      fprintf(stderr, "[prof] persistent KV buffer: %.1f MB\n",
+              ggml_backend_buffer_get_size(kv_gpu_buf) / 1048576.0);
   }
   // Duration/repeat stop: the decoder must not transcribe past the real audio,
   // and must not RESTART the transcript from the top (a WASM-numerics EOS-boundary
@@ -990,6 +1037,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     dec_opts.causal_mask     = true;
     dec_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v        = gpu_kv_v_vec.data();
+    // Pin only the new K/V column (~4 KB/layer) instead of the full concat
+    // (~34 MB/layer at ~4k ctx) as the extraction output.
+    dec_opts.kv_outputs_new_col_only = true;
 
     auto dec = llm_graph_builder_->build_graph(&best_token, 1, nullptr,
                                               &decode_pos, &dec_opts);
@@ -1078,8 +1128,12 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       ggml_tensor *k_out = dec->get_kv_output_k(il);
       ggml_tensor *v_out = dec->get_kv_output_v(il);
       if (!k_out || !v_out) continue;
-      ggml_backend_tensor_get(k_out, kv_stage_k.data(), off_f32, new_bytes_f32);
-      ggml_backend_tensor_get(v_out, kv_stage_v.data(), off_f32, new_bytes_f32);
+      // kv_outputs_new_col_only: the output IS the new column [kv_dim, 1] —
+      // read at offset 0. (Legacy full-concat outputs: read at the column's
+      // offset.) Detect by width so both contracts stay correct.
+      const size_t k_off = (k_out->ne[1] == 1) ? 0 : off_f32;
+      ggml_backend_tensor_get(k_out, kv_stage_k.data(), k_off, new_bytes_f32);
+      ggml_backend_tensor_get(v_out, kv_stage_v.data(), k_off, new_bytes_f32);
       if (use_q8_kv) {
         ggml_quantize_chunk(GGML_TYPE_Q8_0, kv_stage_k.data(), q8_col.data(),
                             0, 1, kv_dim, nullptr);

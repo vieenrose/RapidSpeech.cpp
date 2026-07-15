@@ -156,7 +156,9 @@ if (globalThis.name !== "em-pthread") {
           };
         });
         postMessage({ type: "window", text, base: msg.base, durS,
-                      wi: msg.wi, nw: msg.nw, segs });
+                      wi: msg.wi, nw: msg.nw, segs,
+                      // WASM heap high-water (grows monotonically) — memory telemetry
+                      heapMB: (Module.HEAP8.length / 1048576) | 0 });
         return;
       }
     } catch (err) {

@@ -321,6 +321,7 @@ function ensureModel() {
         tokenCount++;                        // one decoder token per stream event
         scheduleTailRender();
       } else if (m.type === "window") {
+        if (m.heapMB) console.log(`[mem] wasm heap high-water: ${m.heapMB} MB`);
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(m); }
       } else if (m.type === "error") {
         setModelState("", "Error: " + m.error);
@@ -494,18 +495,23 @@ function hbStart() {
 function hbStop() { clearInterval(hbTimer); $("heartbeat").style.display = "none"; }
 
 /* ============================ live transcription ========================= */
-async function transcribe(wav) {
+async function transcribe(source) {
   // Caller already acquireBusy()'d synchronously; this owns releasing it.
+  // `source` is a window source ({durS, getWindow, close}) — audio is decoded
+  // PER WINDOW on demand, so an hour-long file never sits fully decoded in
+  // memory (~460 MB/2 h saved). durS may be an estimate for compressed audio.
   aborted = false;
   $("btn-abort").style.display = "";
-  const secs = wav.length / SR;
   const WINDOW_S = currentWindowS();   // snapshot the selector for this run
-  const nWin = Math.max(1, Math.ceil(secs / WINDOW_S));
+  let nWin = Math.max(1, Math.ceil(source.durS / WINDOW_S));
   const t0 = Date.now();
   hbStart();
   $("bar").style.display = "";
 
-  const finish = () => { hbStop(); $("btn-abort").style.display = "none"; releaseBusy(); };
+  const finish = () => {
+    hbStop(); $("btn-abort").style.display = "none"; releaseBusy();
+    try { source.close(); } catch {}
+  };
 
   try {
     beat("loading model");
@@ -520,15 +526,25 @@ async function transcribe(wav) {
   segs = [];
   diarSegs = [];
   tokenCount = 0;
+  let processedS = 0;
   $("status").textContent =
-    `${fmt(secs)} of audio → ${nWin} × ${WINDOW_S}s window(s)`;
+    `${fmt(source.durS)} of audio → ~${nWin} × ${WINDOW_S}s window(s)`;
 
-  for (let w = 0; w < nWin; w++) {
+  // Unbounded: nWin is an estimate for compressed audio; we stop when the
+  // source runs dry (short/empty window).
+  for (let w = 0; ; w++) {
     if (aborted) break;
-    const s0 = w * WINDOW_S * SR;
-    const piece = wav.subarray(s0, Math.min(wav.length, s0 + WINDOW_S * SR));
+    beat(`decoding window ${w + 1}`);
+    let piece;
+    try {
+      piece = await source.getWindow(w * WINDOW_S * SR, WINDOW_S * SR);
+    } catch (e) {
+      $("status").textContent = "Audio decode failed: " + e.message;
+      break;
+    }
     const durS = piece.length / SR;
     if (durS < 0.3) break;
+    nWin = Math.max(nWin, w + 1);          // durS was an estimate for mp3 etc.
     beat(`window ${w + 1}/${nWin}`);
     $("status").textContent = `Window ${w + 1}/${nWin} · transcribing…`;
     await yieldToLoop(); // paint the previous window + let an abort click land
@@ -541,6 +557,7 @@ async function transcribe(wav) {
       finish();
       return;
     }
+    processedS = w * WINDOW_S + durS;
     for (const s of winSegs) diarSegs.push(s);
     normalizeSegs(diarSegs);                 // fill end + window-local speaker
     // Re-link speakers globally across all windows so far (CAM++ AHC), or fall
@@ -566,9 +583,9 @@ async function transcribe(wav) {
   renderTranscript();
   $("status").textContent = aborted ? "Stopped — partial result kept." : "Done · all local.";
   $("stats").textContent =
-    `${fmt(secs)} audio · ${segs.length} segments · ` +
+    `${fmt(processedS)} audio · ${segs.length} segments · ` +
     `${new Set(segs.map((s) => s.speaker)).size} speakers · ` +
-    `${fmt(el)} compute (${(secs / el).toFixed(2)}× realtime` +
+    `${fmt(el)} compute (${(processedS / el).toFixed(2)}× realtime` +
     (tokenCount ? `, ${(tokenCount / el).toFixed(1)} tok/s` : "") + `)`;
   if (segs.length) offerDownloads(segs);
   finish();
@@ -594,8 +611,7 @@ document.querySelectorAll("[data-ex]").forEach((btn) => {
       $("player-box").style.display = "";
       const blob = await (await fetch(url)).blob();
       const file = new File([blob], `${stem}.mp3`, { type: blob.type || "audio/mpeg" });
-      const wav = await blobTo16k(file, 0, (msg) => { $("status").textContent = msg; });
-      await transcribe(wav);
+      await transcribe(await makeAudioSource(file, (msg) => { $("status").textContent = msg; }));
     } catch (err) {
       $("status").textContent = "無法載入範例：" + err.message;
       releaseBusy();
@@ -788,6 +804,100 @@ async function blobTo16k(blob, maxS = 0, onStatus = null) {
   return maxS > 0 ? wav.subarray(0, Math.min(wav.length, Math.ceil(maxS * SR))) : wav;
 }
 
+/* ================= on-demand window sources ==============================
+ * transcribe() pulls audio one window at a time, so long recordings never sit
+ * fully decoded in memory (2 h @16 kHz f32 ≈ 460 MB). WAV gets random access
+ * via byte slicing; MP3 gets a sequential rolling decoder; anything else falls
+ * back to a one-shot full decode. */
+
+// Trivial source over an already-decoded array (mic, fallback decode).
+function arraySource(wav) {
+  return {
+    durS: wav.length / SR,
+    async getWindow(s0, n) {
+      const a = Math.min(s0, wav.length);
+      return wav.subarray(a, Math.min(a + n, wav.length));
+    },
+    close() {},
+  };
+}
+
+// WAV: exact random access — slice the PCM byte range of the requested window,
+// prepend a synthesized header, decode + resample just that window.
+function wavWindowSource(file, header) {
+  const bytesPerFrame = header.channels * (header.bitsPerSample / 8);
+  const totalFrames = Math.floor(header.dataLen / bytesPerFrame);
+  const srcRate = header.sampleRate;
+  let ac = null;
+  return {
+    durS: totalFrames / srcRate,
+    async getWindow(s0, n) {
+      const f0 = Math.floor((s0 / SR) * srcRate);
+      if (f0 >= totalFrames) return new Float32Array(0);
+      const nf = Math.min(Math.ceil((n / SR) * srcRate), totalFrames - f0);
+      const byteStart = header.dataOff + f0 * bytesPerFrame;
+      const pcm = await file.slice(byteStart, byteStart + nf * bytesPerFrame).arrayBuffer();
+      const chunk = new Blob([wavHeaderBytes(header, pcm.byteLength), pcm], { type: "audio/wav" });
+      if (!ac) ac = new AudioContext();
+      const decoded = await ac.decodeAudioData(await chunk.arrayBuffer());
+      const out = await resampleTo16kMono(decoded);
+      return out.length > n ? out.subarray(0, n) : out;
+    },
+    close() { if (ac) { ac.close(); ac = null; } },
+  };
+}
+
+// MP3: sequential streaming — decode fixed-size byte chunks forward into a
+// small rolling buffer, dropping samples already consumed by earlier windows.
+// (Windows are requested in order by transcribe().)
+function mp3StreamSource(file, estDurS) {
+  const chunkCount = Math.ceil(file.size / MP3_CHUNK_BYTES);
+  let nextChunk = 0, bufStart = 0, eof = false;
+  let buf = new Float32Array(0);
+  let ac = null;
+  async function fillTo(endSample) {
+    while (!eof && bufStart + buf.length < endSample) {
+      if (nextChunk >= chunkCount) { eof = true; break; }
+      const part = file.slice(nextChunk * MP3_CHUNK_BYTES,
+                              Math.min((nextChunk + 1) * MP3_CHUNK_BYTES, file.size));
+      nextChunk++;
+      if (!ac) ac = new AudioContext();
+      let decoded;
+      try { decoded = await ac.decodeAudioData(await part.arrayBuffer()); }
+      catch { continue; }               // skip an undecodable boundary chunk
+      const res = await resampleTo16kMono(decoded);
+      const grown = new Float32Array(buf.length + res.length);
+      grown.set(buf); grown.set(res, buf.length);
+      buf = grown;
+    }
+  }
+  return {
+    durS: estDurS,
+    async getWindow(s0, n) {
+      if (s0 > bufStart) {              // drop consumed samples
+        const drop = Math.min(s0 - bufStart, buf.length);
+        buf = buf.slice(drop); bufStart += drop;
+      }
+      await fillTo(s0 + n);
+      const a = Math.max(0, s0 - bufStart);
+      const b = Math.min(buf.length, a + n);
+      return b > a ? buf.subarray(a, b) : new Float32Array(0);
+    },
+    close() { if (ac) { ac.close(); ac = null; } buf = new Float32Array(0); },
+  };
+}
+
+// Pick the best source for a blob.
+async function makeAudioSource(blob, onStatus) {
+  const durationS = await probeDuration(blob).catch(() => 0);
+  const isMp3 = /mpeg|mp3/i.test(blob.type) || /\.mp3$/i.test(blob.name || "");
+  const wavHeader = !isMp3 ? await parseWavHeader(blob).catch(() => null) : null;
+  if (wavHeader) return wavWindowSource(blob, wavHeader);
+  if (isMp3 && durationS > 0) return mp3StreamSource(blob, durationS);
+  // m4a/other: no reliable random access — one-shot decode (ffmpeg fallback inside).
+  return arraySource(await blobTo16k(blob, 0, onStatus));
+}
+
 /* ---- drop zone + file input -------------------------------------------- */
 const drop = $("drop");
 drop.onclick = () => { if (!drop.classList.contains("disabled")) $("file-in").click(); };
@@ -816,8 +926,7 @@ async function handleFile(f) {
   try {
     $("audio").src = URL.createObjectURL(f);
     $("player-box").style.display = "";
-    const wav = await blobTo16k(f, 0, (msg) => { $("status").textContent = msg; });
-    await transcribe(wav);
+    await transcribe(await makeAudioSource(f, (msg) => { $("status").textContent = msg; }));
   } catch (err) {
     $("status").textContent = "Could not decode this file: " + err.message;
     releaseBusy();
@@ -848,7 +957,7 @@ $("btn-rec").onclick = async () => {
         $("audio").src = URL.createObjectURL(blob);
         $("player-box").style.display = "";
         resetView("處理錄音…");
-        await transcribe(await blobTo16k(blob, MIC_MAX_S));
+        await transcribe(arraySource(await blobTo16k(blob, MIC_MAX_S)));
       } catch (err) {
         $("status").textContent = "Could not process the recording: " + err.message;
         releaseBusy();

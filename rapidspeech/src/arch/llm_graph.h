@@ -185,6 +185,22 @@ struct llm_build_opts {
   bool use_flash_attn = false; // Use flash attention (if available)
   bool offload_kqv = true;     // Offload K/Q/V to CPU
 
+  // Memory: in the GPU-persistent (O3) decode path, pin only the NEW K/V
+  // column(s) [kv_dim, n_tokens] as the per-layer extraction output instead of
+  // the full [kv_dim, n_cached+n_tokens] concat. At ~4k ctx the full-width
+  // pinned outputs cost ~940 MB across 28 layers in the decode/warmup graph
+  // buffer; the new column is ~4 KB. Readers must fetch the column at offset 0
+  // (detectable via output->ne[1] == n_tokens). MOSS-TD decode sets this;
+  // default off = bit-identical to before for every other arch.
+  bool kv_outputs_new_col_only = false;
+
+  // Memory: pin the per-layer KV extraction outputs (prefill/store path) as
+  // q8_0 casts instead of f32. The f32 K/V stay transient (gallocr reclaims
+  // them after attention), so a long-prompt prefill pins ~34/128 of the bytes
+  // (885 -> 235 MB at ~3.8k ctx). Readers must handle GGML_TYPE_Q8_0 outputs.
+  // MOSS-TD prefill sets this under RS_KV_Q8; default off = bit-identical.
+  bool kv_outputs_q8 = false;
+
   // Debug
   bool debug_dump_graph = false; // Dump graph for debugging
 };

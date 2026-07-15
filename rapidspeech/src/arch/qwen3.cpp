@@ -190,8 +190,13 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   result->set_graph(gf_);
   result->set_ctx(ctx_);
 
-  // Transfer KV output tensors to result for host-side extraction
+  // Transfer KV output tensors to result for host-side extraction.
+  // Expand them into the graph explicitly: with kv_outputs_q8 the pinned
+  // outputs are q8_0 casts with no attention consumer, so without this they
+  // would never be computed. (For the f32 outputs this is a no-op.)
   for (size_t i = 0; i < tmp_kv_outputs_k_.size(); ++i) {
+    ggml_build_forward_expand(gf_, tmp_kv_outputs_k_[i]);
+    ggml_build_forward_expand(gf_, tmp_kv_outputs_v_[i]);
     result->add_kv_output(tmp_kv_outputs_k_[i], tmp_kv_outputs_v_[i]);
   }
   result->update_params(
@@ -291,8 +296,13 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   result->set_graph(gf_);
   result->set_ctx(ctx_);
 
-  // Transfer KV output tensors to result for host-side extraction
+  // Transfer KV output tensors to result for host-side extraction.
+  // Expand them into the graph explicitly: with kv_outputs_q8 the pinned
+  // outputs are q8_0 casts with no attention consumer, so without this they
+  // would never be computed. (For the f32 outputs this is a no-op.)
   for (size_t i = 0; i < tmp_kv_outputs_k_.size(); ++i) {
+    ggml_build_forward_expand(gf_, tmp_kv_outputs_k_[i]);
+    ggml_build_forward_expand(gf_, tmp_kv_outputs_v_[i]);
     result->add_kv_output(tmp_kv_outputs_k_[i], tmp_kv_outputs_v_[i]);
   }
   result->update_params(
