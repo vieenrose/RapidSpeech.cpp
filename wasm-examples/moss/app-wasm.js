@@ -403,7 +403,13 @@ function ensureModel() {
     // ?threads=N override for hybrid-CPU tuning (e.g. Meteor Lake: try the
     // P-core count, 6-8 — often 1.5-2x faster than the 16-thread default).
     const threads = +(new URLSearchParams(location.search).get("threads") || 0);
-    worker.postMessage({ type: "init", ggufUrl: GGUF_URL, spkUrl: SPK_GGUF_URL, threads });
+    // ?env_NAME=VALUE params become engine env vars (debug/tuning knobs, e.g.
+    // ?env_GGML_WEBGPU_NO_SUBGROUPS=1 or ?env_RS_REP_PENALTY=1.0).
+    const env = {};
+    for (const [k, v] of new URLSearchParams(location.search))
+      if (k.startsWith("env_")) env[k.slice(4)] = v;
+    worker.postMessage({ type: "init", ggufUrl: GGUF_URL, spkUrl: SPK_GGUF_URL,
+                         threads, env });
   }).catch((e) => { modelPromise = null; throw e; });
   return modelPromise;
 }

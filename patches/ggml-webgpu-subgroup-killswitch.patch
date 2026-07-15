@@ -1,0 +1,22 @@
+diff --git a/src/ggml-webgpu/ggml-webgpu.cpp b/src/ggml-webgpu/ggml-webgpu.cpp
+index 401c75c1..e0028c2b 100644
+--- a/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -3732,6 +3732,17 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
+ #endif
+     ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix = valid_subgroup_matrix_config;
+ 
++    // Runtime kill switches for bisecting driver-specific miscompute (e.g.
++    // subgroup reductions on some Vulkan drivers): force the portable
++    // non-subgroup shader variants.
++    if (getenv("GGML_WEBGPU_NO_SUBGROUPS")) {
++        GGML_LOG_INFO("ggml_webgpu: subgroups disabled via GGML_WEBGPU_NO_SUBGROUPS\n");
++        ctx->webgpu_global_ctx->capabilities.supports_subgroups = false;
++    }
++    if (getenv("GGML_WEBGPU_NO_SUBGROUP_MATRIX")) {
++        ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix = false;
++    }
++
+     // Runtime subgroup size can be any supported size in this range. Shaders
+     // that allocate per-lane register arrays must size them for the minimum.
+     ctx->webgpu_global_ctx->capabilities.min_subgroup_size = info.subgroupMinSize;

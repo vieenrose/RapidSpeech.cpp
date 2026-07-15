@@ -507,6 +507,16 @@ const char *rs_wasm_get_version(void) {
   return rs_get_version();
 }
 
+// Set a process env var from JS BEFORE model init — the engine reads tuning
+// and debug knobs via getenv (RS_REP_PENALTY, GGML_WEBGPU_NO_SUBGROUPS, ...),
+// and emscripten's Module.ENV is baked at runtime start, too early for a page
+// to reach. libc setenv works at any time.
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_setenv(const char *name, const char *value) {
+  if (!name || !*name) return -1;
+  return setenv(name, value ? value : "", 1);
+}
+
 // ── KWS (open-vocabulary wake-word, independent of g_ctx) ──
 //
 // Mirrors the VAD pattern: KWS owns its own rs_context_t so it can hold a

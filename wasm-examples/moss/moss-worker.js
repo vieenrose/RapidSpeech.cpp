@@ -182,6 +182,15 @@ if (globalThis.name !== "em-pthread") {
           printErr: (t) => { scanLog(String(t));
             try { postMessage({ type: "cxxlog", text: String(t) }); } catch {} },
         });
+        // Engine env knobs from the page (?env_NAME=VALUE) — must be set
+        // before model init; the C++ reads them via getenv.
+        if (msg.env) {
+          const setenv = Module.cwrap("rs_wasm_setenv", "number", ["string", "string"]);
+          for (const [k, v] of Object.entries(msg.env)) {
+            setenv(k, String(v));
+            console.log(`[env] ${k}=${v}`);
+          }
+        }
         // 1. MOSS transcription model (~700 MB).
         const modelPath = await fetchToFS(msg.ggufUrl, "model.gguf", "asr");
         postMessage({ type: "status", text: "Loading transcription model…" });
