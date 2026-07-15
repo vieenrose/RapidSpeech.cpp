@@ -358,8 +358,10 @@ function ensureModel() {
       } else if (m.type === "ready") {
         modelReady = true; dlState = null; $("dl-bars").innerHTML = "";
         diarize = !!m.diarize;
-        setModelState("ready", `Model ready · Q4_K · WASM · ${m.threads} threads` +
-          (diarize ? " · CAM++ diarization" : ""));
+        setModelState("ready", `Model ready · Q4_K · WASM · ` +
+          (m.gpu ? "WebGPU + " : "") + `${m.threads} threads` +
+          (diarize ? " · CAM++ diarization" : "") +
+          (WANT_GPU && !m.gpu ? " · (GPU requested but engine is CPU-only)" : ""));
         resolve();
       } else if (m.type === "moss_token") {
         tailProvisional = s2tw(m.text);      // live partial (Traditional)
@@ -1119,7 +1121,9 @@ async function init() {
   if (IS_IOS) {
     const wr = $("win-row"); if (wr) wr.style.display = "none"; // fixed 28 s on iOS
   }
-  $("input-note").textContent = "CPU · multi-threaded WASM · live token streaming";
+  $("input-note").textContent =
+    (WASM_VARIANT === "gpu" ? "WebGPU + CPU" : "CPU") +
+    " · multi-threaded WASM · live token streaming";
   $("btn-load").disabled = false;
   setControlsEnabled(true);
   setModelState("", "Not loaded — starts automatically when needed");

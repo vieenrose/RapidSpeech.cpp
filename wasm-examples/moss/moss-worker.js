@@ -168,13 +168,19 @@ if (globalThis.name !== "em-pthread") {
     try {
       if (msg.type === "init") {
         if (msg.threads > 0) N_THREADS = Math.max(1, Math.min(msg.threads | 0, 16));
+        // Truth about which backend the scheduler actually got — the engine
+        // logs it during init; "requested GPU" alone proves nothing.
+        let gpuActive = false;
+        const scanLog = (t) => { if (/WebGPU backend added to scheduler/.test(t)) gpuActive = true; };
         Module = await globalThis.RapidSpeechModule({
           locateFile: (p) =>
             (p.endsWith(".wasm") ? `./rapidspeech-wasm-${WASM_VARIANT}.wasm` : p),
+          print: (t) => { scanLog(String(t)); console.log(t); },
           // Forward engine stderr to the page: iOS Safari has no console, and
           // ggml reports failures (e.g. buffer allocation) there before the
           // C++ returns an empty transcript "gracefully".
-          printErr: (t) => { try { postMessage({ type: "cxxlog", text: String(t) }); } catch {} },
+          printErr: (t) => { scanLog(String(t));
+            try { postMessage({ type: "cxxlog", text: String(t) }); } catch {} },
         });
         // 1. MOSS transcription model (~700 MB).
         const modelPath = await fetchToFS(msg.ggufUrl, "model.gguf", "asr");
@@ -206,7 +212,8 @@ if (globalThis.name !== "em-pthread") {
             postMessage({ type: "status", text: "Speaker model unavailable; per-window tags only." });
           }
         }
-        postMessage({ type: "ready", threads: N_THREADS, diarize: !!speakerEmbed });
+        postMessage({ type: "ready", threads: N_THREADS, diarize: !!speakerEmbed,
+                      gpu: gpuActive });
         return;
       }
 
