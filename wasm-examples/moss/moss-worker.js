@@ -29,7 +29,11 @@ if (globalThis.name !== "em-pthread") {
   // ── main worker role ────────────────────────────────────────────────────
   let Module = null, transcribePcm = null;
   let speakerEmbed = null, spkDim = 0;
-  const N_THREADS = Math.max(1, Math.min(self.navigator?.hardwareConcurrency || 4, 16));
+  // Default thread count. On hybrid CPUs (Intel P+E+LPE) more threads can be
+  // SLOWER: ggml barriers every op on the slowest core, so 16 threads on a
+  // 6P+8E+2LPE laptop runs at low-power-E-core pace. Overridable per run via
+  // the page's ?threads= URL param (passed in the init message).
+  let N_THREADS = Math.max(1, Math.min(self.navigator?.hardwareConcurrency || 4, 16));
   const SR = 16000;
   // raw [start(-end)][Sxx]text parser (embedding boundaries; s2tw/ITN done on page)
   const SEG_RE = /\[(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\](?:\[(S\d+)\])?([^\[]*)/g;
@@ -161,6 +165,7 @@ if (globalThis.name !== "em-pthread") {
     const msg = e.data;
     try {
       if (msg.type === "init") {
+        if (msg.threads > 0) N_THREADS = Math.max(1, Math.min(msg.threads | 0, 16));
         Module = await globalThis.RapidSpeechModule({
           locateFile: (p) =>
             (p.endsWith(".wasm") ? `./rapidspeech-wasm-${WASM_VARIANT}.wasm` : p),

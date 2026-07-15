@@ -377,7 +377,10 @@ function ensureModel() {
         else { modelPromise = null; reject(new Error(m.error)); }
       }
     };
-    worker.postMessage({ type: "init", ggufUrl: GGUF_URL, spkUrl: SPK_GGUF_URL });
+    // ?threads=N override for hybrid-CPU tuning (e.g. Meteor Lake: try the
+    // P-core count, 6-8 — often 1.5-2x faster than the 16-thread default).
+    const threads = +(new URLSearchParams(location.search).get("threads") || 0);
+    worker.postMessage({ type: "init", ggufUrl: GGUF_URL, spkUrl: SPK_GGUF_URL, threads });
   }).catch((e) => { modelPromise = null; throw e; });
   return modelPromise;
 }
