@@ -132,20 +132,29 @@ if (globalThis.name !== "em-pthread") {
     return `/${name}`;
   }
 
-  // Embed one PCM slice -> Array(spkDim) L2-normalized, or null if too short/failed.
+  // Embed one PCM slice -> Array(spkDim) L2-normalized, or null if too
+  // short/failed. Never throws: a failed embed degrades that one segment to
+  // "inherit previous speaker" — it must not error the whole window.
   function embedSlice(pcm, a, b) {
-    if (!speakerEmbed || !spkDim) return null;
-    a = Math.max(0, a | 0); b = Math.min(pcm.length, b | 0);
-    if (b - a < 0.3 * SR) return null;                 // ORT: skip < 0.3 s
-    const seg = pcm.subarray(a, b);
-    const sp = Module._malloc(seg.length * 4);
-    new Float32Array(Module.HEAPF32.buffer, sp, seg.length).set(seg);
-    const ep = Module._malloc(spkDim * 4);
-    const rc = speakerEmbed(sp, seg.length, ep, spkDim);
-    let emb = null;
-    if (rc === 0) emb = Array.from(new Float32Array(Module.HEAPF32.buffer, ep, spkDim));
-    Module._free(sp); Module._free(ep);
-    return emb;
+    try {
+      if (!speakerEmbed || !spkDim) return null;
+      a = Math.max(0, a | 0); b = Math.min(pcm.length, b | 0);
+      if (b - a < 0.3 * SR) return null;               // ORT: skip < 0.3 s
+      const seg = pcm.subarray(a, b);
+      const sp = Module._malloc(seg.length * 4);
+      if (!sp) return null;
+      new Float32Array(Module.HEAPF32.buffer, sp, seg.length).set(seg);
+      const ep = Module._malloc(spkDim * 4);
+      if (!ep) { Module._free(sp); return null; }
+      const rc = speakerEmbed(sp, seg.length, ep, spkDim);
+      let emb = null;
+      if (rc === 0) emb = Array.from(new Float32Array(Module.HEAPF32.buffer, ep, spkDim));
+      Module._free(sp); Module._free(ep);
+      return emb;
+    } catch (err) {
+      console.warn("embedSlice failed:", err);
+      return null;
+    }
   }
 
   self.onmessage = async (e) => {
@@ -218,13 +227,17 @@ if (globalThis.name !== "em-pthread") {
             emb: embedSlice(pcm, s.start * SR, end * SR),
           };
         });
+        // WASM heap high-water (grows monotonically) — memory telemetry.
+        // NOTE: HEAPU8, not HEAP8 — HEAP8 is not in EXPORTED_RUNTIME_METHODS;
+        // reading .length of undefined here killed the whole window message
+        // (transcript vanished at end of every window). Defensive anyway.
+        const heapMB = Module.HEAPU8 ? (Module.HEAPU8.length / 1048576) | 0 : 0;
         postMessage({ type: "window", text, base: msg.base, durS,
-                      wi: msg.wi, nw: msg.nw, segs,
-                      // WASM heap high-water (grows monotonically) — memory telemetry
-                      heapMB: (Module.HEAP8.length / 1048576) | 0 });
+                      wi: msg.wi, nw: msg.nw, segs, heapMB });
         return;
       }
     } catch (err) {
+      console.error("[worker] handler failed:", err && err.stack || err);
       postMessage({ type: "error", error: String(err && err.message || err) });
     }
   };

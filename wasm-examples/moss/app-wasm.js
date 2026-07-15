@@ -109,8 +109,13 @@ function s2tw(t) {
     } catch { _s2twConv = false; }
   }
   // Match the ORT demo: OpenCC (Simplified->Traditional) THEN number ITN
-  // (十一人 -> 11人, 百分之X -> X%), with itn.js's idiom guards.
-  return itn(_s2twConv ? _s2twConv(t) : t);
+  // (十一人 -> 11人, 百分之X -> X%), with itn.js's idiom guards. Both steps are
+  // cosmetic — NEVER let them throw and take down the pipeline (an exception
+  // here cleared the streamed transcript and hung the window promise).
+  let out = t;
+  try { out = _s2twConv ? _s2twConv(t) : t; } catch {}
+  try { out = itn(out); } catch {}
+  return out;
 }
 const dispCache = new Map();
 function dispText(text) {
@@ -345,8 +350,10 @@ function ensureModel() {
         beat(m.phase);
       } else if (m.type === "window") {
         if (m.heapMB) console.log(`[mem] wasm heap high-water: ${m.heapMB} MB`);
+
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(m); }
       } else if (m.type === "error") {
+        console.error("[worker-error]", m.error);
         setModelState("", "Error: " + m.error);
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(null); }
         else { modelPromise = null; reject(new Error(m.error)); }
@@ -386,7 +393,16 @@ function transcribeWindow(wav, base, durS) {
     tailProvisional = "";
     onWindowResolve = (m) => {
       tailProvisional = "";
-      resolve(m ? mapWindowSegs(m, base) : []);
+      // NEVER throw out of this resolver: an exception here leaves the window
+      // promise pending forever (the run hangs with the tail already cleared —
+      // i.e. "the streamed transcript disappeared"). Any per-segment mapping
+      // problem degrades to skipping the window, not killing the session.
+      try {
+        resolve(m ? mapWindowSegs(m, base) : []);
+      } catch (err) {
+        console.error("window mapping failed:", err);
+        resolve([]);
+      }
     };
     const w = wav.slice();                 // copy just this window's samples
     worker.postMessage(
@@ -587,7 +603,14 @@ async function transcribe(source) {
     normalizeSegs(diarSegs);                 // fill end + window-local speaker
     // Re-link speakers globally across all windows so far (CAM++ AHC), or fall
     // back to the model's per-window [Sxx] tags when the speaker model is absent.
-    segs = diarize ? linkSpeakers(diarSegs) : diarSegs;
+    // Linking is an enhancement — if it ever fails, keep the per-window tags
+    // rather than losing the transcript.
+    try {
+      segs = diarize ? linkSpeakers(diarSegs) : diarSegs;
+    } catch (err) {
+      console.error("speaker linking failed:", err);
+      segs = diarSegs;
+    }
     renderLegend();
     renderTranscript();
 
