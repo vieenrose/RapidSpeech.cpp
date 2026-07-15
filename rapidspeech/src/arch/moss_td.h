@@ -170,6 +170,12 @@ private:
   uint32_t                            n_cached_tokens_ = 0;
   static constexpr int MAX_DECODE_TOKENS = 512;
 
+  // CPU-only scheduler for the batch-1 decode loop (rs_context->sched_cpu;
+  // null in CPU-only builds, where decode falls back to the main sched which
+  // is already CPU). With the MossTD per-component weight split (encoder on
+  // GPU, LLM CPU-resident) the decode runs here — see DecodeWithLLM.
+  ggml_backend_sched_t                decode_sched_ = nullptr;
+
   // Prompt and audio-token IDs (cached so we don't re-tokenize per call).
   std::string user_input_prompt_;
   std::string cached_user_input_prompt_;

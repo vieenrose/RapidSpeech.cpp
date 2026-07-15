@@ -183,6 +183,10 @@ bool MossTDModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   gguf_context *ctx_gguf  = ctx->ctx_gguf;
   ggml_context *gguf_data = ctx->gguf_data;
 
+  // CPU-only scheduler for the batch-1 decode loop (null in CPU-only builds —
+  // decode then falls back to the main sched, which is already CPU there).
+  decode_sched_ = ctx->sched_cpu;
+
   auto get_i32 = [&](const char *key, int32_t def) -> int32_t {
     int idx = gguf_find_key(ctx_gguf, key);
     if (idx == -1) return def;
@@ -898,6 +902,31 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
                               host_kv_cache_v_[il].data(), 0, bytes);
     }
   }
+  // Decode scheduler. With the MossTD per-component weight split (rs_context
+  // default when a GPU is present: encoder a.*/mm.* on GPU, LLM CPU-resident),
+  // the batch-1 decode runs on the CPU-only scheduler: (1) sm_53 has no CUDA
+  // get_rows for the q6_K token_embd — all-GPU decode aborts; (2) batch-1 GEMV
+  // is memory-bound and the CPU reads q4 blocks directly, no dequant pass.
+  // Prefill/encoder stay on the GPU `sched` (batched GEMMs, ~6x faster there).
+  // The persistent KV lives on the LAST backend of `sched` (the CPU), so both
+  // schedulers can read/write it in place. The CPU decode sched is only valid
+  // when the LLM weights are CPU-resident (rs_context's per-component split) —
+  // a CPU-only scheduler cannot touch CUDA-resident weights (sched split
+  // assert). Detect the actual placement from the embed tensor's buffer, so
+  // this stays consistent with whatever rs_context decided (smart default /
+  // RS_MOSS_GPU_WEIGHTS / RS_MOSS_SPLIT). RS_MOSS_GPU_DECODE=1 forces
+  // main-sched decode explicitly.
+  bool llm_weights_on_host = true;
+  if (llm_model_->tok_embd() && llm_model_->tok_embd()->buffer) {
+    llm_weights_on_host =
+        ggml_backend_buffer_is_host(llm_model_->tok_embd()->buffer);
+  }
+  const bool cpu_decode =
+      decode_sched_ && llm_weights_on_host &&
+      getenv("RS_MOSS_GPU_DECODE") == nullptr;
+  ggml_backend_sched_t decode_sched = cpu_decode ? decode_sched_ : sched;
+  RS_LOG_INFO("MossTD decode on %s scheduler",
+              cpu_decode ? "CPU(sched_cpu)" : "main(sched)");
   {
     llm_build_opts warmup_opts;
     warmup_opts.output_mode    = llm_output_mode::OUTPUT_LOGITS;
@@ -913,7 +942,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     int32_t dummy = 0;
     auto warmup = llm_graph_builder_->build_graph(
         &dummy, 1, nullptr, &warmup_pos, &warmup_opts);
-    if (warmup) ggml_backend_sched_reserve(sched, warmup->get_graph());
+    if (warmup) ggml_backend_sched_reserve(decode_sched, warmup->get_graph());
   }
 
   // -------- (d) autoregressive decode --------
@@ -953,7 +982,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       RS_LOG_ERR("Qwen3ASR: decode build failed at step %d", step);
       break;
     }
-    if (!ggml_backend_sched_alloc_graph(sched, dec->get_graph())) {
+    if (!ggml_backend_sched_alloc_graph(decode_sched, dec->get_graph())) {
       RS_LOG_ERR("Qwen3ASR: decode alloc failed at step %d", step);
       break;
     }
@@ -968,7 +997,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
     }
-    if (ggml_backend_sched_graph_compute(sched, dec->get_graph()) !=
+    if (ggml_backend_sched_graph_compute(decode_sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Qwen3ASR: decode compute failed at step %d", step);
       break;
@@ -1034,18 +1063,18 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     n_cached_tokens_++;
 
     if (next_token == eos_token_id) {
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     if (consecutive_same_token >= MAX_CONSECUTIVE_REPEAT) {
       RS_LOG_WARN("Qwen3ASR: token %d repeated %d times — stopping",
                   next_token, consecutive_same_token);
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     if (alternating_count >= MAX_ALTERNATING_REPEAT) {
       RS_LOG_WARN("Qwen3ASR: alternating pattern at step %d — stopping", step);
-      ggml_backend_sched_reset(sched);
+      ggml_backend_sched_reset(decode_sched);
       break;
     }
     st.token_ids.push_back(next_token);
@@ -1067,14 +1096,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         }
         if (++ngram_counts_[h] >= 3) {
           RS_LOG_WARN("MossTD: repeated content n-gram x3 — stopping (loop breaker)");
-          ggml_backend_sched_reset(sched);
+          ggml_backend_sched_reset(decode_sched);
           break;
         }
       }
     }
 
     best_token = next_token;
-    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_reset(decode_sched);
     (void)debug_decode;
   }
 

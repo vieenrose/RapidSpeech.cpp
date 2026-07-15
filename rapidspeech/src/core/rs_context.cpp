@@ -274,8 +274,43 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   //    decode path is optimized or on hardware where CPU decode wins.
   //    Opt-in: RS_QWEN3ASR_SPLIT=1 (per-component). RS_QWEN3ASR_CPU_WEIGHTS=1 (all-CPU).
   const bool have_gpu = (int)ctx->backends.size() > 1;
-  const bool split_weights = (arch == "Qwen3ASR" && have_gpu &&
-                              getenv("RS_QWEN3ASR_SPLIT") != nullptr);
+  // MOSS-Transcribe-Diarize: smart placement default, measured on Jetson Nano
+  // gen1 (sm_53, 12 s clip): all-GPU = 44 s total (prefill 3.0 s, decode
+  // 554 ms/tok) vs the per-component split = 81 s (prefill collapses to 19 s —
+  // CPU-resident LLM weights get re-uploaded per op — and RapidSpeech's CPU
+  // decode is ~890 ms/tok from per-token graph overhead). So ALL-GPU wins
+  // 2.5x... but only if the token-embedding type has a CUDA get_rows kernel:
+  // the decode's per-token embedding lookup on a q6_K/K-quant embed aborts
+  // (unsupported src type). Default: all-GPU when the embed is get_rows-
+  // compatible (f16/f32/q4_0/q4_1/q5_0/q5_1/q8_0 — e.g. the *embq8* gguf),
+  // per-component split otherwise (correct everywhere, slower). Overrides:
+  // RS_MOSS_GPU_WEIGHTS=1 forces all-GPU, RS_MOSS_SPLIT=1 forces the split.
+  bool moss_embed_gpu_ok = false;
+  if (arch == "MossTD" && have_gpu) {
+    ggml_tensor *emb =
+        ggml_get_tensor(ctx->gguf_data, "llm.model.embed_tokens.weight");
+    if (emb) {
+      switch (emb->type) {
+      case GGML_TYPE_F16: case GGML_TYPE_F32:
+      case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
+      case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+      case GGML_TYPE_Q8_0:
+        moss_embed_gpu_ok = true; break;
+      default:
+        RS_LOG_WARN("MossTD: token embed type %s has no CUDA get_rows — "
+                    "using per-component split (encoder GPU, LLM/decode CPU). "
+                    "For ~2x faster decode use an embq8 gguf "
+                    "(rs-quantize --token-embedding-type q8_0).",
+                    ggml_type_name(emb->type));
+        break;
+      }
+    }
+  }
+  const bool split_weights =
+      have_gpu &&
+      ((arch == "Qwen3ASR" && getenv("RS_QWEN3ASR_SPLIT") != nullptr) ||
+       (arch == "MossTD" && getenv("RS_MOSS_GPU_WEIGHTS") == nullptr &&
+        (getenv("RS_MOSS_SPLIT") != nullptr || !moss_embed_gpu_ok)));
   auto is_encoder_tensor = [](const char *nm) {
     return nm && (strncmp(nm, "a.", 2) == 0 || strncmp(nm, "mm.", 3) == 0);
   };
