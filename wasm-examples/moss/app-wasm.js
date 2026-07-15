@@ -39,19 +39,33 @@ const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
 // on the GPU while single-token decode stays on CPU. Requires a browser with
 // WebGPU (Chrome/Edge; chrome://gpu to verify). Falls back to CPU inside the
 // engine if no adapter is found.
-const WANT_GPU = !IS_IOS && !!new URLSearchParams(location.search).get("gpu");
+// GPU policy: ?gpu=1 forces the WebGPU build on any capable adapter,
+// ?gpu=0 forces CPU, and with no param we AUTO-enable it only on Intel
+// adapters — the one configuration validated end-to-end (the engine
+// auto-selects f32-accumulating matmul shaders there; other vendors run
+// shader paths we haven't verified, and a silently wrong transcript is
+// worse than a slow one).
+const GPU_PARAM = new URLSearchParams(location.search).get("gpu");
+const WANT_GPU = !IS_IOS && GPU_PARAM !== "0" && GPU_PARAM !== null;
+const AUTO_GPU = !IS_IOS && GPU_PARAM === null;
 let WASM_VARIANT = IS_IOS ? "ios" : "mt";   // may become "gpu" after preflight
+let GPU_IS_INTEL = false;
 // The WebGPU backend requires the shader-f16 adapter feature and ABORTS the
 // whole module without it (software adapters like SwiftShader lack f16), so
 // gate the gpu build behind an adapter preflight instead of crashing.
 async function gpuPreflight() {
-  if (!WANT_GPU) return;
+  if (IS_IOS || GPU_PARAM === "0") return;
   try {
     const a = navigator.gpu && await navigator.gpu.requestAdapter();
-    if (a && a.features.has("shader-f16")) { WASM_VARIANT = "gpu"; return; }
-    setModelState("", "WebGPU adapter missing shader-f16 — using CPU build.");
+    if (!a || !a.features.has("shader-f16")) {
+      if (!AUTO_GPU) setModelState("", "WebGPU adapter missing shader-f16 — using CPU build.");
+      return;
+    }
+    GPU_IS_INTEL = /intel/i.test(a.info?.vendor || "");
+    if (AUTO_GPU && !GPU_IS_INTEL) return;   // unvalidated vendor: opt-in only
+    WASM_VARIANT = "gpu";
   } catch {
-    setModelState("", "WebGPU unavailable — using CPU build.");
+    if (!AUTO_GPU) setModelState("", "WebGPU unavailable — using CPU build.");
   }
 }
 // Window size: user-selectable 90/180/300 s (default 180, like the ORT demo —
@@ -402,7 +416,14 @@ function ensureModel() {
     };
     // ?threads=N override for hybrid-CPU tuning (e.g. Meteor Lake: try the
     // P-core count, 6-8 — often 1.5-2x faster than the 16-thread default).
-    const threads = +(new URLSearchParams(location.search).get("threads") || 0);
+    // When the GPU auto-enabled on an Intel adapter, default to ~P-core-count
+    // threads: hybrid Intel laptops pace every ggml barrier at their slowest
+    // low-power E-core, and 6 threads + GPU is the measured-best config.
+    let threads = +(new URLSearchParams(location.search).get("threads") || 0);
+    if (!threads && WASM_VARIANT === "gpu" && GPU_IS_INTEL &&
+        (navigator.hardwareConcurrency || 0) > 8) {
+      threads = 6;
+    }
     // ?env_NAME=VALUE params become engine env vars (debug/tuning knobs, e.g.
     // ?env_GGML_WEBGPU_NO_SUBGROUPS=1 or ?env_RS_REP_PENALTY=1.0).
     const env = {};
