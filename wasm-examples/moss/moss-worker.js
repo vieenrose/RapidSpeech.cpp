@@ -35,36 +35,75 @@ if (globalThis.name !== "em-pthread") {
   const SEG_RE = /\[(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?\](?:\[(S\d+)\])?([^\[]*)/g;
 
   // Stream a GGUF from a URL and expose it to the module's FS, reporting
-  // progress with `tag`. Preferred path: mount the bytes as a Blob via WORKERFS
-  // — the Blob lives OUTSIDE the WASM heap (the browser may even disk-back it)
-  // and ggml reads it lazily, avoiding a ~700 MB in-heap MEMFS copy. Critical
-  // on iOS, where heap + copy + weight buffers would exceed the memory cap.
+  // progress with `tag`. Preferred path: stream the download into CACHE
+  // STORAGE (disk-backed) and mount the resulting Blob via WORKERFS — the
+  // bytes never sit in JS RAM and live OUTSIDE the WASM heap; ggml reads them
+  // lazily. This is what keeps iOS alive: accumulating ~700 MB of chunks in
+  // RAM tripped Safari's memory watchdog (silent tab reload right as the
+  // download finished). Bonus: revisits hit the cache and skip the download.
   // Returns the FS path to pass to the model init.
   let wfsCount = 0;
-  async function fetchToFS(url, name, tag) {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(tag + " fetch " + resp.status);
-    const total = +resp.headers.get("content-length") || 0;
-    const reader = resp.body.getReader();
-    const chunks = []; let got = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value); got += value.length;
-      postMessage({ type: "dl", tag, got, total });
-    }
+  function mountBlob(name, blob) {
     const WORKERFS = Module.FS.filesystems && Module.FS.filesystems.WORKERFS;
-    if (WORKERFS) {
-      const dir = `/wfs${wfsCount++}`;
-      Module.FS.mkdir(dir);
-      Module.FS.mount(WORKERFS, { blobs: [{ name, data: new Blob(chunks) }] }, dir);
-      chunks.length = 0;
-      return `${dir}/${name}`;
+    if (!WORKERFS) return null;
+    const dir = `/wfs${wfsCount++}`;
+    Module.FS.mkdir(dir);
+    Module.FS.mount(WORKERFS, { blobs: [{ name, data: blob }] }, dir);
+    return `${dir}/${name}`;
+  }
+  async function fetchToFS(url, name, tag) {
+    let cache = null;
+    try { cache = await caches.open("moss-models-v1"); } catch {}
+    let blob = null;
+    if (cache) {
+      const hit = await cache.match(url).catch(() => null);
+      if (hit) {
+        blob = await hit.blob();
+        postMessage({ type: "dl", tag, got: blob.size, total: blob.size });
+      }
     }
-    // Fallback: MEMFS copy (in-heap).
-    const buf = new Uint8Array(got);
-    let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
-    chunks.length = 0;
+    if (!blob) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(tag + " fetch " + resp.status);
+      const total = +resp.headers.get("content-length") || 0;
+      if (cache && resp.body && resp.body.tee) {
+        // Tee the stream: one branch counts progress, the other streams
+        // straight into Cache Storage (disk) — no full-file RAM copy, ever.
+        const [pa, pb] = resp.body.tee();
+        const putP = cache.put(url, new Response(pb, {
+          headers: { "Content-Type": "application/octet-stream" },
+        }));
+        const reader = pa.getReader(); let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          got += value.length;
+          postMessage({ type: "dl", tag, got, total });
+        }
+        await putP;
+        const hit = await cache.match(url).catch(() => null);
+        if (hit) blob = await hit.blob();
+      }
+      if (!blob) {
+        // Fallback (no Cache API): accumulate in RAM as before, but roll the
+        // chunks into sub-Blobs every ~64 MB so the browser can spill them.
+        const reader = resp.body.getReader();
+        const parts = []; let chunks = []; let sz = 0, got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value); sz += value.length; got += value.length;
+          if (sz >= 64 * 1048576) { parts.push(new Blob(chunks)); chunks = []; sz = 0; }
+          postMessage({ type: "dl", tag, got, total });
+        }
+        if (chunks.length) parts.push(new Blob(chunks));
+        blob = new Blob(parts);
+      }
+    }
+    const p = mountBlob(name, blob);
+    if (p) return p;
+    // Last resort: MEMFS copy (in-heap).
+    const buf = new Uint8Array(await blob.arrayBuffer());
     Module.FS.writeFile(`/${name}`, buf);
     return `/${name}`;
   }
