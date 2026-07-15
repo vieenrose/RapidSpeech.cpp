@@ -1,5 +1,5 @@
 diff --git a/src/ggml-webgpu/ggml-webgpu.cpp b/src/ggml-webgpu/ggml-webgpu.cpp
-index 401c75c1..e0028c2b 100644
+index 401c75c1..65a220c4 100644
 --- a/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/src/ggml-webgpu/ggml-webgpu.cpp
 @@ -3732,6 +3732,17 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
@@ -20,3 +20,29 @@ index 401c75c1..e0028c2b 100644
      // Runtime subgroup size can be any supported size in this range. Shaders
      // that allocate per-lane register arrays must size them for the minimum.
      ctx->webgpu_global_ctx->capabilities.min_subgroup_size = info.subgroupMinSize;
+@@ -3938,6 +3949,25 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
+ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
+ 
++    // GGML_WEBGPU_DISABLE_OPS="FLASH_ATTN_EXT,MUL_MAT,..." pushes the named
++    // ops back to the CPU via the scheduler — for bisecting driver-specific
++    // shader miscompute on real hardware without rebuilds.
++    {
++        static const char * disable_env = getenv("GGML_WEBGPU_DISABLE_OPS");
++        if (disable_env && *disable_env) {
++            const char * name = ggml_op_name(op->op);
++            const size_t nlen = strlen(name);
++            for (const char * p = disable_env; *p;) {
++                const char * end = strchr(p, ',');
++                const size_t len = end ? (size_t)(end - p) : strlen(p);
++                if (len == nlen && strncasecmp(p, name, len) == 0) {
++                    return false;
++                }
++                p = end ? end + 1 : p + len;
++            }
++        }
++    }
++
+     ggml_tensor * src0 = op->src[0];
+     ggml_tensor * src1 = op->src[1];
+     ggml_tensor * src2 = op->src[2];
