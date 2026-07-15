@@ -299,7 +299,9 @@ function resetView(placeholder) {
 // The WASM module + its ggml pthread pool live in the worker, so the page stays
 // responsive during compute, and the decoder streams each token back live.
 let worker = null, modelReady = false, modelPromise = null;
-let onWindowResolve = null;      // resolves the in-flight transcribeWindow()
+let onWindowResolve = null;
+let lastWinError = null;
+let cxxLog = [], cxxErr = "";      // resolves the in-flight transcribeWindow()
 let tailProvisional = "";        // live partial transcript for the current window
 
 function setModelState(cls, msg) {
@@ -348,13 +350,29 @@ function ensureModel() {
         phaseT0 = m.phase === "prefill" ? Date.now() : phaseT0;
         renderPhase();
         beat(m.phase);
+      } else if (m.type === "cxxlog") {
+        // Engine stderr, forwarded so failures are diagnosable on iOS (no
+        // console there). Keep the last few lines; error-looking ones win.
+        cxxLog.push(m.text);
+        if (cxxLog.length > 12) cxxLog.shift();
+        if (/error|fail|abort|alloc/i.test(m.text)) cxxErr = m.text;
+        console.log("[engine]", m.text);
       } else if (m.type === "window") {
         if (m.heapMB) console.log(`[mem] wasm heap high-water: ${m.heapMB} MB`);
-
+        if (m.failed) {
+          lastWinError = "engine returned no text" +
+            (cxxErr ? ` — ${cxxErr}` : "") + (m.heapMB ? ` (heap ${m.heapMB} MB)` : "");
+          console.error("[worker-error]", lastWinError);
+        }
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(m); }
       } else if (m.type === "error") {
         console.error("[worker-error]", m.error);
         setModelState("", "Error: " + m.error);
+        // Also surface in the always-visible status line — on iOS there is no
+        // console, and a silent per-window failure reads as "Done, 0 segments".
+        lastWinError = m.error;
+        const st = document.getElementById("status");
+        if (st) st.textContent = "Window failed: " + String(m.error).slice(0, 140);
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(null); }
         else { modelPromise = null; reject(new Error(m.error)); }
       }
@@ -565,6 +583,7 @@ async function transcribe(source) {
   segs = [];
   diarSegs = [];
   tokenCount = 0;
+  lastWinError = null; cxxErr = "";
   let processedS = 0;
   $("status").textContent =
     `${fmt(source.durS)} of audio → ~${nWin} × ${WINDOW_S}s window(s)`;
@@ -629,7 +648,9 @@ async function transcribe(source) {
   $("bar").firstElementChild.style.width = "100%";
   renderLegend();
   renderTranscript();
-  $("status").textContent = aborted ? "Stopped — partial result kept." : "Done · all local.";
+  $("status").textContent = aborted ? "Stopped — partial result kept."
+    : lastWinError ? `Done, but a window failed: ${String(lastWinError).slice(0, 120)}`
+    : "Done · all local.";
   $("stats").textContent =
     `${fmt(processedS)} audio · ${segs.length} segments · ` +
     `${new Set(segs.map((s) => s.speaker)).size} speakers · ` +

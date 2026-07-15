@@ -164,6 +164,10 @@ if (globalThis.name !== "em-pthread") {
         Module = await globalThis.RapidSpeechModule({
           locateFile: (p) =>
             (p.endsWith(".wasm") ? `./rapidspeech-wasm-${WASM_VARIANT}.wasm` : p),
+          // Forward engine stderr to the page: iOS Safari has no console, and
+          // ggml reports failures (e.g. buffer allocation) there before the
+          // C++ returns an empty transcript "gracefully".
+          printErr: (t) => { try { postMessage({ type: "cxxlog", text: String(t) }); } catch {} },
         });
         // 1. MOSS transcription model (~700 MB).
         const modelPath = await fetchToFS(msg.ggufUrl, "model.gguf", "asr");
@@ -234,13 +238,19 @@ if (globalThis.name !== "em-pthread") {
             emb: embedSlice(pcm, s.start * SR, end * SR),
           };
         });
+        // Real audio that produces NO text at all is almost always an engine
+        // failure (encode/prefill alloc fail on memory-capped iOS) — C++ logs
+        // the cause to stderr and returns "" rather than throwing. Tag the
+        // window so the page can surface it instead of silently rendering
+        // nothing.
+        const failed = (!text || !text.trim()) && durS > 2;
         // WASM heap high-water (grows monotonically) — memory telemetry.
         // NOTE: HEAPU8, not HEAP8 — HEAP8 is not in EXPORTED_RUNTIME_METHODS;
         // reading .length of undefined here killed the whole window message
         // (transcript vanished at end of every window). Defensive anyway.
         const heapMB = Module.HEAPU8 ? (Module.HEAPU8.length / 1048576) | 0 : 0;
         postMessage({ type: "window", text, base: msg.base, durS,
-                      wi: msg.wi, nw: msg.nw, segs, heapMB });
+                      wi: msg.wi, nw: msg.nw, segs, heapMB, failed });
         return;
       }
     } catch (err) {
