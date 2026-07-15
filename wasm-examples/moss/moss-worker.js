@@ -51,55 +51,79 @@ if (globalThis.name !== "em-pthread") {
     Module.FS.mount(WORKERFS, { blobs: [{ name, data: blob }] }, dir);
     return `${dir}/${name}`;
   }
+  // The model is cached as ~64 MB PART entries plus a manifest, not one big
+  // entry: WebKit's cache.put() buffers the ENTIRE body in RAM before
+  // committing, so a single streamed ~700 MB put re-triggered iOS Safari's
+  // memory watchdog (silent tab reload) right at download completion. Small
+  // puts keep peak RAM at ~2 parts; after each put the part is re-read from
+  // the cache so the composite Blob references DISK-backed parts (a Blob of
+  // Blobs holds references — no copy).
+  const CACHE_NAME = "moss-models-v3";
+  const PART_BYTES = 64 * 1048576;
   async function fetchToFS(url, name, tag) {
     let cache = null;
-    try { cache = await caches.open("moss-models-v1"); } catch {}
-    let blob = null;
+    try {
+      cache = await caches.open(CACHE_NAME);
+      caches.delete("moss-models-v1").catch(() => {});
+      caches.delete("moss-models-v2").catch(() => {});
+    } catch {}
+    // NOTE: Cache API keys ignore URL FRAGMENTS (#...) — every #part key
+    // collapsed to the same entry and overwrote itself. Use query params.
+    const ckey = (suffix) => url + (url.includes("?") ? "&" : "?") + "rspart=" + suffix;
+    const manifestKey = ckey("manifest");
+    // Revisit: rebuild the composite from the cached disk-backed parts.
     if (cache) {
-      const hit = await cache.match(url).catch(() => null);
-      if (hit) {
-        blob = await hit.blob();
-        postMessage({ type: "dl", tag, got: blob.size, total: blob.size });
-      }
-    }
-    if (!blob) {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(tag + " fetch " + resp.status);
-      const total = +resp.headers.get("content-length") || 0;
-      if (cache && resp.body && resp.body.tee) {
-        // Tee the stream: one branch counts progress, the other streams
-        // straight into Cache Storage (disk) — no full-file RAM copy, ever.
-        const [pa, pb] = resp.body.tee();
-        const putP = cache.put(url, new Response(pb, {
-          headers: { "Content-Type": "application/octet-stream" },
-        }));
-        const reader = pa.getReader(); let got = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          got += value.length;
-          postMessage({ type: "dl", tag, got, total });
+      try {
+        const man = await cache.match(manifestKey);
+        if (man) {
+          const { parts, size } = await man.json();
+          const blobs = [];
+          for (let i = 0; i < parts; i++) {
+            const r = await cache.match(ckey(i));
+            if (!r) { blobs.length = 0; break; }
+            blobs.push(await r.blob());
+          }
+          if (parts > 0 && blobs.length === parts) {
+            postMessage({ type: "dl", tag, got: size, total: size });
+            const p = mountBlob(name, new Blob(blobs));
+            if (p) return p;
+          }
         }
-        await putP;
-        const hit = await cache.match(url).catch(() => null);
-        if (hit) blob = await hit.blob();
-      }
-      if (!blob) {
-        // Fallback (no Cache API): accumulate in RAM as before, but roll the
-        // chunks into sub-Blobs every ~64 MB so the browser can spill them.
-        const reader = resp.body.getReader();
-        const parts = []; let chunks = []; let sz = 0, got = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value); sz += value.length; got += value.length;
-          if (sz >= 64 * 1048576) { parts.push(new Blob(chunks)); chunks = []; sz = 0; }
-          postMessage({ type: "dl", tag, got, total });
-        }
-        if (chunks.length) parts.push(new Blob(chunks));
-        blob = new Blob(parts);
-      }
+      } catch {}
     }
+    // Download: stream, committing each ~64 MB part as its own cache entry.
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(tag + " fetch " + resp.status);
+    const total = +resp.headers.get("content-length") || 0;
+    const reader = resp.body.getReader();
+    const partBlobs = []; let chunks = [], sz = 0, got = 0, pi = 0;
+    const flush = async () => {
+      if (!sz) return;
+      let part = new Blob(chunks); chunks = []; sz = 0;
+      if (cache) {
+        try {
+          await cache.put(ckey(pi), new Response(part));
+          const rt = await cache.match(ckey(pi));
+          if (rt) part = await rt.blob();      // swap to the disk-backed copy
+        } catch { cache = null; }              // quota/private mode: keep RAM part
+      }
+      partBlobs.push(part); pi++;
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); sz += value.length; got += value.length;
+      if (sz >= PART_BYTES) await flush();
+      postMessage({ type: "dl", tag, got, total });
+    }
+    await flush();
+    if (cache) {
+      try {
+        await cache.put(manifestKey,
+                        new Response(JSON.stringify({ parts: pi, size: got })));
+      } catch {}
+    }
+    const blob = new Blob(partBlobs);
     const p = mountBlob(name, blob);
     if (p) return p;
     // Last resort: MEMFS copy (in-heap).
