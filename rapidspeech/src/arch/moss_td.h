@@ -147,6 +147,15 @@ public:
     on_token_ = std::move(cb);
   }
 
+  // Phase-progress hook: invoked at pipeline milestones so slow phases
+  // (multi-chunk encoder, long-window prefill) can show live progress instead
+  // of a silent multi-minute gap. phase is "mel" | "encode" | "prefill" |
+  // "decode"; cur/total are phase-specific (encode: chunk index/count;
+  // prefill: 0/ctx_tokens at start, total/total at end).
+  void SetOnPhase(std::function<void(const char *, int, int)> cb) {
+    on_phase_ = std::move(cb);
+  }
+
   const RSModelMeta &GetMeta() const override { return meta_; }
 
   void SetUseLLM(bool use) override { (void)use; /* always uses LLM */ }
@@ -177,6 +186,7 @@ private:
   std::vector<int32_t> cached_suffix_tokens_;
   int32_t audio_start_id_ = -1;
   std::function<void(const std::string &)> on_token_;  // streaming hook
+  std::function<void(const char *, int, int)> on_phase_;  // phase progress
   int32_t audio_end_id_   = -1;
 
   bool MapEncoderTensors(std::map<std::string, struct ggml_tensor *> &tensors);

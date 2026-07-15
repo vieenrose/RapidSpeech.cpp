@@ -177,6 +177,9 @@
       <span id="input-note" style="font-size:.83rem;color:var(--muted)"></span>
     </div>
     <div class="chips" id="examples">
+      <button class="chip" data-ex="jfk" data-url="./jfk.mp3" disabled>
+        📄 JFK inaugural (English) <small>11 s · classic ASR sample · click to transcribe</small>
+      </button>
       <button class="chip" data-ex="ivod_2024_15362" disabled>
         📄 全院委員談話會 <small>真實立法院會議 · 5 min · 點擊即時轉錄（本機執行）</small>
       </button>
@@ -188,7 +191,7 @@
 
   <div class="card">
     <h2>Transcript</h2>
-    <div id="player-box" style="display:none"><audio id="audio" controls preload="none"></audio></div>
+    <div id="player-box" style="display:none"><audio id="audio" controls preload="none" crossorigin="anonymous"></audio></div>
     <div id="statusline"><span id="status">Starting the in-browser engine…</span><span id="stats"></span></div>
     <div id="heartbeat"><span id="hb-dot"></span><span id="hb-text"></span></div>
     <div id="bar"><div></div></div>
@@ -241,7 +244,7 @@
   </footer>
 </div>
 <!-- OpenCC Simplified->Traditional (self-contained cn2t bundle) for zh-TW output -->
-<script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/cn2t.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/cn2t.js" crossorigin="anonymous"></script>
 <script type="module" src="app-wasm.js"></script>
 </body>
 </html>

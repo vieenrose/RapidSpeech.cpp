@@ -179,8 +179,18 @@ const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
           postMessage({ type: "moss_token", text: UTF8ToString($0) });
       }, partial.c_str());
     });
+    // Phase progress (encoder chunk N/M, prefill start, decode start) so the
+    // page can show liveness through the long silent phases of big windows.
+    m->SetOnPhase([](const char *phase, int cur, int total) {
+      EM_ASM({
+        if (typeof postMessage === "function")
+          postMessage({ type: "moss_phase", phase: UTF8ToString($0),
+                        cur: $1, total: $2 });
+      }, phase, cur, total);
+    });
   } else {
     m->SetOnToken(nullptr);
+    m->SetOnPhase(nullptr);
   }
   // For long (multi-chunk) windows the f32 KV cache would blow past the WASM
   // 4 GB budget (300 s ~= 3854 ctx tokens -> ~1 GB f32 KV, 3.7 GB peak). q8_0 KV
@@ -193,15 +203,16 @@ const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
   // Encode() runs the C++ WhisperMelExtractor (mel) + encoder graph. The encoder
   // is truncated to the real audio length (see MossTDModel::RunEncoder), so short
   // clips don't pay for 30 s of silence.
-  if (!m->Encode(pcmv, *st, g_ctx->sched)) { m->SetOnToken(nullptr); return g_last_text; }
+  if (!m->Encode(pcmv, *st, g_ctx->sched)) { m->SetOnToken(nullptr); m->SetOnPhase(nullptr); return g_last_text; }
   // Drop trailing silence tokens to the real-audio length.
   auto *mst = static_cast<MossTDState *>(st.get());
   if (n_audio_tokens > 0 && n_audio_tokens < mst->T_audio) {
     mst->audio_embeds.resize((size_t)mst->n_embd * n_audio_tokens);
     mst->T_audio = n_audio_tokens;
   }
-  if (!m->Decode(*st, g_ctx->sched)) { m->SetOnToken(nullptr); return g_last_text; }
+  if (!m->Decode(*st, g_ctx->sched)) { m->SetOnToken(nullptr); m->SetOnPhase(nullptr); return g_last_text; }
   m->SetOnToken(nullptr);
+  m->SetOnPhase(nullptr);
   std::string text = m->GetTranscription(*st);
   std::strncpy(g_last_text, text.c_str(), sizeof(g_last_text) - 1);
   g_last_text[sizeof(g_last_text) - 1] = '\0';

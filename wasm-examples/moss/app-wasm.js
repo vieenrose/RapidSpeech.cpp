@@ -62,6 +62,23 @@ let segs = [], rows = [], activeIdx = -1, hiddenSpk = new Set();
 let tokenCount = 0;   // decoder tokens streamed this run (for tok/s)
 let diarSegs = [];    // accumulated segments (with CAM++ embeddings) across windows
 let diarize = false;  // true once the CAM++ speaker model loaded (cross-window linking)
+let phaseInfo = null, phaseT0 = 0, phaseWin = "";  // live phase progress display
+
+// Render the current pipeline phase into the status line, e.g.
+// "Window 2/12 · encoding 3/10…" / "Window 2/12 · prefill (2350 tokens)… 18s".
+function renderPhase() {
+  if (!phaseInfo || !busy) return;
+  const p = phaseInfo;
+  let txt;
+  if (p.phase === "encode")       txt = `encoding audio ${p.cur}/${p.total}…`;
+  else if (p.phase === "prefill") txt =
+    `prefill (${p.total} tokens)… ${Math.round((Date.now() - phaseT0) / 1000)}s`;
+  else if (p.phase === "decode")  txt = "transcribing…";
+  else return;
+  $("status").textContent = `${phaseWin}${txt}`;
+}
+// Tick the prefill elapsed-seconds display.
+setInterval(() => { if (phaseInfo && phaseInfo.phase === "prefill") renderPhase(); }, 1000);
 
 function acquireBusy() {
   if (busy) return false;
@@ -320,6 +337,12 @@ function ensureModel() {
         tailProvisional = s2tw(m.text);      // live partial (Traditional)
         tokenCount++;                        // one decoder token per stream event
         scheduleTailRender();
+      } else if (m.type === "moss_phase") {
+        // Liveness through the long silent phases (multi-chunk encode, prefill).
+        phaseInfo = m;
+        phaseT0 = m.phase === "prefill" ? Date.now() : phaseT0;
+        renderPhase();
+        beat(m.phase);
       } else if (m.type === "window") {
         if (m.heapMB) console.log(`[mem] wasm heap high-water: ${m.heapMB} MB`);
         if (onWindowResolve) { const r = onWindowResolve; onWindowResolve = null; r(m); }
@@ -546,7 +569,9 @@ async function transcribe(source) {
     if (durS < 0.3) break;
     nWin = Math.max(nWin, w + 1);          // durS was an estimate for mp3 etc.
     beat(`window ${w + 1}/${nWin}`);
-    $("status").textContent = `Window ${w + 1}/${nWin} · transcribing…`;
+    phaseWin = `Window ${w + 1}/${nWin} · `;
+    phaseInfo = null;
+    $("status").textContent = `${phaseWin}starting…`;
     await yieldToLoop(); // paint the previous window + let an abort click land
 
     let winSegs;
@@ -606,7 +631,8 @@ document.querySelectorAll("[data-ex]").forEach((btn) => {
     const stem = btn.dataset.ex;
     resetView(`載入範例 ${stem}…`);
     try {
-      const url = `${EXAMPLES}${stem}.mp3`;
+      // data-url = same-origin example file; otherwise fetch from the HF demo dir.
+      const url = btn.dataset.url || `${EXAMPLES}${stem}.mp3`;
       $("audio").src = url;
       $("player-box").style.display = "";
       const blob = await (await fetch(url)).blob();
@@ -850,26 +876,56 @@ function wavWindowSource(file, header) {
 // MP3: sequential streaming — decode fixed-size byte chunks forward into a
 // small rolling buffer, dropping samples already consumed by earlier windows.
 // (Windows are requested in order by transcribe().)
+//
+// TIMELINE ANCHORING: each chunk is PLACED at the sample offset implied by its
+// BYTE offset (CBR assumption: file.size bytes span estDurS seconds), instead
+// of naively appended. Independent chunk decodes lose samples (ID3 header,
+// partial boundary frames, decoder priming) and can even fail outright; naive
+// appending accumulated those losses into a growing timestamp offset and, on
+// a failed chunk, silently dropped ~2 minutes of audio. With anchoring, a
+// short/failed decode just leaves a silence-padded gap — timestamps of all
+// later audio remain correct and drift never accumulates.
 function mp3StreamSource(file, estDurS) {
   const chunkCount = Math.ceil(file.size / MP3_CHUNK_BYTES);
+  const samplesPerByte = (estDurS * SR) / file.size;
   let nextChunk = 0, bufStart = 0, eof = false;
   let buf = new Float32Array(0);
   let ac = null;
+  function appendAt(expectedStart, res) {
+    const end = bufStart + buf.length;
+    let gap = expectedStart - end;
+    if (gap > 0) {                       // pad the hole (short/failed decode)
+      const grown = new Float32Array(buf.length + gap + res.length);
+      grown.set(buf);
+      grown.set(res, buf.length + gap);
+      buf = grown;
+    } else {                             // slight overlap: trim the chunk head
+      const trim = Math.min(-gap, res.length);
+      const add = res.subarray(trim);
+      const grown = new Float32Array(buf.length + add.length);
+      grown.set(buf); grown.set(add, buf.length);
+      buf = grown;
+    }
+  }
   async function fillTo(endSample) {
     while (!eof && bufStart + buf.length < endSample) {
       if (nextChunk >= chunkCount) { eof = true; break; }
-      const part = file.slice(nextChunk * MP3_CHUNK_BYTES,
-                              Math.min((nextChunk + 1) * MP3_CHUNK_BYTES, file.size));
+      const byteStart = nextChunk * MP3_CHUNK_BYTES;
+      const part = file.slice(byteStart, Math.min(byteStart + MP3_CHUNK_BYTES, file.size));
+      const expectedStart = Math.round(byteStart * samplesPerByte);
       nextChunk++;
       if (!ac) ac = new AudioContext();
       let decoded;
       try { decoded = await ac.decodeAudioData(await part.arrayBuffer()); }
-      catch { continue; }               // skip an undecodable boundary chunk
+      catch {
+        console.warn(`[mp3] chunk ${nextChunk - 1} undecodable — gap left as silence`);
+        continue;                        // the next chunk's anchor pads the hole
+      }
       const res = await resampleTo16kMono(decoded);
-      const grown = new Float32Array(buf.length + res.length);
-      grown.set(buf); grown.set(res, buf.length);
-      buf = grown;
+      appendAt(expectedStart, res);
     }
+    // Audio exhausted with a pending request: nothing more will arrive.
+    if (nextChunk >= chunkCount && bufStart + buf.length < endSample) eof = true;
   }
   return {
     durS: estDurS,
@@ -952,6 +1008,7 @@ $("btn-rec").onclick = async () => {
       stream.getTracks().forEach((t) => t.stop());
       btn.textContent = "● Record mic";
       btn.classList.remove("rec-on");
+      btn.disabled = true;   // transcribing now; releaseBusy() re-enables
       try {
         const blob = new Blob(recChunks);
         $("audio").src = URL.createObjectURL(blob);
@@ -966,6 +1023,10 @@ $("btn-rec").onclick = async () => {
     recorder.start();
     btn.textContent = "■ Stop & transcribe";
     btn.classList.add("rec-on");
+    // acquireBusy() disabled ALL input controls — including this button, which
+    // made the recording unstoppable. Re-enable just the record button so the
+    // "stop" branch at the top of this handler is reachable.
+    btn.disabled = false;
     $("status").textContent = `Recording… (max ${MIC_MAX_S / 60} min)`;
     setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, MIC_MAX_S * 1000);
   } catch (e) {
@@ -1011,7 +1072,18 @@ async function boot() {
     try {
       await navigator.serviceWorker.register("coi-sw.js");
       await navigator.serviceWorker.ready;
-      if (!navigator.serviceWorker.controller) { markReload(); location.reload(); return; }
+      // ALWAYS reload once after registration (marker-guarded). Checking
+      // navigator.serviceWorker.controller here is a trap: clients.claim()
+      // attaches the controller to THIS already-loaded page, but
+      // crossOriginIsolated is fixed by the headers of the ORIGINAL document
+      // response, which did NOT go through the SW — so "controller present"
+      // does not mean "isolated", and skipping the reload left users stuck on
+      // the open-in-new-tab prompt at the direct URL.
+      markReload();
+      $("status").textContent =
+        "Enabling secure context (one-time)… the page will reload automatically.";
+      location.reload();
+      return;
     } catch {}
   }
   if (self.crossOriginIsolated) {

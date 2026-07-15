@@ -513,6 +513,7 @@ bool MossTDModel::RunEncoder(const std::vector<float> &mel_features,
         (size_t)n_embd * tokens_per_chunk * sizeof(float));
     ggml_free(ctx0);
     ggml_backend_sched_reset(sched);
+    if (on_phase_) on_phase_("encode", ci + 1, n_chunks);
   }
 
   RS_LOG_INFO("MossTD encoder: n_chunks=%d tokens/chunk=%d T_audio=%d n_embd=%d",
@@ -798,6 +799,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   if (auto t = result->get_input_tensor("causal_mask")) {
     result->set_causal_mask(t, total_T, 0);
   }
+  if (on_phase_) on_phase_("prefill", 0, (int)total_T);   // prefill starting
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
       GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("Qwen3ASR: LLM prefill compute failed");
@@ -809,6 +811,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     fprintf(stderr, "[prof] post-prefill-compute sched buffer: %.1f MB\n",
             ggml_backend_sched_get_buffer_size(sched, b0) / 1048576.0);
   }
+  if (on_phase_) on_phase_("decode", 0, 0);   // prefill done, decoding starts
 
   ggml_tensor *logits = result->get_logits();
   if (!logits) {
@@ -1169,9 +1172,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     const std::string dtext = llm_model_->vocab().detokenize(st.token_ids);
     if (on_token_) on_token_(dtext);
     // Duration/repeat stop: inspect the last complete "[N.NN]" timestamp. A jump
-    // backward past what we've already emitted means the decoder restarted the
-    // transcript (WASM EOS-boundary divergence -> duplicated segments); a value
-    // well beyond the audio means it's hallucinating past the end.
+    // FAR backward means the decoder restarted the transcript (WASM
+    // EOS-boundary divergence -> duplicated segments); a value well beyond the
+    // audio means it's hallucinating past the end. IMPORTANT: overlapping
+    // speech in real meetings legitimately yields small backward jumps (the
+    // next segment's start precedes the previous segment's end by several
+    // seconds), so the backward tolerance must scale with the window — a hard
+    // 0.6 s cut truncated real meeting windows. Restart jumps are ~the whole
+    // window; overlap jumps are a few seconds.
     if (audio_dur_s > 0.0) {
       const size_t rb = dtext.rfind(']');
       if (rb != std::string::npos && rb > 0) {
@@ -1181,7 +1189,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           char *endp = nullptr;
           const double ts = std::strtod(num.c_str(), &endp);
           if (endp != num.c_str() && *endp == '\0') {   // a pure-numeric [ts]
-            if (ts < max_ts_seen - 0.6 || ts > audio_dur_s + 2.0) {
+            const double back_tol =
+                std::max(5.0, std::min(20.0, 0.5 * audio_dur_s));
+            if (ts < max_ts_seen - back_tol || ts > audio_dur_s + 2.0) {
               ggml_backend_sched_reset(sched);
               break;
             }
