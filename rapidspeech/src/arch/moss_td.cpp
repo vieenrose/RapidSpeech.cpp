@@ -585,6 +585,24 @@ bool MossTDModel::Encode(const std::vector<float> &input_frames,
   }
   auto _te = std::chrono::steady_clock::now();
   bool ok = RunEncoder(mel, n_frames_padded, state, sched);
+  // HF parity: the reference encodes silence-padded 30 s chunks but SLICES
+  // each chunk's output to the real-sample token count ((n-1)//stride + 1,
+  // stride = hop*2*merge = 1280 samples/token) before the LLM sees it. The
+  // LLM was never trained on trailing-silence tokens; feeding them (partial
+  // last chunk, or the single-chunk RS_ENC_MARGIN) corrupts timestamps and
+  // destabilizes quantized decodes. Padding is contiguous at the tail, so a
+  // global tail truncation equals HF's per-chunk slicing.
+  if (ok && !input_frames.empty()) {
+    auto &st = static_cast<MossTDState &>(state);
+    const int stride = 160 * 2 * hparams_.merge_size;
+    const int keep = (int)((input_frames.size() - 1) / stride) + 1;
+    if (keep < st.T_audio) {
+      st.audio_embeds.resize((size_t)st.n_embd * keep);
+      RS_LOG_INFO("MossTD: sliced audio tokens %d -> %d (real-audio length)",
+                  st.T_audio, keep);
+      st.T_audio = keep;
+    }
+  }
   if (prof) {
     double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - _te).count();
@@ -684,9 +702,17 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   RS_LOG_INFO("Qwen3ASR DecodeWithLLM: prefix=%d audio=%d suffix=%d total=%d",
               n_prefix, audio_T, n_suffix, total_T);
 
+  // Decode budget scales with audio length: dense Mandarin runs ~7 chars/s
+  // (~1 token/char) plus timestamp tokens, so a fixed 512 cap silently
+  // truncated any dense window past ~80 s. 2/3 of the audio token count
+  // (12.5/s) allows ~8.3 text tokens/s; clamped so short clips keep the old
+  // budget and pathological inputs can't balloon the KV cache.
+  const int max_decode_tokens =
+      std::min(3072, std::max(MAX_DECODE_TOKENS, (audio_T * 2) / 3));
+
   // -------- (a) projection graph: build the [n_embd, total_T] LLM input --------
   llm_cparams cparams;
-  cparams.n_ctx          = total_T + MAX_DECODE_TOKENS;
+  cparams.n_ctx          = total_T + max_decode_tokens;
   cparams.n_batch        = total_T;
   cparams.n_ubatch       = total_T;
   cparams.n_threads      = 4;
@@ -920,7 +946,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   if (use_q8_kv) {
     RS_LOG_INFO("MossTD: RS_KV_Q8 set — persistent KV cache stored as q8_0");
   }
-  const int32_t n_kv_max = n_cached_tokens_ + MAX_DECODE_TOKENS;
+  const int32_t n_kv_max = n_cached_tokens_ + max_decode_tokens;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
   ggml_backend_buffer_t kv_gpu_buf = nullptr;
@@ -998,8 +1024,18 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_CONSECUTIVE_REPEAT = 10;
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
-  std::unordered_map<uint64_t, int> ngram_counts_;
-  constexpr float REPETITION_PENALTY = 1.10f;
+  // hash -> {hits while time stagnant, max_ts_seen at last hit}
+  struct NgramSeen { int count; double max_ts; };
+  std::unordered_map<uint64_t, NgramSeen> ngram_counts_;
+  // The HF reference decodes with plain greedy, but under Q4_K the very first
+  // format tokens sit on a knife edge: without a penalty the decode can lock
+  // into a degenerate style (timestamps pinned at 0.00, "[00:00:00]" artifacts,
+  // dropped speaker tags, bracket spam). A mild 1.10/64 penalty stabilizes
+  // that choice; validated clean on 12 s / 80 s / 180 s dense-meeting windows
+  // with the QAT q4 model (f16 is clean either way). RS_REP_PENALTY overrides
+  // (e.g. =1.0 for f16 parity runs).
+  const char *rp_env = std::getenv("RS_REP_PENALTY");
+  const float REPETITION_PENALTY = rp_env ? (float)std::atof(rp_env) : 1.10f;
   constexpr int PENALTY_WINDOW = 64;
 
   if (prof) {
@@ -1028,7 +1064,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
   double max_ts_seen = 0.0;
   auto _tdec = std::chrono::steady_clock::now();
-  for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
+  for (int step = 0; step < max_decode_tokens; ++step) {
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
     llm_build_opts dec_opts;
     dec_opts.output_mode    = llm_output_mode::OUTPUT_LOGITS;
@@ -1079,8 +1115,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0,
                             (size_t)n_vocab * sizeof(float));
 
-    // Repetition penalty over recent window.
-    {
+    // Repetition penalty over recent window (disabled unless RS_REP_PENALTY).
+    if (REPETITION_PENALTY != 1.0f) {
       int p_start = std::max(0, (int)st.token_ids.size() - PENALTY_WINDOW);
       std::unordered_set<int32_t> recent;
       for (int p = p_start; p < (int)st.token_ids.size(); ++p) {
@@ -1204,8 +1240,12 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     // Loop breaker: the greedy decoder can cycle on silence-padded / short
     // audio (esp. under WASM SIMD numerics), repeating whole segments. The
     // repeats carry *different* timestamps, so an exact-block check misses
-    // them — instead count content n-grams: if any 8-token window recurs a
-    // 3rd time, the transcription is looping. Stop and drop the repeated tail.
+    // them — instead count content n-grams. But real speech repeats too:
+    // council meetings re-read motions verbatim, so an n-gram recurring is
+    // only a loop if the transcript CLOCK has stalled. Count a recurrence
+    // only when max_ts_seen advanced < 2 s since the same n-gram's last hit
+    // (a legit re-read arrives tens of seconds later; a stuck loop that DOES
+    // advance time runs into the `ts > audio_dur+2` guard above instead).
     {
       const auto &tk = st.token_ids;
       const int nsz = (int)tk.size();
@@ -1215,8 +1255,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           h ^= (uint64_t)(uint32_t)tk[j];
           h *= 1099511628211ULL;
         }
-        if (++ngram_counts_[h] >= 3) {
-          RS_LOG_WARN("MossTD: repeated content n-gram x3 — stopping (loop breaker)");
+        auto it = ngram_counts_.find(h);
+        if (it == ngram_counts_.end()) {
+          ngram_counts_.emplace(h, NgramSeen{1, max_ts_seen});
+        } else if (max_ts_seen >= it->second.max_ts + 2.0) {
+          it->second = NgramSeen{1, max_ts_seen};   // time moved on: not a loop
+        } else if (++it->second.count >= 3) {
+          RS_LOG_WARN("MossTD: repeated content n-gram x3 with stalled "
+                      "timestamps — stopping (loop breaker)");
           ggml_backend_sched_reset(sched);
           break;
         }

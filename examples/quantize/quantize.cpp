@@ -233,6 +233,8 @@ static void rs_print_usage(const char *argv0) {
   std::fprintf(stderr, "  --token-embedding-type <type>  Force embed_tokens.weight to this type (overrides\n");
   std::fprintf(stderr, "                                 both --pure and K_M / IQ_M bumps).\n");
   std::fprintf(stderr, "  --output-tensor-type <type>    Force lm_head / ctc_lo / ctc_out_linear to this type.\n");
+  std::fprintf(stderr, "  --tensor-type PATTERN=TYPE     Force TYPE on weights whose name matches the regex\n");
+  std::fprintf(stderr, "                                 PATTERN (repeatable; first match wins).\n");
   std::fprintf(stderr, "  --threads <n>                  Number of quantization threads (default 4).\n\n");
   std::fprintf(stderr, "Quantization types:\n");
   ggml_print_ftypes(stderr);
@@ -284,6 +286,19 @@ int main(int argc, char **argv) {
         return 1;
       }
       cli_opts.output_tensor_type = t;
+    } else if (strcmp(argv[i], "--tensor-type") == 0 && i + 1 < argc) {
+      // PATTERN=TYPE (llama.cpp-style), e.g. --tensor-type 'layers\.27\.=q8_0'
+      std::string arg = argv[++i];
+      size_t eq = arg.rfind('=');
+      ggml_type t = eq == std::string::npos
+                        ? GGML_TYPE_COUNT
+                        : parse_qtype_name(arg.substr(eq + 1).c_str());
+      if (t == GGML_TYPE_COUNT) {
+        RS_QUANTIZE_LOG_ERROR("--tensor-type wants PATTERN=TYPE, got: %s",
+                              arg.c_str());
+        return 1;
+      }
+      cli_opts.tensor_type_overrides.emplace_back(arg.substr(0, eq), t);
     } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
       cli_opts.nthread = atoi(argv[++i]);
       if (cli_opts.nthread < 1) cli_opts.nthread = 1;

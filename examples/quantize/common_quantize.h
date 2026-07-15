@@ -38,6 +38,9 @@ void ggml_print_ftypes(FILE *fp = stderr);
 //                           means "unset".
 //   output_tensor_type    — same, but for OUTPUT (lm_head.weight, ctc.ctc_lo,
 //                           ctc_out_linear).
+//   tensor_type_overrides — (regex, type) pairs; a weight whose name matches
+//                           a regex (std::regex_search) is forced to that
+//                           type. First match wins; beats every other rule.
 struct rs_quantize_options {
   enum ggml_ftype ftype = GGML_FTYPE_ALL_F32;
   int nthread = 4;
@@ -47,6 +50,7 @@ struct rs_quantize_options {
   bool pure = false;
   enum ggml_type token_embedding_type = GGML_TYPE_COUNT;
   enum ggml_type output_tensor_type   = GGML_TYPE_COUNT;
+  std::vector<std::pair<std::string, enum ggml_type>> tensor_type_overrides;
 };
 
 // Quantize a GGUF model: read fname_inp, quantize weight tensors, write

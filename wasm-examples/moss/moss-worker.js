@@ -203,6 +203,7 @@ if (globalThis.name !== "em-pthread") {
         if (!transcribePcm) { postMessage({ type: "error", error: "not ready" }); return; }
         const pcm = new Float32Array(msg.pcm);           // transferred buffer
         const ptr = Module._malloc(pcm.length * 4);
+        if (!ptr) throw new Error(`malloc failed for ${pcm.length * 4} bytes (window pcm)`);
         new Float32Array(Module.HEAPF32.buffer, ptr, pcm.length).set(pcm);
         // While this runs, C++ posts {type:"moss_token", text} per token.
         let text = transcribePcm(ptr, pcm.length, msg.nTok, 1 /*stream*/, msg.prompt);
@@ -210,6 +211,12 @@ if (globalThis.name !== "em-pthread") {
         Module._free(ptr);
 
         // Parse segments and embed each (for cross-window speaker linking).
+        // Strip stray [hh:mm:ss] artifacts the QAT model occasionally emits —
+        // they carry no info and would break the [start][Sxx] segment regex.
+        text = text.replace(/\[\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\]/g, "");
+        // ... and collapse doubled open-brackets ("[0.25][[S01]", a QAT-model
+        // first-segment quirk) so the [start][Sxx] regex still matches.
+        text = text.replace(/\[+\[/g, "[");
         const durS = msg.durS;
         const raw = []; let m;
         SEG_RE.lastIndex = 0;

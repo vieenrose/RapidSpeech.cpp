@@ -223,7 +223,10 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
   //    variable-length, and 8-alignment satisfies conv2 (stride 2) + merge-4 so
   //    it produces exactly ceil(real/8) tokens without processing silence.
   //    For longer audio keep uniform chunk-sized chunks.
-  const int n_eff   = std::min(n_frames, (int)pcm.size() / hop + 1);
+  // ceil, NOT +1: for exact-multiple durations (e.g. 180.00 s) a spurious
+  // extra frame rounded the chunk count up, appending an entire 30 s
+  // all-silence chunk (375 dead audio tokens the HF reference never sees).
+  const int n_eff   = std::min(n_frames, (int)((pcm.size() + hop - 1) / hop));
   const int ENC_ALIGN = 8;   // conv2 stride-2 (even) * merge-4
   // RS_NO_ENC_TRUNC=1 restores full chunk-sized padding (30 s) for A/B accuracy
   // comparison against the encoder-truncation optimization.
@@ -245,16 +248,19 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
     n_out_frames = n_chunks * chunk;
   }
 
-  out.assign((size_t)n_mels * n_out_frames, 0.0f);
+  // Pad with the NORMALIZED SILENCE FLOOR, not 0.0: the HF reference pads the
+  // raw audio with zeros, whose log-mel clamps to (mmax-8) and normalizes to
+  // (mmax-4)/4. The MOSS encoder is bidirectional within a chunk with NO
+  // padding mask, so real frames in a partial last chunk attend to the pad
+  // region — 0.0 there is out-of-distribution and corrupts that chunk's
+  // tokens (broken timestamps, unstable quantized decodes).
+  const float pad_v = (floor_v + 4.0f) / 4.0f;
+  out.assign((size_t)n_mels * n_out_frames, pad_v);
   const int n_copy = std::min(n_eff, n_frames);
   for (int m = 0; m < n_mels; ++m) {
     std::memcpy(out.data() + (size_t)m * n_out_frames,
                 log_mel.data() + (size_t)m * n_frames,
                 (size_t)n_copy * sizeof(float));
-    // Trailing frames stay zero-filled (the floor value of normalized log-mel
-    // is 0, since (mmax-8 + 4)/4 - we put 0 which is below the floor — but
-    // the encoder ignores these positions via chunk masking, so the exact
-    // value does not matter).
   }
   return n_out_frames;
 }

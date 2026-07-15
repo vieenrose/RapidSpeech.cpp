@@ -381,6 +381,17 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
   // caller can force a specific qtype on embed_tokens / lm_head / ctc_lo
   // regardless of the default policy.  Skip the dimensionality/weight check
   // for these — categorize_tensor already constrains to known weight names.
+  // Pattern overrides only apply to matmul-shaped weights: 1-D tensors
+  // (norm scales, biases) matched by a broad pattern like "layers\.27\."
+  // must stay f32 — element-wise ops (ggml_mul in RMSNorm) assert on
+  // quantized operands.
+  if (ggml_n_dims(tensor) >= 2) {
+    for (const auto &ov : opts.tensor_type_overrides) {
+      if (std::regex_search(name, std::regex(ov.first))) {
+        return pick(ov.second);
+      }
+    }
+  }
   if (cat == tensor_category::TOKEN_EMBD &&
       opts.token_embedding_type != GGML_TYPE_COUNT) {
     return pick(opts.token_embedding_type);
