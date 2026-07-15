@@ -34,7 +34,26 @@ const SR = 16000, N_MEL = 80, N_FRAMES = 3000;
 // (cross-window CAM++ linking keeps speaker IDs consistent regardless).
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-const WASM_VARIANT = IS_IOS ? "ios" : "mt";
+// ?gpu=1 opts into the experimental WebGPU build (Dawn/emscripten): the
+// scheduler streams weights to the GPU for large-batch ops, so PREFILL runs
+// on the GPU while single-token decode stays on CPU. Requires a browser with
+// WebGPU (Chrome/Edge; chrome://gpu to verify). Falls back to CPU inside the
+// engine if no adapter is found.
+const WANT_GPU = !IS_IOS && !!new URLSearchParams(location.search).get("gpu");
+let WASM_VARIANT = IS_IOS ? "ios" : "mt";   // may become "gpu" after preflight
+// The WebGPU backend requires the shader-f16 adapter feature and ABORTS the
+// whole module without it (software adapters like SwiftShader lack f16), so
+// gate the gpu build behind an adapter preflight instead of crashing.
+async function gpuPreflight() {
+  if (!WANT_GPU) return;
+  try {
+    const a = navigator.gpu && await navigator.gpu.requestAdapter();
+    if (a && a.features.has("shader-f16")) { WASM_VARIANT = "gpu"; return; }
+    setModelState("", "WebGPU adapter missing shader-f16 — using CPU build.");
+  } catch {
+    setModelState("", "WebGPU unavailable — using CPU build.");
+  }
+}
 // Window size: user-selectable 90/180/300 s (default 180, like the ORT demo —
 // 300 s peaks ~3 GB in-WASM and can fail on long meetings). iOS is memory-capped
 // so it always uses a single 28 s chunk; cross-window CAM++ linking keeps
@@ -314,11 +333,13 @@ function setModelState(cls, msg) {
 function ensureModel() {
   if (modelReady) return Promise.resolve();
   if (modelPromise) return modelPromise;
-  modelPromise = new Promise((resolve, reject) => {
+  modelPromise = new Promise(async (resolve, reject) => {
     $("btn-load").disabled = true;
     setModelState("loading", "Loading WASM runtime…");
     $("dl-bars").innerHTML =
       `<div>Q4_K GGUF<progress id="pg-model" max="100" value="0"></progress></div>`;
+    await gpuPreflight();
+    if (WASM_VARIANT === "gpu") setModelState("loading", "Loading WASM runtime (WebGPU)…");
     worker = new Worker(`./moss-worker.js?wasm=${WASM_VARIANT}`);
     worker.onerror = () => {
       setModelState("", "Worker failed to start."); modelPromise = null;

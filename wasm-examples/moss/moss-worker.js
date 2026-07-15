@@ -21,8 +21,10 @@
 // refuses large shared-memory reservations). Passed by the page as
 // moss-worker.js?wasm=ios; pthread re-spawns reuse the same URL, so every
 // pthread worker loads the same variant.
-const WASM_VARIANT =
-  new URLSearchParams(self.location.search).get("wasm") === "ios" ? "ios" : "mt";
+const WASM_VARIANT = (() => {
+  const v = new URLSearchParams(self.location.search).get("wasm");
+  return v === "ios" || v === "gpu" ? v : "mt";
+})();
 importScripts(`./rapidspeech-wasm-${WASM_VARIANT}.js`);
 
 if (globalThis.name !== "em-pthread") {
