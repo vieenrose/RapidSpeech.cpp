@@ -74,13 +74,17 @@ endif()
 # Performance flags for the WHOLE tree (ggml + rapidspeech), set BEFORE
 # add_subdirectory(ggml) so ggml's targets inherit them.
 #   -msimd128       : 128-bit WASM SIMD (ggml's vectorized quant/mul_mat kernels).
-#   -mrelaxed-simd  : lets LLVM fuse mul+add into relaxed FMA and use relaxed
-#                     integer dot-products in the hot quantized matmul loops.
 #   -O3 at LINK     : REQUIRED for emscripten to run the Binaryen wasm-opt pass;
 #                     CMAKE_BUILD_TYPE=Release only sets -O3 for COMPILE, so
 #                     without this the final .wasm is left largely unoptimized.
-add_compile_options(-msimd128 -mrelaxed-simd)
-add_link_options(-O3 -msimd128 -mrelaxed-simd)
+# NOTE: do NOT add -mrelaxed-simd here. It measured ZERO speedup (clang only
+# auto-emits a few relaxed FMAs; ggml's hot loops are hand-written intrinsics)
+# but makes the module UNPARSEABLE on engines without relaxed-SIMD — older iOS
+# Safari aborted with "CompileError: relaxed simd instructions not supported".
+# If relaxed-dot kernels are ever hand-written, gate them to a separate
+# desktop-only build variant.
+add_compile_options(-msimd128)
+add_link_options(-O3 -msimd128)
 
 # Pass Emscripten flags to ggml
 set(GGML_WASM_SINGLE_FILE ON CACHE BOOL "ggml: single-file WASM" FORCE)
