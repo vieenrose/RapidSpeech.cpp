@@ -247,6 +247,8 @@ function renderLegend() {
 }
 
 function renderTranscript(tail = "") {
+  // Expose current segments for harnesses/debugging (times in seconds).
+  try { window.__segs = segs.map(x => ({ s: x.start, e: x.end, spk: x.speaker, t: x.text })); } catch {}
   const color = colorsFor(segs);
   const box = $("transcript");
   box.innerHTML = (segs.map((s, i) =>
