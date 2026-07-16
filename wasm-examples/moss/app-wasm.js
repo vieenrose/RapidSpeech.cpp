@@ -48,12 +48,29 @@ const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
 const GPU_PARAM = new URLSearchParams(location.search).get("gpu");
 const WANT_GPU = !IS_IOS && GPU_PARAM !== "0" && GPU_PARAM !== null;
 const AUTO_GPU = !IS_IOS && GPU_PARAM === null;
-let WASM_VARIANT = IS_IOS ? "ios" : "mt";   // may become "gpu" after preflight
+let WASM_VARIANT = IS_IOS ? "ios" : "mt";   // may become "gpu"/"mtx" after preflight
+// Relaxed-SIMD probe: a minimal module using f32x4.relaxed_madd (opcode
+// 0x105). Valid only where the engine implements the relaxed-simd proposal
+// (desktop Chrome/Edge/Firefox); older iOS Safari rejects it — which is why
+// the default builds strip the flag and this loads a separate mtx variant
+// (~relaxed-dot q4_K kernels, measurably faster decode).
+const HAS_RELAXED_SIMD = (() => {
+  try {
+    // () -> v128: three v128.const 0 then f32x4.relaxed_madd (0xFD 0x105)
+    const z = [0xfd, 0x0c, ...Array(16).fill(0)];
+    const body = [0x00, ...z, ...z, ...z, 0xfd, 0x85, 0x02, 0x0b];
+    return WebAssembly.validate(new Uint8Array([
+      0,97,115,109,1,0,0,0, 1,5,1,96,0,1,123, 3,2,1,0,
+      10, body.length + 2, 1, body.length, ...body
+    ]));
+  } catch { return false; }
+})();
 let GPU_IS_INTEL = false;
 // The WebGPU backend requires the shader-f16 adapter feature and ABORTS the
 // whole module without it (software adapters like SwiftShader lack f16), so
 // gate the gpu build behind an adapter preflight instead of crashing.
 async function gpuPreflight() {
+  if (!IS_IOS && HAS_RELAXED_SIMD && WASM_VARIANT === "mt") WASM_VARIANT = "mtx";
   if (IS_IOS || GPU_PARAM === "0") return;
   try {
     const a = navigator.gpu && await navigator.gpu.requestAdapter();

@@ -23,7 +23,7 @@
 // pthread worker loads the same variant.
 const WASM_VARIANT = (() => {
   const v = new URLSearchParams(self.location.search).get("wasm");
-  return v === "ios" || v === "gpu" ? v : "mt";
+  return v === "ios" || v === "gpu" || v === "mtx" ? v : "mt";
 })();
 importScripts(`./rapidspeech-wasm-${WASM_VARIANT}.js`);
 

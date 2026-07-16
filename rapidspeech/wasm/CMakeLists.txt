@@ -85,6 +85,15 @@ endif()
 # desktop-only build variant.
 add_compile_options(-msimd128)
 add_link_options(-O3 -msimd128)
+# Relaxed SIMD (desktop-Chrome-only variant): maps relaxed_dot/madd to real
+# FMA/dot hardware — big win in the quant vec_dot kernels. NOT for the default
+# builds: auto-emitted relaxed opcodes CompileError on older iOS Safari, so
+# the page feature-detects and only loads this variant where supported.
+option(RS_WASM_RELAXED_SIMD "Enable WASM relaxed-simd (desktop-only variant)" OFF)
+if (RS_WASM_RELAXED_SIMD)
+    add_compile_options(-mrelaxed-simd)
+    add_link_options(-mrelaxed-simd)
+endif()
 
 # Pass Emscripten flags to ggml
 set(GGML_WASM_SINGLE_FILE ON CACHE BOOL "ggml: single-file WASM" FORCE)
