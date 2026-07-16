@@ -391,11 +391,18 @@ async function benchWorkers(n, ms) {
   ws.forEach(w => w.terminate()); URL.revokeObjectURL(url);
   return total;
 }
+function labelAuto(n) {   // show the measured pick in the dropdown
+  const opt = document.querySelector('#threads-sel option[value="0"]');
+  if (opt) opt.textContent = `auto (${n})`;
+}
 async function calibrateThreads() {
   const hc = Math.min(navigator.hardwareConcurrency || 4, 16);
   if (hc <= 4) return hc;
   const key = `moss-threads-v1-${hc}`;
-  try { const c = +localStorage.getItem(key); if (c > 0) return c; } catch {}
+  if (new URLSearchParams(location.search).get("recalibrate") !== null) {
+    try { localStorage.removeItem(key); } catch {}
+  }
+  try { const c = +localStorage.getItem(key); if (c > 0) { labelAuto(c); return c; } } catch {}
   const cands = [...new Set([4, 6, 8, Math.min(12, hc), hc])].filter(n => n <= hc).sort((a, b) => a - b);
   setModelState("loading", "Calibrating CPU threads…");
   let best = hc, bestScore = 0;
@@ -406,6 +413,7 @@ async function calibrateThreads() {
   }
   try { localStorage.setItem(key, String(best)); } catch {}
   console.log(`[calibrate] threads=${best} of ${hc} (candidates ${cands.join(",")})`);
+  labelAuto(best);
   return best;
 }
 
