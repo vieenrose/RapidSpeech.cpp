@@ -310,9 +310,18 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
       have_gpu &&
       ((arch == "Qwen3ASR" && getenv("RS_QWEN3ASR_SPLIT") != nullptr) ||
        (arch == "MossTD" && getenv("RS_MOSS_GPU_WEIGHTS") == nullptr &&
-        (getenv("RS_MOSS_SPLIT") != nullptr || !moss_embed_gpu_ok)));
-  auto is_encoder_tensor = [](const char *nm) {
-    return nm && (strncmp(nm, "a.", 2) == 0 || strncmp(nm, "mm.", 3) == 0);
+        (getenv("RS_MOSS_SPLIT") != nullptr ||
+         getenv("RS_MOSS_ENC_CPU") != nullptr || !moss_embed_gpu_ok)));
+  // RS_MOSS_ENC_CPU=1 INVERTS the split: encoder/adaptor stay on CPU and the
+  // LLM goes to GPU. Rationale (Jetson Nano): the encoder's long-sequence
+  // attention kernels on a display-driving Tegra exceed the CUDA launch
+  // watchdog on >30 s windows, while LLM prefill/decode kernels are small and
+  // batch-tiled; this placement dodges the watchdog and keeps the ~2.5x GPU
+  // decode win. Requires a get_rows-compatible token embed (embq8 gguf).
+  const bool enc_cpu = getenv("RS_MOSS_ENC_CPU") != nullptr;
+  auto is_encoder_tensor = [enc_cpu](const char *nm) {
+    const bool enc = nm && (strncmp(nm, "a.", 2) == 0 || strncmp(nm, "mm.", 3) == 0);
+    return enc_cpu ? !enc : enc;   // inverted: GPU group = everything BUT encoder
   };
   if (split_weights) {
     ggml_backend_t gpu_be = ctx->backends[0];
