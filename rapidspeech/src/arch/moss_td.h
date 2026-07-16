@@ -183,6 +183,7 @@ private:
   std::string user_input_prompt_;
   std::string cached_user_input_prompt_;
   std::vector<int32_t> cached_prefix_tokens_;
+  std::map<int32_t, std::vector<float>> digit_embd_cache_;  // time-marker digit embeds
   std::vector<int32_t> cached_suffix_tokens_;
   int32_t audio_start_id_ = -1;
   std::function<void(const std::string &)> on_token_;  // streaming hook

@@ -697,7 +697,44 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const auto &suffix_tokens = cached_suffix_tokens_;
   const int n_prefix = (int)prefix_tokens.size();
   const int n_suffix = (int)suffix_tokens.size();
-  const int total_T  = n_prefix + audio_T + n_suffix;
+
+  // Time markers (HF processor parity): the model is TRAINED with absolute-
+  // time digit tokens interleaved into the audio span every 2 s (25 audio
+  // tokens per marker at 12.5 tok/s) — e.g. ...25 audio toks..."2"...25..."4".
+  // Omitting them (as this port did originally) makes the model infer time
+  // without its trained clock. span[i] = -1 marks an audio-embedding slot,
+  // otherwise a digit token id. RS_NO_TIME_MARKERS restores the old span.
+  std::vector<int32_t> span;
+  {
+    const bool no_markers = std::getenv("RS_NO_TIME_MARKERS") != nullptr;
+    const int every_s = 2, tok_per_marker = 25;   // int(12.5 * every_s)
+    static int32_t digit_ids[10];
+    static bool digits_ok = false;
+    if (!digits_ok) {
+      bool ok = true;
+      for (int d = 0; d < 10; ++d) {
+        auto t = llm_model_->vocab().tokenize(std::string(1, char('0' + d)), false);
+        if (t.size() != 1) { ok = false; break; }
+        digit_ids[d] = t[0];
+      }
+      digits_ok = ok;
+    }
+    if (no_markers || !digits_ok) {
+      span.assign(audio_T, -1);
+    } else {
+      const double duration = audio_T / 12.5;
+      int consumed = 0;
+      for (int sec = every_s; sec <= (int)duration; sec += every_s) {
+        const int pos = (sec / every_s) * tok_per_marker;
+        for (int i = consumed; i < pos && i < audio_T; ++i) span.push_back(-1);
+        consumed = std::max(consumed, std::min(pos, audio_T));
+        for (char c : std::to_string(sec)) span.push_back(digit_ids[c - '0']);
+      }
+      for (int i = consumed; i < audio_T; ++i) span.push_back(-1);
+    }
+  }
+  const int span_T   = (int)span.size();
+  const int total_T  = n_prefix + span_T + n_suffix;
 
   RS_LOG_INFO("Qwen3ASR DecodeWithLLM: prefix=%d audio=%d suffix=%d total=%d",
               n_prefix, audio_T, n_suffix, total_T);
@@ -769,11 +806,69 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     return false;
   }
 
-  std::vector<float> llm_in_host((size_t)n_embd * total_T);
-  ggml_backend_tensor_get(llm_in, llm_in_host.data(), 0,
-                          llm_in_host.size() * sizeof(float));
+  // Contiguous prefix+audio+suffix staging buffer (marker-free layout).
+  const int stage_T = n_prefix + audio_T + n_suffix;
+  std::vector<float> stage_host((size_t)n_embd * stage_T);
+  ggml_backend_tensor_get(llm_in, stage_host.data(), 0,
+                          stage_host.size() * sizeof(float));
   ggml_free(ctx_proj);
   ggml_backend_sched_reset(sched);
+
+  // Interleave marker digit-token embeddings into the audio span. Digit
+  // embeddings are fetched once via a tiny get_rows graph and cached.
+  std::vector<float> llm_in_host((size_t)n_embd * total_T);
+  {
+    if (digit_embd_cache_.empty()) {
+      std::vector<int32_t> uniq;
+      for (int32_t t : span) if (t >= 0) uniq.push_back(t);
+      std::sort(uniq.begin(), uniq.end());
+      uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+      if (!uniq.empty()) {
+        struct ggml_init_params dp = {
+            64 * ggml_tensor_overhead() + (1u << 18), nullptr, true};
+        ggml_context *ctx_d = ggml_init(dp);
+        ggml_cgraph *gf_d = ggml_new_graph(ctx_d);
+        ggml_tensor *ids = ggml_new_tensor_1d(ctx_d, GGML_TYPE_I32, (int)uniq.size());
+        ggml_set_input(ids);
+        ggml_tensor *emb = ggml_get_rows(ctx_d, llm_model_->tok_embd(), ids);
+        ggml_set_output(emb);
+        ggml_build_forward_expand(gf_d, emb);
+        if (ggml_backend_sched_alloc_graph(sched, gf_d)) {
+          ggml_backend_tensor_set(ids, uniq.data(), 0, uniq.size() * sizeof(int32_t));
+          if (ggml_backend_sched_graph_compute(sched, gf_d) == GGML_STATUS_SUCCESS) {
+            std::vector<float> rows((size_t)n_embd * uniq.size());
+            ggml_backend_tensor_get(emb, rows.data(), 0, rows.size() * sizeof(float));
+            for (size_t i = 0; i < uniq.size(); ++i)
+              digit_embd_cache_[uniq[i]] = std::vector<float>(
+                  rows.begin() + i * n_embd, rows.begin() + (i + 1) * n_embd);
+          }
+        }
+        ggml_free(ctx_d);
+        ggml_backend_sched_reset(sched);
+      }
+    }
+    const float *stage = stage_host.data();
+    float *out = llm_in_host.data();
+    memcpy(out, stage, (size_t)n_embd * n_prefix * sizeof(float));
+    out += (size_t)n_embd * n_prefix;
+    const float *audio_rows = stage + (size_t)n_embd * n_prefix;
+    int a = 0;
+    for (int32_t t : span) {
+      if (t < 0) {
+        memcpy(out, audio_rows + (size_t)n_embd * a, n_embd * sizeof(float));
+        ++a;
+      } else {
+        auto it = digit_embd_cache_.find(t);
+        if (it != digit_embd_cache_.end())
+          memcpy(out, it->second.data(), n_embd * sizeof(float));
+        else
+          memset(out, 0, n_embd * sizeof(float));
+      }
+      out += n_embd;
+    }
+    memcpy(out, stage + (size_t)n_embd * (n_prefix + audio_T),
+           (size_t)n_embd * n_suffix * sizeof(float));
+  }
 
   // -------- (b) Prefill LLM with the spliced embeddings --------
   const bool prof = std::getenv("RS_PROFILE") != nullptr;
