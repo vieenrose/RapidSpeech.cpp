@@ -157,6 +157,20 @@
         <label for="hotwords">Hotwords <small>(names/terms to bias recognition, comma-separated — e.g. 蔡其昌, 高端疫苗)</small></label><br>
         <input type="text" id="hotwords" placeholder="熱詞 / hotwords…" style="width:100%;max-width:560px;margin-top:2px">
       </div>
+      <div style="margin-top:8px;font-size:.85rem">
+        Threads:
+        <select id="threads-sel" style="margin-left:4px">
+          <option value="0" selected>auto</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+          <option value="12">12</option>
+          <option value="16">16</option>
+        </select>
+        <small style="margin-left:6px">CPU workers — fewer can be FASTER on hybrid
+        laptops (P+E cores); takes effect at model load (reload page to change after)</small>
+      </div>
       <div id="win-row" style="margin-top:8px;font-size:.85rem">
         Window:
         <label><input type="radio" name="win" value="90"> Fast 1.5 min</label>

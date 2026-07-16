@@ -450,7 +450,9 @@ function ensureModel() {
     // When the GPU auto-enabled on an Intel adapter, default to ~P-core-count
     // threads: hybrid Intel laptops pace every ggml barrier at their slowest
     // low-power E-core, and 6 threads + GPU is the measured-best config.
-    let threads = +(new URLSearchParams(location.search).get("threads") || 0);
+    // Priority: ?threads= URL param > UI dropdown > auto heuristics.
+    let threads = +(new URLSearchParams(location.search).get("threads") || 0) ||
+                  +(document.getElementById("threads-sel")?.value || 0);
     if (!threads && WASM_VARIANT === "gpu" && GPU_IS_INTEL &&
         (navigator.hardwareConcurrency || 0) > 8) {
       threads = 6;
