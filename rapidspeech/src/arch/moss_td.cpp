@@ -986,7 +986,11 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // (~885 MB for a 280 s window) between the prefill graph teardown and the
   // persistent-KV upload. The default f32 path is byte-identical to before.
   const size_t q8_row = ggml_row_size(GGML_TYPE_Q8_0, kv_dim);
+  const bool use_f16_kv_pref = !use_q8_kv && getenv("RS_KV_F32") == nullptr;
+  const size_t f16_row_pref = ggml_row_size(GGML_TYPE_F16, kv_dim);
   std::vector<std::vector<uint8_t>> host_q8_k, host_q8_v;
+  std::vector<std::vector<uint8_t>> host_f16_k, host_f16_v;
+  if (use_f16_kv_pref) { host_f16_k.assign(n_layer, {}); host_f16_v.assign(n_layer, {}); }
   host_kv_cache_k_.assign(n_layer, {});
   host_kv_cache_v_.assign(n_layer, {});
   {
@@ -1019,6 +1023,17 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           ggml_quantize_chunk(GGML_TYPE_Q8_0, stage.data(), host_q8_v[il].data(),
                               0, n_cached_tokens_, kv_dim, nullptr);
         }
+      } else if (use_f16_kv_pref) {
+        // f16 snapshot: read f32 layer, cast to f16 into byte staging.
+        if (stage.empty()) stage.resize((size_t)kv_dim * n_cached_tokens_);
+        host_f16_k[il].resize(f16_row_pref * (size_t)n_cached_tokens_);
+        host_f16_v[il].resize(f16_row_pref * (size_t)n_cached_tokens_);
+        ggml_backend_tensor_get(k_out, stage.data(), 0, kv_bytes);
+        ggml_fp32_to_fp16_row(stage.data(), (ggml_fp16_t *)host_f16_k[il].data(),
+                              (size_t)kv_dim * n_cached_tokens_);
+        ggml_backend_tensor_get(v_out, stage.data(), 0, kv_bytes);
+        ggml_fp32_to_fp16_row(stage.data(), (ggml_fp16_t *)host_f16_v[il].data(),
+                              (size_t)kv_dim * n_cached_tokens_);
       } else {
         host_kv_cache_k_[il].resize(kv_bytes / sizeof(float));
         host_kv_cache_v_[il].resize(kv_bytes / sizeof(float));
@@ -1037,7 +1052,19 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // near-lossless for attention. kv_dim (=head_dim*n_head_kv=128*8=1024) is a
   // multiple of QK8_0=32, so q8_0 row quantization is exact-shape. Other archs
   // (qwen3_asr, funasr-nano) don't run this code path and are unaffected.
-  const ggml_type kv_type = use_q8_kv ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+  // KV storage type: f32 (reference) / f16 (RS_KV_F16 — half memory, plain
+  // cast, no block-quant staging cost, timestamps preserved; llama.cpp's
+  // default) / q8_0 (RS_KV_Q8 — smallest, but whole-second timestamp snapping
+  // + ~3% text drift measured; keep for tight heaps only).
+  // f16 is the DEFAULT (half of f32, sub-second timestamps preserved, ~7%
+  // decode cost); RS_KV_F32 opts back into the reference format.
+  const bool use_f16_kv = !use_q8_kv && getenv("RS_KV_F32") == nullptr;
+  const ggml_type kv_type = use_q8_kv ? GGML_TYPE_Q8_0
+                          : use_f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
+  if (use_f16_kv) {
+    RS_LOG_INFO("MossTD: persistent KV cache stored as f16 (default; "
+                "RS_KV_F32/RS_KV_Q8 override)");
+  }
   if (use_q8_kv) {
     RS_LOG_INFO("MossTD: RS_KV_Q8 set — persistent KV cache stored as q8_0");
   }
@@ -1081,6 +1108,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         }
         std::vector<uint8_t>().swap(host_q8_k[il]);
         std::vector<uint8_t>().swap(host_q8_v[il]);
+      } else if (use_f16_kv) {
+        const size_t fbytes = ggml_row_size(GGML_TYPE_F16, kv_dim) * (size_t)n_cached_tokens_;
+        if (host_f16_k[il].size() == fbytes) {
+          ggml_backend_tensor_set(gpu_kv_k_vec[il], host_f16_k[il].data(), 0, fbytes);
+          ggml_backend_tensor_set(gpu_kv_v_vec[il], host_f16_v[il].data(), 0, fbytes);
+        }
+        std::vector<uint8_t>().swap(host_f16_k[il]);
+        std::vector<uint8_t>().swap(host_f16_v[il]);
       } else {
         size_t bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
         ggml_backend_tensor_set(gpu_kv_k_vec[il],
@@ -1258,6 +1293,10 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     const size_t off_q8        = (size_t)n_cached_tokens_ * q8_row;
     std::vector<uint8_t> q8_col;
     if (use_q8_kv) q8_col.resize(q8_row);
+    const size_t f16_row = ggml_row_size(GGML_TYPE_F16, kv_dim);
+    const size_t off_f16 = (size_t)n_cached_tokens_ * f16_row;
+    std::vector<uint8_t> f16_col;
+    if (use_f16_kv) f16_col.resize(f16_row);
     for (int il = 0; il < n_layer; ++il) {
       ggml_tensor *k_out = dec->get_kv_output_k(il);
       ggml_tensor *v_out = dec->get_kv_output_v(il);
@@ -1275,6 +1314,11 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         ggml_quantize_chunk(GGML_TYPE_Q8_0, kv_stage_v.data(), q8_col.data(),
                             0, 1, kv_dim, nullptr);
         ggml_backend_tensor_set(gpu_kv_v_vec[il], q8_col.data(), off_q8, q8_row);
+      } else if (use_f16_kv) {
+        ggml_fp32_to_fp16_row(kv_stage_k.data(), (ggml_fp16_t *)f16_col.data(), kv_dim);
+        ggml_backend_tensor_set(gpu_kv_k_vec[il], f16_col.data(), off_f16, f16_row);
+        ggml_fp32_to_fp16_row(kv_stage_v.data(), (ggml_fp16_t *)f16_col.data(), kv_dim);
+        ggml_backend_tensor_set(gpu_kv_v_vec[il], f16_col.data(), off_f16, f16_row);
       } else {
         ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(), off_f32,
                                 new_bytes_f32);
