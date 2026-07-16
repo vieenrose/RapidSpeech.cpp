@@ -375,6 +375,40 @@ function setModelState(cls, msg) {
 
 // Create the worker, download the GGUF (streaming, progress) and init the model.
 // Guarded so it runs at most once; safe to await from multiple entry points.
+// Measure the best thread count for THIS device (see init comment). Spawns
+// n workers each hammering a f64 mul-add loop for `ms`, sums iterations.
+async function benchWorkers(n, ms) {
+  const src = `onmessage = (e) => {
+    const end = performance.now() + e.data; let x = 1.000001, it = 0;
+    while (performance.now() < end) { for (let i = 0; i < 5e4; i++) x = x * 1.000001 + 1e-9; it++; }
+    postMessage(it + x * 0);
+  };`;
+  const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+  const ws = Array.from({ length: n }, () => new Worker(url));
+  const total = (await Promise.all(ws.map(w => new Promise(res => {
+    w.onmessage = (e) => res(e.data); w.postMessage(ms);
+  })))).reduce((a, b) => a + b, 0);
+  ws.forEach(w => w.terminate()); URL.revokeObjectURL(url);
+  return total;
+}
+async function calibrateThreads() {
+  const hc = Math.min(navigator.hardwareConcurrency || 4, 16);
+  if (hc <= 4) return hc;
+  const key = `moss-threads-v1-${hc}`;
+  try { const c = +localStorage.getItem(key); if (c > 0) return c; } catch {}
+  const cands = [...new Set([4, 6, 8, Math.min(12, hc), hc])].filter(n => n <= hc).sort((a, b) => a - b);
+  setModelState("loading", "Calibrating CPU threads…");
+  let best = hc, bestScore = 0;
+  await benchWorkers(2, 60);                       // warmup / JIT
+  for (const n of cands) {
+    const score = await benchWorkers(n, 250);
+    if (score > bestScore * 1.05) { bestScore = score; best = n; }  // 5% hysteresis: prefer fewer threads on ties
+  }
+  try { localStorage.setItem(key, String(best)); } catch {}
+  console.log(`[calibrate] threads=${best} of ${hc} (candidates ${cands.join(",")})`);
+  return best;
+}
+
 function ensureModel() {
   if (modelReady) return Promise.resolve();
   if (modelPromise) return modelPromise;
@@ -450,9 +484,15 @@ function ensureModel() {
     // When the GPU auto-enabled on an Intel adapter, default to ~P-core-count
     // threads: hybrid Intel laptops pace every ggml barrier at their slowest
     // low-power E-core, and 6 threads + GPU is the measured-best config.
-    // Priority: ?threads= URL param > UI dropdown > auto heuristics.
+    // Priority: ?threads= URL param > UI dropdown > CALIBRATION (auto).
+    // hardwareConcurrency counts a hybrid laptop's low-power E-cores the same
+    // as P-cores, and ggml barriers every op on the slowest thread — so the
+    // only reliable "auto" is to measure: run a fixed SIMD workload at several
+    // worker counts (~1.5 s total, once per device, cached in localStorage)
+    // and use the count with the best aggregate throughput.
     let threads = +(new URLSearchParams(location.search).get("threads") || 0) ||
                   +(document.getElementById("threads-sel")?.value || 0);
+    if (!threads) threads = await calibrateThreads();
     if (!threads && WASM_VARIANT === "gpu" && GPU_IS_INTEL &&
         (navigator.hardwareConcurrency || 0) > 8) {
       threads = 6;
