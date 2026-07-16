@@ -153,6 +153,10 @@
     <div id="model-strip">
       <span id="model-state"><span class="dot"></span><span id="model-msg">Not loaded — starts automatically when needed</span></span>
       <span id="quality" class="sub">Q4_K GGUF · ~700 MB one-time download · browser-cached</span>
+      <div style="margin-top:8px;font-size:.85rem">
+        <label for="hotwords">Hotwords <small>(names/terms to bias recognition, comma-separated — e.g. 蔡其昌, 高端疫苗)</small></label><br>
+        <input type="text" id="hotwords" placeholder="熱詞 / hotwords…" style="width:100%;max-width:560px;margin-top:2px">
+      </div>
       <div id="win-row" style="margin-top:8px;font-size:.85rem">
         Window:
         <label><input type="radio" name="win" value="90"> Fast 1.5 min</label>

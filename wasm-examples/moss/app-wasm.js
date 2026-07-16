@@ -25,6 +25,14 @@ const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
 const PROMPT = "请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。";
+// Hotword biasing — OFFICIAL MOSS-TD prompt feature (examples/prompts.md):
+// appending 热词提示：w1, w2 … biases the decoder toward those spellings.
+// Measured on the 5-min meeting: fixed 10+ garbled legislator names at q4.
+function promptWithHotwords() {
+  const hw = (document.getElementById("hotwords")?.value || "").trim()
+    .replace(/[、;；\n]+/g, ",").split(",").map(s => s.trim()).filter(Boolean);
+  return hw.length ? `${PROMPT}热词提示：${hw.join(", ")}` : PROMPT;
+}
 const EXAMPLES =
   "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-onnx/resolve/main/demo/";
 
@@ -501,7 +509,7 @@ function transcribeWindow(wav, base, durS) {
     };
     const w = wav.slice();                 // copy just this window's samples
     worker.postMessage(
-      { type: "run", pcm: w.buffer, nTok, base, durS, prompt: PROMPT },
+      { type: "run", pcm: w.buffer, nTok, base, durS, prompt: promptWithHotwords() },
       [w.buffer]);
   });
 }
