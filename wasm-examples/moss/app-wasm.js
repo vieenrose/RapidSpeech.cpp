@@ -500,6 +500,7 @@ function ensureModel() {
     // and use the count with the best aggregate throughput.
     let threads = +(new URLSearchParams(location.search).get("threads") || 0) ||
                   +(document.getElementById("threads-sel")?.value || 0);
+    if (threads) console.log(`[threads] manual=${threads}`);
     if (!threads) threads = await calibrateThreads();
     if (!threads && WASM_VARIANT === "gpu" && GPU_IS_INTEL &&
         (navigator.hardwareConcurrency || 0) > 8) {
