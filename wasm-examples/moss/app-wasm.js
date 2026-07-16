@@ -62,7 +62,11 @@ async function gpuPreflight() {
       return;
     }
     GPU_IS_INTEL = /intel/i.test(a.info?.vendor || "");
-    if (AUTO_GPU && !GPU_IS_INTEL) return;   // unvalidated vendor: opt-in only
+    // MEASURED (155H, 5-min meeting): GPU total 70min vs CPU 32min — the
+    // WebGPU backend accelerates encode/prefill but decode (85% of the work)
+    // runs 3.3x slower through the per-token scheduler. So AUTO never enables
+    // GPU; ?gpu=1 forces it (useful once decode moves to a static graph).
+    if (AUTO_GPU) return;
     WASM_VARIANT = "gpu";
   } catch {
     if (!AUTO_GPU) setModelState("", "WebGPU unavailable — using CPU build.");
