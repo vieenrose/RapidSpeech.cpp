@@ -144,7 +144,10 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
         current_opts_.n_kv_max > n_tokens) {
-      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+      // Match the live-prefix KV view (padded to 256, capped at n_kv_max).
+      uint32_t padded = (current_opts_.n_kv_cache + n_tokens + 255) / 256 * 256;
+      if (padded > current_opts_.n_kv_max) padded = current_opts_.n_kv_max;
+      n_kv_cache = padded - n_tokens;
     }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
@@ -236,7 +239,10 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
         current_opts_.n_kv_max > n_tokens) {
-      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+      // Match the live-prefix KV view (padded to 256, capped at n_kv_max).
+      uint32_t padded = (current_opts_.n_kv_cache + n_tokens + 255) / 256 * 256;
+      if (padded > current_opts_.n_kv_max) padded = current_opts_.n_kv_max;
+      n_kv_cache = padded - n_tokens;
     }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }

@@ -6,6 +6,7 @@
 #include "utils/rs_log.h"
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <chrono>
@@ -754,8 +755,17 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   cparams.n_ctx          = total_T + max_decode_tokens;
   cparams.n_batch        = total_T;
   cparams.n_ubatch       = total_T;
-  cparams.n_threads      = 4;
-  cparams.n_threads_batch = 4;
+  // Decode threads: was hardcoded 4 while the process is pinned to 8 P-cores.
+  // RS_THREADS overrides; default = min(8, hw threads).
+  const int rs_threads = std::getenv("RS_THREADS")
+      ? atoi(std::getenv("RS_THREADS"))
+      : std::min(8u, std::thread::hardware_concurrency());
+  cparams.n_threads      = rs_threads;
+  cparams.n_threads_batch = rs_threads;
+  // RS_NO_FLASH=1 falls back to the mul_mat+softmax attention path (A/B).
+  cparams.flash_attn = std::getenv("RS_NO_FLASH") == nullptr;
+  RS_LOG_INFO("MossTD: attention path = %s",
+              cparams.flash_attn ? "flash_attn_ext" : "mulmat+softmax");
   llm_graph_builder_ =
       std::make_unique<llm_build_qwen3>(*llm_model_, cparams, sched);
 
@@ -1277,16 +1287,19 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     // full concat (~34 MB/layer at ~4k ctx) as the extraction output.
     dec_opts.kv_outputs_new_col_only = !ingraph_kv;
 
+    auto _t0 = std::chrono::steady_clock::now();
     auto dec = llm_graph_builder_->build_graph(&best_token, 1, nullptr,
                                               &decode_pos, &dec_opts);
     if (!dec) {
       RS_LOG_ERR("Qwen3ASR: decode build failed at step %d", step);
       break;
     }
+    auto _t1 = std::chrono::steady_clock::now();
     if (!ggml_backend_sched_alloc_graph(sched, dec->get_graph())) {
       RS_LOG_ERR("Qwen3ASR: decode alloc failed at step %d", step);
       break;
     }
+    auto _t2 = std::chrono::steady_clock::now();
     if (auto t = dec->get_input_tensor("inp_tokens")) {
       ggml_backend_tensor_set(t, &best_token, 0, sizeof(int32_t));
     }
@@ -1311,9 +1324,19 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       RS_LOG_ERR("Qwen3ASR: no logits at step %d", step);
       break;
     }
+    auto _t3 = std::chrono::steady_clock::now();
     std::vector<float> dec_logits_host(n_vocab);
     ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0,
                             (size_t)n_vocab * sizeof(float));
+    if (prof && step && step % 200 == 0) {
+      auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      fprintf(stderr,
+              "[prof] step %d: build %.2f alloc %.2f compute %.2f logits %.2f ms\n",
+              step, ms(_t0, _t1), ms(_t1, _t2), ms(_t2, _t3),
+              ms(_t3, std::chrono::steady_clock::now()));
+    }
 
     // Repetition penalty over recent window (disabled unless RS_REP_PENALTY).
     if (REPETITION_PENALTY != 1.0f) {

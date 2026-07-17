@@ -441,7 +441,14 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
         ggml_tensor *k_after = ggml_set_rows(ctx, k_gpu, k_cur_2d, write_idx);
         ggml_tensor *v_after = ggml_set_rows(ctx, v_gpu, v_cur_2d, write_idx);
 
-        const int64_t n_total = current_opts_.n_kv_max;
+        // View only the LIVE prefix (padded to 256 for flash-attn kernel
+        // alignment), not the full n_kv_max: attending over the whole fixed
+        // buffer streamed ~400 MB/token of dead masked KV at 3.5k n_kv_max
+        // (measured 37 ms/tok compute; llama.cpp sizes reads the same way).
+        int64_t n_total = ((int64_t)current_opts_.n_kv_cache + n_tokens + 255)
+                          / 256 * 256;
+        if (n_total > (int64_t)current_opts_.n_kv_max)
+          n_total = current_opts_.n_kv_max;
         ggml_tensor *k_view =
             ggml_view_2d(ctx, k_after, kv_dim, n_total, k_after->nb[1], 0);
         ggml_tensor *v_view =
