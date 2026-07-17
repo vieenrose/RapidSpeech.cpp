@@ -1210,6 +1210,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const double tok_per_s = (double)span_T / std::max(1e-9, audio_T / 12.5);
   int kv_audio_lo = kv_audio_base;                    // first NON-evicted audio col
   int kv_audio_end_phys = n_prefix + span_T;          // end of audio region (physical)
+  int kv_evicted_total = 0;                           // cols removed so far (absolute->physical shift)
   llm_pos logical_pos = (llm_pos)(n_cached_tokens_ + 2);  // survives compaction
   const size_t kv_row_b = ggml_row_size(kv_type, kv_dim);
   std::vector<uint8_t> kv_move;                       // compaction staging
@@ -1217,9 +1218,13 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   for (int step = 0; step < max_decode_tokens; ++step) {
     // ---- audio-KV eviction (batched) ----
     if (kv_window_s > 0.0 && max_ts_seen > kv_window_s) {
+      // Absolute audio column for (max_ts - W), shifted into PHYSICAL space by
+      // what previous compactions already removed. Without the shift, every
+      // compaction after the first double-evicts (the window shrinks each
+      // round -> model loses in-window audio and stops early).
       int keep_from = kv_audio_base +
-          (int)((max_ts_seen - kv_window_s) * tok_per_s);
-      keep_from = std::min(keep_from, kv_audio_end_phys);
+          (int)((max_ts_seen - kv_window_s) * tok_per_s) - kv_evicted_total;
+      keep_from = std::min(std::max(keep_from, kv_audio_lo), kv_audio_end_phys);
       const int delta = keep_from - kv_audio_lo;
       if (delta >= 256) {                             // amortize the memmove
         const int tail = n_cached_tokens_ - keep_from;
@@ -1237,6 +1242,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           }
           n_cached_tokens_    -= delta;
           kv_audio_end_phys   -= delta;
+          kv_evicted_total    += delta;
           if (prof && step % 64 < 1)
             fprintf(stderr, "[prof] kv-evict: dropped %d cols, n_kv now %d\n",
                     delta, n_cached_tokens_);
