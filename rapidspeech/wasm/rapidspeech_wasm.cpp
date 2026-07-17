@@ -197,12 +197,14 @@ const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
   // is near-lossless and cuts ~0.7 GB. Short clips stay f32 (fully lossless).
   // KV policy: the engine default is now f16 (great natively), but in WASM a
   // 180 s window at f16 KV measured 3743 MB heap high-water vs the 4096 MB
-  // hard cap — 350 MB of headroom is an OOM waiting to happen. Keep q8_0 for
-  // long windows here (2955 MB, proven on 2 h runs); its timestamp cost is
-  // real but bounded, and the w2 clock issue was measured to be independent
-  // of KV format. Short windows get the engine default (f16).
-  if (n_audio_tokens > 1500) setenv("RS_KV_Q8", "1", 1);
-  else                       unsetenv("RS_KV_Q8");
+  // hard cap — 350 MB of headroom is an OOM waiting to happen. With the
+  // v6-stream model (trained for a bounded 45 s audio-KV window) long windows
+  // use monotonic KV EVICTION instead of q8: audio KV stays O(45 s) at full
+  // f16 precision, heap stays flat, and sub-second timestamps survive.
+  // Short windows get the engine default (f16, no eviction).
+  if (n_audio_tokens > 1500) setenv("RS_AUDIO_KV_WINDOW", "45", 1);
+  else                       unsetenv("RS_AUDIO_KV_WINDOW");
+  unsetenv("RS_KV_Q8");
 
   std::vector<float> pcmv(pcm, pcm + n_samples);
   auto st = m->CreateState();

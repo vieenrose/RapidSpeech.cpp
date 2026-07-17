@@ -64,7 +64,7 @@ if (globalThis.name !== "em-pthread") {
   // puts keep peak RAM at ~2 parts; after each put the part is re-read from
   // the cache so the composite Blob references DISK-backed parts (a Blob of
   // Blobs holds references — no copy).
-  const CACHE_NAME = "moss-models-v3";
+  const CACHE_NAME = "moss-models-v4";
   const PART_BYTES = 64 * 1048576;
   async function fetchToFS(url, name, tag) {
     let cache = null;
