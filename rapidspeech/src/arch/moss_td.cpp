@@ -1096,6 +1096,11 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
     if (!kv_gpu_buf) {
       RS_LOG_ERR("Qwen3ASR: failed to allocate GPU KV buffers");
+    } else {
+      // Zero the whole buffer: the fixed-shape decode graph attends over all
+      // n_kv_max rows with the tail masked to -inf — but uninitialized f16
+      // can be NaN, and NaN*0 still poisons the softmax row.
+      ggml_backend_buffer_clear(kv_gpu_buf, 0);
     }
     // Upload the prefill KV (n_cached_tokens_ columns). Under RS_KV_Q8 the
     // per-layer snapshot already produced q8_0 bytes (host_q8_k/v) — raw-copy
@@ -1260,9 +1265,17 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     dec_opts.causal_mask     = true;
     dec_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v        = gpu_kv_v_vec.data();
-    // Pin only the new K/V column (~4 KB/layer) instead of the full concat
-    // (~34 MB/layer at ~4k ctx) as the extraction output.
-    dec_opts.kv_outputs_new_col_only = true;
+    // In-graph KV append (fixed-shape graph + ggml_set_rows, cosyvoice3
+    // pattern): the new K/V column is written into the persistent tensors
+    // DEVICE-SIDE, eliminating 2*n_layer host get/set round-trips per token
+    // (the dominant per-token cost). q8_0 KV keeps the legacy host-staging
+    // path (set_rows writes f32/f16); RS_DECODE_LEGACY forces it for A/B.
+    const bool ingraph_kv =
+        !use_q8_kv && std::getenv("RS_DECODE_LEGACY") == nullptr;
+    dec_opts.fixed_kv_cache_shape = ingraph_kv;
+    // Legacy path: pin only the new K/V column (~4 KB/layer) instead of the
+    // full concat (~34 MB/layer at ~4k ctx) as the extraction output.
+    dec_opts.kv_outputs_new_col_only = !ingraph_kv;
 
     auto dec = llm_graph_builder_->build_graph(&best_token, 1, nullptr,
                                               &decode_pos, &dec_opts);
@@ -1284,6 +1297,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
+    }
+    if (ingraph_kv) {
+      dec->set_kv_write_indices(n_cached_tokens_, n_layer);
     }
     if (ggml_backend_sched_graph_compute(sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
@@ -1337,6 +1353,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
 
     // Stage new KV column to host + persistent GPU buffer.
+    // In-graph path: KV was appended device-side by ggml_set_rows — skip the
+    // host staging entirely. Legacy/q8 path below.
+    if (!ingraph_kv) {
     // k_out/v_out are the f32 concat outputs [kv_dim, n_cached+1]; the NEW
     // column lives at f32 offset n_cached_tokens_*kv_dim. For q8_0 storage we
     // must quantize that one f32 column to q8_0 and write it at the q8_0 row
@@ -1380,6 +1399,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
                                 new_bytes_f32);
       }
     }
+    }  // !ingraph_kv (legacy host staging)
     n_cached_tokens_++;
     logical_pos++;
 
