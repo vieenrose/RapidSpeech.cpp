@@ -519,6 +519,18 @@ function ensureModel() {
 
 $("btn-load").onclick = () => { ensureModel().catch(() => {}); };
 
+// Thread count is baked into the engine's pthread pool at init — a dropdown
+// change after load silently did nothing. Re-init with the new count (weights
+// reload from the browser cache, ~20 s). Ignored mid-transcription: the
+// change applies on the next Load instead of killing the active run.
+document.getElementById("threads-sel")?.addEventListener("change", () => {
+  if (!modelReady || busy) return;
+  hardResetEngine("thread count changed — engine re-initializing");
+  lastWinError = null;
+  setModelState("loading", "Applying new thread count…");
+  ensureModel().catch(() => {});
+});
+
 let tailRafPending = false;
 function scheduleTailRender() {
   if (tailRafPending) return;
