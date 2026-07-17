@@ -539,13 +539,41 @@ function mapWindowSegs(m, base) {
   }));
 }
 
+// A stalled window must not kill the whole run: WASM pthreads can't be
+// interrupted, so the only recovery is to terminate the worker, drop the
+// engine, and re-init before the next window (the GGUF re-loads from the
+// browser cache, ~10-20 s). Returns true if a reset actually happened.
+function hardResetEngine(reason) {
+  console.error("[watchdog]", reason);
+  lastWinError = reason;
+  try { worker && worker.terminate(); } catch {}
+  worker = null; modelReady = false; modelPromise = null;
+  onWindowResolve = null; dlState = null;
+  return true;
+}
+
 /* ---- one window: send PCM to the worker; tokens stream via onmessage -------- */
 // Resolves with the window's segments (absolute time, ITN'd text, + embeddings).
+// A watchdog resolves with [] and hard-resets the engine if the worker makes
+// no progress (no token, no phase event) for STALL_LIMIT_S — otherwise one bad
+// window hangs the session forever.
+const STALL_LIMIT_S = 300;
 function transcribeWindow(wav, base, durS) {
   return new Promise((resolve) => {
     const nTok = Math.floor((wav.length - 1) / 1280) + 1;
     tailProvisional = "";
+    const dog = setInterval(() => {
+      const idle = (Date.now() - lastBeat) / 1000;
+      if (idle < STALL_LIMIT_S) return;
+      clearInterval(dog);
+      hardResetEngine(
+        `window stalled (${idle.toFixed(0)}s without progress) — engine restarted, window skipped`);
+      $("status").textContent = `${phaseWin}stalled — restarting engine, skipping this window`;
+      tailProvisional = "";
+      resolve([]);
+    }, 5000);
     onWindowResolve = (m) => {
+      clearInterval(dog);
       tailProvisional = "";
       // NEVER throw out of this resolver: an exception here leaves the window
       // promise pending forever (the run hangs with the tail already cleared —
@@ -680,7 +708,7 @@ function hbStart() {
       note = `computing a window — ${idle.toFixed(0)}s since last output (normal)`;
     } else {
       dot.className = "bad";
-      note = `no progress for ${idle.toFixed(0)}s — likely stalled; use ✕ Stop and retry`;
+      note = `no progress for ${idle.toFixed(0)}s — if stalled, auto-recovery kicks in at ${STALL_LIMIT_S}s`;
     }
     $("hb-text").textContent = `${fmt(el)} elapsed · ${beatWhat} · ${note}`;
   }, 1000);
@@ -794,6 +822,11 @@ async function transcribe(source) {
 
     let winSegs;
     try {
+      if (!modelReady) {           // watchdog reset a previous window's engine
+        beat("reloading engine");
+        $("status").textContent = `${phaseWin}reloading engine after stall…`;
+        await ensureModel();
+      }
       winSegs = await transcribeWindow(piece, winStartS, durS);
     } catch (e) {
       $("status").textContent = "Inference failed: " + e.message;
@@ -843,7 +876,18 @@ async function transcribe(source) {
   finish();
 }
 
-$("btn-abort").onclick = () => { aborted = true; };
+$("btn-abort").onclick = () => {
+  aborted = true;
+  // If a window is mid-flight, the WASM compute can't be interrupted — kill
+  // the worker so Stop is immediate, and resolve the pending window empty so
+  // the run loop unwinds. The engine re-inits (from cache) on the next run.
+  if (onWindowResolve) {
+    const r = onWindowResolve;
+    hardResetEngine("stopped by user mid-window");
+    tailProvisional = "";
+    r(null);
+  }
+};
 
 /* ============================ examples ================================== */
 // Run LIVE through the WASM path (no precomputed JSON). Fetches the example

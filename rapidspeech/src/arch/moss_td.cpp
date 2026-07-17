@@ -741,11 +741,13 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
 
   // Decode budget scales with audio length: dense Mandarin runs ~7 chars/s
   // (~1 token/char) plus timestamp tokens, so a fixed 512 cap silently
-  // truncated any dense window past ~80 s. 2/3 of the audio token count
-  // (12.5/s) allows ~8.3 text tokens/s; clamped so short clips keep the old
-  // budget and pathological inputs can't balloon the KV cache.
+  // truncated any dense window past ~80 s. Budget 1:1 with the audio token
+  // count (12.5/s = ~12.5 text tokens/s): verbatim minutes-reading windows
+  // exceeded the earlier 2/3 ratio and were cut mid-sentence. Clamped so
+  // short clips keep the old budget and pathological inputs can't balloon
+  // the KV cache.
   const int max_decode_tokens =
-      std::min(3072, std::max(MAX_DECODE_TOKENS, (audio_T * 2) / 3));
+      std::min(3072, std::max(MAX_DECODE_TOKENS, audio_T));
 
   // -------- (a) projection graph: build the [n_embd, total_T] LLM input --------
   llm_cparams cparams;
@@ -1193,9 +1195,55 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const double audio_dur_s =
       static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
   double max_ts_seen = 0.0;
+  // RS_AUDIO_KV_WINDOW=<seconds>: monotonic-alignment KV eviction. ASR
+  // attention is effectively local in time — when emitting text for time T
+  // the decoder needs audio KV near T, not minutes back. As max_ts advances,
+  // COMPACT the persistent KV: slide the still-needed tail left over audio
+  // columns older than (max_ts - W), so per-token attention traffic stays
+  // O(window) instead of O(audio). Old K keeps its baked RoPE positions
+  // (eviction removes keys, doesn't renumber them); new tokens use logical
+  // positions so RoPE stays monotone. Long-range speaker identity is carried
+  // by CAM++ linking, not raw audio KV, so W~45s should be accuracy-safe.
+  const double kv_window_s =
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 0.0;
+  const int kv_audio_base = n_prefix;                 // first audio col (sinks kept)
+  const double tok_per_s = (double)span_T / std::max(1e-9, audio_T / 12.5);
+  int kv_audio_lo = kv_audio_base;                    // first NON-evicted audio col
+  int kv_audio_end_phys = n_prefix + span_T;          // end of audio region (physical)
+  llm_pos logical_pos = (llm_pos)(n_cached_tokens_ + 2);  // survives compaction
+  const size_t kv_row_b = ggml_row_size(kv_type, kv_dim);
+  std::vector<uint8_t> kv_move;                       // compaction staging
   auto _tdec = std::chrono::steady_clock::now();
   for (int step = 0; step < max_decode_tokens; ++step) {
-    llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
+    // ---- audio-KV eviction (batched) ----
+    if (kv_window_s > 0.0 && max_ts_seen > kv_window_s) {
+      int keep_from = kv_audio_base +
+          (int)((max_ts_seen - kv_window_s) * tok_per_s);
+      keep_from = std::min(keep_from, kv_audio_end_phys);
+      const int delta = keep_from - kv_audio_lo;
+      if (delta >= 256) {                             // amortize the memmove
+        const int tail = n_cached_tokens_ - keep_from;
+        if (tail > 0) {
+          kv_move.resize((size_t)tail * kv_row_b);
+          for (int il = 0; il < n_layer; ++il) {
+            for (ggml_tensor *kv : {gpu_kv_k_vec[il], gpu_kv_v_vec[il]}) {
+              ggml_backend_tensor_get(kv, kv_move.data(),
+                                      (size_t)keep_from * kv_row_b,
+                                      (size_t)tail * kv_row_b);
+              ggml_backend_tensor_set(kv, kv_move.data(),
+                                      (size_t)kv_audio_lo * kv_row_b,
+                                      (size_t)tail * kv_row_b);
+            }
+          }
+          n_cached_tokens_    -= delta;
+          kv_audio_end_phys   -= delta;
+          if (prof && step % 64 < 1)
+            fprintf(stderr, "[prof] kv-evict: dropped %d cols, n_kv now %d\n",
+                    delta, n_cached_tokens_);
+        }
+      }
+    }
+    llm_pos decode_pos = logical_pos;
     llm_build_opts dec_opts;
     dec_opts.output_mode    = llm_output_mode::OUTPUT_LOGITS;
     dec_opts.skip_embeddings = false;
@@ -1327,6 +1375,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       }
     }
     n_cached_tokens_++;
+    logical_pos++;
 
     if (next_token == eos_token_id) {
       ggml_backend_sched_reset(sched);
