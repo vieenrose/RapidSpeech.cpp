@@ -688,7 +688,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // fixed 512 cap silently truncated dense windows past ~80 s (main-branch
   // backport).
   const int max_decode_tokens =
-      std::min(3072, std::max(MAX_DECODE_TOKENS, (audio_T * 2) / 3));
+      std::min(3072, std::max(MAX_DECODE_TOKENS, audio_T));
   cparams.n_ctx          = total_T + max_decode_tokens;
   cparams.n_batch        = total_T;
   cparams.n_ubatch       = total_T;
@@ -896,6 +896,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     ggml_backend_t gpu_backend =
         ggml_backend_sched_get_backend(sched, n_backends - 1);
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
+    if (kv_gpu_buf) ggml_backend_buffer_clear(kv_gpu_buf, 0);  // fixed-shape
+    // attention reads masked tail rows; uninitialized data must not be NaN.
     if (!kv_gpu_buf) {
       RS_LOG_ERR("Qwen3ASR: failed to allocate GPU KV buffers");
     }
@@ -974,9 +976,48 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const double audio_dur_s =
       static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
   double max_ts_seen = 0.0;
+  // RS_AUDIO_KV_WINDOW=<s>: monotonic audio-KV eviction (main-branch port,
+  // incl. the evicted-total physical-shift fix). Requires the v6-stream
+  // model (trained for the bounded window); v5 drifts/stops early.
+  const double kv_window_s =
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 0.0;
+  const int kv_audio_base = n_prefix;
+  const double kv_tok_per_s = 12.5;
+  int kv_audio_lo = kv_audio_base;
+  int kv_audio_end_phys = n_prefix + audio_T;
+  int kv_evicted_total = 0;
+  llm_pos logical_pos = (llm_pos)(n_cached_tokens_ + 2);
+  const size_t kv_row_b = (size_t)kv_dim * sizeof(float);
+  std::vector<uint8_t> kv_move;
   auto _tdec = std::chrono::steady_clock::now();
   for (int step = 0; step < max_decode_tokens; ++step) {
-    llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
+    if (kv_window_s > 0.0 && max_ts_seen > kv_window_s) {
+      int keep_from = kv_audio_base +
+          (int)((max_ts_seen - kv_window_s) * kv_tok_per_s) - kv_evicted_total;
+      keep_from = std::min(std::max(keep_from, kv_audio_lo), kv_audio_end_phys);
+      const int delta = keep_from - kv_audio_lo;
+      if (delta >= 256) {
+        const int tail = n_cached_tokens_ - keep_from;
+        if (tail > 0) {
+          kv_move.resize((size_t)tail * kv_row_b);
+          for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor *kvs[2] = {gpu_kv_k_vec[il], gpu_kv_v_vec[il]};
+            for (int t = 0; t < 2; ++t) {
+              ggml_backend_tensor_get(kvs[t], kv_move.data(),
+                                      (size_t)keep_from * kv_row_b,
+                                      (size_t)tail * kv_row_b);
+              ggml_backend_tensor_set(kvs[t], kv_move.data(),
+                                      (size_t)kv_audio_lo * kv_row_b,
+                                      (size_t)tail * kv_row_b);
+            }
+          }
+          n_cached_tokens_  -= delta;
+          kv_audio_end_phys -= delta;
+          kv_evicted_total  += delta;
+        }
+      }
+    }
+    llm_pos decode_pos = logical_pos;
     llm_build_opts dec_opts;
     dec_opts.output_mode    = llm_output_mode::OUTPUT_LOGITS;
     dec_opts.skip_embeddings = false;
@@ -987,6 +1028,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     dec_opts.causal_mask     = true;
     dec_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v        = gpu_kv_v_vec.data();
+    const bool ingraph_kv = std::getenv("RS_DECODE_LEGACY") == nullptr;
+    dec_opts.fixed_kv_cache_shape = ingraph_kv;
 
     auto dec = llm_graph_builder_->build_graph(&best_token, 1, nullptr,
                                               &decode_pos, &dec_opts);
@@ -1008,6 +1051,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
+    }
+    if (ingraph_kv) {
+      dec->set_kv_write_indices(n_cached_tokens_, n_layer);
     }
     if (ggml_backend_sched_graph_compute(decode_sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
@@ -1061,7 +1107,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     }
 
     // Stage new KV column to host + persistent GPU buffer.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; ingraph_kv ? false : il < n_layer; ++il) {
       ggml_tensor *k_out = dec->get_kv_output_k(il);
       ggml_tensor *v_out = dec->get_kv_output_v(il);
       if (!k_out || !v_out) continue;
@@ -1073,6 +1119,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(), off, new_bytes);
     }
     n_cached_tokens_++;
+    logical_pos++;
 
     if (next_token == eos_token_id) {
       ggml_backend_sched_reset(decode_sched);

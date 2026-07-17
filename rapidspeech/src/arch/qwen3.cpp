@@ -142,6 +142,14 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   if (current_opts_.causal_mask) {
     uint32_t n_kv_cache =
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+        current_opts_.n_kv_max > n_tokens) {
+      // Match the live-prefix KV view (padded to 256, capped at n_kv_max).
+      const uint32_t kv_pad = 1;  // match exact-length KV views
+      uint32_t padded = (current_opts_.n_kv_cache + n_tokens + kv_pad - 1) / kv_pad * kv_pad;
+      if (padded > current_opts_.n_kv_max) padded = current_opts_.n_kv_max;
+      n_kv_cache = padded - n_tokens;
+    }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
@@ -225,6 +233,14 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   if (current_opts_.causal_mask) {
     uint32_t n_kv_cache =
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+        current_opts_.n_kv_max > n_tokens) {
+      // Match the live-prefix KV view (padded to 256, capped at n_kv_max).
+      const uint32_t kv_pad = 1;  // match exact-length KV views
+      uint32_t padded = (current_opts_.n_kv_cache + n_tokens + kv_pad - 1) / kv_pad * kv_pad;
+      if (padded > current_opts_.n_kv_max) padded = current_opts_.n_kv_max;
+      n_kv_cache = padded - n_tokens;
+    }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
@@ -360,7 +376,12 @@ ggml_tensor *llm_build_qwen3::build_attention_layer(
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
-  if (cparams_.flash_attn) {
+  if (cparams_.flash_attn &&
+      !(current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape)) {
+    // gen1 ggml: the flash kernel needs 256-padded KV, but padded zero rows
+    // corrupt decode numerics on this toolchain (measured: timestamps stall
+    // then loop-breaker at ~29 s). Fixed-shape decode uses exact-length
+    // views + mulmat/softmax; flash stays for prefill where it is safe.
     cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);
   } else {
     cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,

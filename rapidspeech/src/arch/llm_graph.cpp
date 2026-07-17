@@ -120,6 +120,22 @@ void llm_graph_result::set_input_tokens(ggml_tensor *inp_tokens,
   ggml_backend_tensor_set(inp_tokens, tokens, 0, n_tokens * sizeof(int32_t));
 }
 
+void llm_graph_result::set_kv_write_indices(uint32_t index,
+                                            uint32_t n_layers) {
+  for (uint32_t il = 0; il < n_layers; ++il) {
+    char name[64];
+    snprintf(name, sizeof(name), "kv_write_idx_layer_%u", il);
+    ggml_tensor *idx = get_input_tensor(name);
+    if (!idx || !idx->data) continue;
+    const int64_t n_idx = ggml_nelements(idx);
+    std::vector<int32_t> rows(n_idx);
+    for (int64_t i = 0; i < n_idx; ++i)
+      rows[i] = static_cast<int32_t>(index + static_cast<uint32_t>(i));
+    ggml_backend_tensor_set(idx, rows.data(), 0,
+                            rows.size() * sizeof(int32_t));
+  }
+}
+
 void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
                                        uint32_t n_kv_cache) {
   if (!mask || !mask->data) {
@@ -312,6 +328,53 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                                          llm_kv_cache *kv_cache,
                                          uint32_t n_tokens, int32_t il) {
   (void)kv_cache;
+
+  if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+      current_opts_.gpu_kv_k && current_opts_.gpu_kv_v &&
+      current_opts_.gpu_kv_k[il] && current_opts_.gpu_kv_v[il]) {
+    // In-graph KV append (main-branch port): ggml_set_rows writes the new
+    // column into the persistent KV device-side; attention reads only the
+    // LIVE prefix padded to 256 (not n_kv_max — dead masked rows are pure
+    // memory traffic).
+    ggml_tensor *k_gpu = current_opts_.gpu_kv_k[il];
+    ggml_tensor *v_gpu = current_opts_.gpu_kv_v[il];
+    const int64_t head_dim = k_cur->ne[0];
+    const int64_t n_head_kv = k_cur->ne[1];
+    const int64_t n_cur = k_cur->ne[2];
+    const int64_t kv_dim = head_dim * n_head_kv;
+    ggml_tensor *k_cur_2d =
+        ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur), kv_dim, n_cur);
+    ggml_tensor *v_cur_2d =
+        ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur), kv_dim, n_cur);
+    // gen1 toolchain: ggml_set_rows is a stub here — use the classic
+    // cpy-into-offset-view append instead. The write offset is static per
+    // graph (graph is rebuilt each step), and on the single CPU backend
+    // nodes run in expand order, so the copy lands before attention reads.
+    const size_t wr_off = (size_t)current_opts_.n_kv_cache * k_gpu->nb[1];
+    ggml_tensor *k_wr = ggml_cpy(
+        ctx, k_cur_2d,
+        ggml_view_2d(ctx, k_gpu, kv_dim, n_cur, k_gpu->nb[1], wr_off));
+    ggml_tensor *v_wr = ggml_cpy(
+        ctx, v_cur_2d,
+        ggml_view_2d(ctx, v_gpu, kv_dim, n_cur, v_gpu->nb[1], wr_off));
+    if (gf_) {
+      ggml_build_forward_expand(gf_, k_wr);
+      ggml_build_forward_expand(gf_, v_wr);
+    }
+    ggml_tensor *k_after = k_gpu;
+    ggml_tensor *v_after = v_gpu;
+    const int64_t kv_pad = 1;  // exact views (padded zero rows corrupt gen1 kernels)
+    int64_t n_total = ((int64_t)current_opts_.n_kv_cache + n_cur + kv_pad - 1)
+                      / kv_pad * kv_pad;
+    if (n_total > (int64_t)current_opts_.n_kv_max)
+      n_total = current_opts_.n_kv_max;
+    ggml_tensor *k_view =
+        ggml_view_2d(ctx, k_after, kv_dim, n_total, k_after->nb[1], 0);
+    ggml_tensor *v_view =
+        ggml_view_2d(ctx, v_after, kv_dim, n_total, v_after->nb[1], 0);
+    return {ggml_reshape_3d(ctx, k_view, head_dim, n_head_kv, n_total),
+            ggml_reshape_3d(ctx, v_view, head_dim, n_head_kv, n_total)};
+  }
 
   if (current_opts_.is_decode_step && current_opts_.n_kv_cache > 0) {
     // Decode step: concatenate cached K/V with current K/V

@@ -167,6 +167,7 @@ struct llm_build_opts {
   // Decode mode control
   bool is_decode_step =
       false;               // true = decode step (n_tokens=1, concat cached K/V)
+  bool fixed_kv_cache_shape = false; // in-graph set_rows KV append
   uint32_t n_kv_cache = 0; // Number of cached KV pairs for decode step
   uint32_t n_kv_max = 0;   // Max KV cache capacity (for GPU-persistent buffers)
 
@@ -285,6 +286,7 @@ public:
                         uint32_t n_tokens);
   void set_input_tokens(ggml_tensor *inp_tokens, const int32_t *tokens,
                         uint32_t n_tokens);
+  void set_kv_write_indices(uint32_t index, uint32_t n_layers);
   void set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
                        uint32_t n_kv_cache);
 
