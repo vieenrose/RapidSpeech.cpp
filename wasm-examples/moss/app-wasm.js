@@ -800,7 +800,16 @@ async function transcribe(source) {
       $("status").textContent = "Audio decode failed: " + e.message;
       break;
     }
-    if (piece.length / SR < 0.3) break;
+    if (piece.length / SR < 0.3) {
+      // A 2 h file "running dry" at minute 4 is a decode failure, not EOF:
+      // surface it instead of reporting Done (source.durS may be an estimate,
+      // so allow 10% slack before calling it an error).
+      if (source.durS && cursorS < source.durS * 0.9) {
+        lastWinError = `audio source ended early at ${fmt(cursorS)} of ~${fmt(source.durS)} — media decode failed; try re-selecting the file`;
+        console.error("[source]", lastWinError);
+      }
+      break;
+    }
     const isLastWin = piece.length / SR < WINDOW_S - 0.5;   // source ran short
     const winStartS = cursorS;
     const cut = pauseCut(piece);
