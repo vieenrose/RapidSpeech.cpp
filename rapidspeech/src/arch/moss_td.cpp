@@ -757,9 +757,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   cparams.n_ubatch       = total_T;
   // Decode threads: was hardcoded 4 while the process is pinned to 8 P-cores.
   // RS_THREADS overrides; default = min(8, hw threads).
-  const int rs_threads = std::getenv("RS_THREADS")
+  const int rs_threads = std::max(1, std::getenv("RS_THREADS")
       ? atoi(std::getenv("RS_THREADS"))
-      : std::min(8u, std::thread::hardware_concurrency());
+      : (int)std::min(8u, std::thread::hardware_concurrency()));
   cparams.n_threads      = rs_threads;
   cparams.n_threads_batch = rs_threads;
   // RS_NO_FLASH=1 falls back to the mul_mat+softmax attention path (A/B).

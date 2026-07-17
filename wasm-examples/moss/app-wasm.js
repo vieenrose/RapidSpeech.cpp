@@ -569,14 +569,19 @@ function hardResetEngine(reason) {
 // A watchdog resolves with [] and hard-resets the engine if the worker makes
 // no progress (no token, no phase event) for STALL_LIMIT_S — otherwise one bad
 // window hangs the session forever.
-const STALL_LIMIT_S = 300;
+// Slow is NOT stalled: prefill emits no beat for its whole single graph
+// compute, which on a low-thread machine can exceed a fixed 300 s (user-hit:
+// a healthy window killed at 304 s). Scale the limit with the window length —
+// 3x the audio duration, floor 7 min — so only a truly dead worker is culled.
+const stallLimitS = (durS) => Math.max(420, Math.ceil(durS * 3));
 function transcribeWindow(wav, base, durS) {
   return new Promise((resolve) => {
     const nTok = Math.floor((wav.length - 1) / 1280) + 1;
     tailProvisional = "";
+    const limitS = stallLimitS(durS);
     const dog = setInterval(() => {
       const idle = (Date.now() - lastBeat) / 1000;
-      if (idle < STALL_LIMIT_S) return;
+      if (idle < limitS) return;
       clearInterval(dog);
       hardResetEngine(
         `window stalled (${idle.toFixed(0)}s without progress) — engine restarted, window skipped`);
@@ -720,7 +725,7 @@ function hbStart() {
       note = `computing a window — ${idle.toFixed(0)}s since last output (normal)`;
     } else {
       dot.className = "bad";
-      note = `no progress for ${idle.toFixed(0)}s — if stalled, auto-recovery kicks in at ${STALL_LIMIT_S}s`;
+      note = `no progress for ${idle.toFixed(0)}s — auto-recovery kicks in if the window truly stalls`;
     }
     $("hb-text").textContent = `${fmt(el)} elapsed · ${beatWhat} · ${note}`;
   }, 1000);
