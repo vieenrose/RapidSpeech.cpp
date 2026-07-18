@@ -543,6 +543,7 @@ function scheduleTailRender() {
 // time + Traditional/ITN'd text, keeping the embedding for cross-window linking.
 function mapWindowSegs(m, base) {
   return (m.segs || []).map((s) => ({
+    win: base,                   // window identity for constraint-linking
     start: base + s.start,
     end: s.end != null ? base + s.end : null,
     rawEnd: s.rawEnd != null ? base + s.rawEnd : null,
@@ -611,29 +612,68 @@ function transcribeWindow(wav, base, durS) {
   });
 }
 
-/* ---- cross-window speaker linking (ported from the ORT demo pipeline.js) ----
- * Core-segment average-linkage AHC @ cosine 0.45; segments < 3 s snap to the
- * nearest cluster centroid; no-embedding segments inherit the previous label.
- * Gives globally-consistent S01/S02… across windows via CAM++ embeddings. */
-function linkSpeakers(segs, threshold = 0.45, minCoreDur = 3.0) {
-  const withEmb = [];
-  segs.forEach((s, i) => { if (s.emb) withEmb.push(i); });
-  const core = withEmb.filter((i) => segs[i].end - segs[i].start >= minCoreDur);
-  const labOf = new Map();
-  if (core.length >= 2) {
-    const n = core.length;
+/* ---- cross-window speaker linking, v2 (constraint-protected) ----
+ * The model already diarizes WITHIN a window ([Sxx] tags). Treat each
+ * (window, tag) as one UNIT: pool its segments' CAM++ embeddings
+ * (duration-weighted — much better SNR than per-segment), then AHC over
+ * units with a CANNOT-LINK veto: two units that co-occur in the same window
+ * are distinct people by construction and may never merge (directly or
+ * transitively). The veto removes the over-merge cliff, so a LOOSE 0.65
+ * threshold is safe. Measured on the 2h council meeting: per-segment
+ * AHC@0.45 fragmented to 24 speakers; units+veto@0.65 gives ~10 with the
+ * chair + main officials each one cluster spanning the whole file. */
+function linkSpeakers(segs, threshold = 0.65) {
+  // effective tag per segment (carry the last seen [Sxx] forward)
+  const tags = []; let prevTag = "S01";
+  for (const s of segs) { if (s.spk) prevTag = s.spk; tags.push(prevTag); }
+  // build units
+  const unitOf = new Map(), units = [];
+  segs.forEach((s, i) => {
+    const key = (s.win ?? 0) + "|" + tags[i];
+    let u = unitOf.get(key);
+    if (u === undefined) {
+      u = units.length; unitOf.set(key, u);
+      units.push({ win: s.win ?? 0, sum: null, wsum: 0, segIdx: [] });
+    }
+    units[u].segIdx.push(i);
+    if (s.emb) {
+      const w = Math.max(0.5, (s.end ?? s.start + 1) - s.start);
+      if (!units[u].sum) units[u].sum = new Float64Array(s.emb.length);
+      for (let k = 0; k < s.emb.length; k++) units[u].sum[k] += w * s.emb[k];
+      units[u].wsum += w;
+    }
+  });
+  const embIdx = [];                 // units with embeddings
+  units.forEach((u, i) => {
+    if (!u.sum) return;
+    let n = 0; for (let k = 0; k < u.sum.length; k++) n += u.sum[k] * u.sum[k];
+    n = Math.sqrt(n) || 1;
+    u.vec = new Float64Array(u.sum.length);
+    for (let k = 0; k < u.sum.length; k++) u.vec[k] = u.sum[k] / n;
+    embIdx.push(i);
+  });
+  const labOfUnit = new Map();       // unit index -> cluster id
+  let nClusters = 0;
+  if (embIdx.length >= 2) {
+    const n = embIdx.length;
     const D = new Float64Array(n * n);
     for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) {
-      let dot = 0; const ea = segs[core[a]].emb, eb = segs[core[b]].emb;
+      let dot = 0;
+      const ea = units[embIdx[a]].vec, eb = units[embIdx[b]].vec;
       for (let k = 0; k < ea.length; k++) dot += ea[k] * eb[k];
       D[a * n + b] = D[b * n + a] = 1 - dot;
     }
-    const clusters = core.map((_, i) => [i]);
+    const clusters = embIdx.map((_, i) => [i]);
+    const wins = embIdx.map((i) => new Set([units[i].win]));
     const active = new Set(clusters.map((_, i) => i));
     for (;;) {
       let bi = -1, bj = -1, bd = threshold;
       for (const i of active) for (const j of active) {
         if (j <= i) continue;
+        // cannot-link veto: clusters sharing any window are distinct people
+        let shared = false;
+        for (const w of wins[i]) if (wins[j].has(w)) { shared = true; break; }
+        if (shared) continue;
         const d = D[i * n + j];
         if (d < bd) { bd = d; bi = i; bj = j; }
       }
@@ -645,41 +685,32 @@ function linkSpeakers(segs, threshold = 0.45, minCoreDur = 3.0) {
         D[bi * n + k] = D[k * n + bi] = d;
       }
       clusters[bi] = clusters[bi].concat(clusters[bj]);
+      for (const w of wins[bj]) wins[bi].add(w);
       active.delete(bj);
     }
-    const cents = [];
     for (const ci of active) {
-      const members = clusters[ci];
-      const dim = segs[core[0]].emb.length;
-      const c = new Float64Array(dim);
-      for (const mm of members) { const e = segs[core[mm]].emb; for (let k = 0; k < dim; k++) c[k] += e[k]; }
-      let nrm = 0; for (let k = 0; k < dim; k++) nrm += c[k] * c[k];
-      nrm = Math.sqrt(nrm) || 1;
-      for (let k = 0; k < dim; k++) c[k] /= nrm;
-      cents.push(c);
-      for (const mm of members) labOf.set(core[mm], cents.length - 1);
+      const cid = nClusters++;
+      for (const m of clusters[ci]) labOfUnit.set(embIdx[m], cid);
     }
-    for (const i of withEmb) {
-      if (labOf.has(i)) continue;
-      let best = 0, bestDot = -2;
-      for (let c = 0; c < cents.length; c++) {
-        let dot = 0; const e = segs[i].emb;
-        for (let k = 0; k < e.length; k++) dot += cents[c][k] * e[k];
-        if (dot > bestDot) { bestDot = dot; best = c; }
-      }
-      labOf.set(i, best);
-    }
-  } else if (withEmb.length) {
-    for (const i of withEmb) labOf.set(i, 0);
+  } else if (embIdx.length === 1) {
+    labOfUnit.set(embIdx[0], nClusters++);
   }
+  // label segments; units with no embedding (all segments too short to
+  // embed) inherit the previous segment's cluster instead of minting a new
+  // speaker. Canonical S01/S02… by first appearance.
+  const segCluster = new Array(segs.length);
+  units.forEach((u, i) => {
+    if (!labOfUnit.has(i)) return;
+    for (const si of u.segIdx) segCluster[si] = labOfUnit.get(i);
+  });
   const canon = new Map();
-  const out = []; let prev = "S01";
+  const out = []; let prevCl = null;
   segs.forEach((s, i) => {
-    let spk; const l = labOf.get(i);
-    if (l === undefined) spk = prev;
-    else { if (!canon.has(l)) canon.set(l, `S${String(canon.size + 1).padStart(2, "0")}`); spk = canon.get(l); }
-    prev = spk;
-    out.push({ start: s.start, end: s.end, speaker: spk, text: s.text });
+    let l = segCluster[i];
+    if (l === undefined || l === null) l = prevCl ?? (segCluster.find(x => x != null) ?? 0);
+    prevCl = l;
+    if (!canon.has(l)) canon.set(l, `S${String(canon.size + 1).padStart(2, "0")}`);
+    out.push({ start: s.start, end: s.end, speaker: canon.get(l), text: s.text });
   });
   return out;
 }
@@ -938,11 +969,11 @@ async function transcribe(source) {
             buf += p;
             if (buf.length >= 60) {
               // emb was measured on the pre-split span — meaningless now
-              exploded.push({ spk: s.spk, text: buf, emb: null });
+              exploded.push({ spk: s.spk, text: buf, emb: null, win: s.win });
               buf = "";
             }
           }
-          if (buf) exploded.push({ spk: s.spk, text: buf, emb: null });
+          if (buf) exploded.push({ spk: s.spk, text: buf, emb: null, win: s.win });
         }
         const chars = exploded.reduce((a, s) => a + (s.text || "").length, 0);
         if (chars >= 40) {
