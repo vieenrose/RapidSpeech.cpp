@@ -687,6 +687,30 @@ function linkSpeakers(segs, threshold = 0.45, minCoreDur = 3.0) {
 // Fill each segment's display `end`: prefer the model's own end timestamp,
 // else the next segment's start, else a small default. Also carry the last
 // seen [Sxx] speaker forward when a segment omits its own tag.
+// Collapse decode-loop artifacts: a model repetition loop with ADVANCING
+// timestamps evades every engine guard (clock ticks AND advances each cycle
+// — measured: one utterance repeated 13x over 50 s of low-SNR chatter).
+// Transcript-level signature is unambiguous: the same >=10-char text
+// reappearing within 30 s at most 2 segments back (A,B,A,B cycles). Keep the
+// first occurrence, drop the echoes.
+function collapseLoops(list) {
+  const out = [];
+  for (const s of list) {
+    const t = (s.text || s.t || "").trim();
+    let dup = false;
+    if (t.length >= 10) {
+      for (let k = out.length - 1; k >= 0 && k >= out.length - 2; k--) {
+        const p = out[k];
+        if ((p.text || p.t || "").trim() === t && s.start - p.start < 30) {
+          dup = true; break;
+        }
+      }
+    }
+    if (!dup) out.push(s);
+  }
+  return out;
+}
+
 function normalizeSegs(list) {
   let prev = "S01";
   for (let i = 0; i < list.length; i++) {
@@ -886,6 +910,7 @@ async function transcribe(source) {
     }
     processedS = cursorS;
     for (const s of winSegs) diarSegs.push(s);
+    diarSegs = collapseLoops(diarSegs);
     normalizeSegs(diarSegs);                 // fill end + window-local speaker
     // Re-link speakers globally across all windows so far (CAM++ AHC), or fall
     // back to the model's per-window [Sxx] tags when the speaker model is absent.

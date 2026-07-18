@@ -1190,7 +1190,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
   // hash -> {hits while time stagnant, max_ts_seen at last hit}
-  struct NgramSeen { int count; int first_idx; double ts; int ts_ticks; };
+  struct NgramSeen { int count; int first_idx; double ts; int ts_ticks;
+                     int last_idx; double last_delta; int cyc; };
   std::unordered_map<uint64_t, NgramSeen> ngram_counts_;
   // The HF reference decodes with plain greedy, but under Q4_K the very first
   // format tokens sit on a knife edge: without a penalty the decode can lock
@@ -1560,9 +1561,35 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         auto it = ngram_counts_.find(h);
         const int cur_idx = nsz;
         if (it == ngram_counts_.end()) {
-          ngram_counts_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count});
+          ngram_counts_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen,
+                                             ts_tick_count, cur_idx, -1.0, 1});
         } else if (max_ts_seen >= it->second.ts + 2.0) {
-          it->second = NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count};
+          // Clock advanced — usually a legit re-read. BUT a repetition loop
+          // that FABRICATES advancing timestamps (measured: one utterance
+          // 13x, each cycle advancing ~3-7 s) looks exactly like this. Its
+          // signature: near-constant token stride AND near-constant small
+          // ts-delta per recurrence. Legit re-reads recur once at an
+          // irregular, usually large gap; timestamp-free passages have no
+          // deltas at all.
+          const int stride = cur_idx - it->second.last_idx;
+          const double delta = max_ts_seen - it->second.ts;
+          const bool periodic =
+              stride <= 256 && delta > 0.0 && delta <= 15.0 &&
+              (it->second.last_delta < 0.0 ||
+               std::fabs(delta - it->second.last_delta) <= 2.0);
+          if (periodic && ++it->second.cyc >= 4) {
+            RS_LOG_WARN("MossTD: %d uniform cycles (stride~%d, dt~%.1fs) — "
+                        "advancing-clock loop, trimming + stopping",
+                        it->second.cyc, stride, delta);
+            if ((int)st.token_ids.size() > it->second.first_idx)
+              st.token_ids.resize(it->second.first_idx);
+            ggml_backend_sched_reset(sched);
+            break;
+          }
+          const int keep_cyc = periodic ? it->second.cyc : 1;
+          const int keep_first = periodic ? it->second.first_idx : cur_idx;
+          it->second = NgramSeen{1, keep_first, max_ts_seen, ts_tick_count,
+                                 cur_idx, periodic ? delta : -1.0, keep_cyc};
         } else if (ts_tick_count > it->second.ts_ticks) {
           it->second.ts_ticks = ts_tick_count;
           if (++it->second.count >= 3) {
