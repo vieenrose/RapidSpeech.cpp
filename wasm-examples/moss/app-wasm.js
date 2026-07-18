@@ -918,6 +918,26 @@ async function transcribe(source) {
       }
       // else: healthy window (covered ≈ cut) or a fully-degenerate one
       // (covered < MIN_ADV) — keep the pause-cut advance to guarantee progress.
+      // Marker-less window: dense continuous speech can make the model emit a
+      // single [0.00] and then NO time markers, so every segment lands at the
+      // window start and the timeline collapses (2h audit: last ~5 min of
+      // text crammed into 7070-7073 s). When marked coverage is negligible,
+      // spread segment boundaries over the decoded span proportionally to
+      // text length — an estimate, but monotone and readable. Write it into
+      // rawEnd: normalizeSegs() keeps only rawEnd-based ends.
+      if (winSegs.length && coveredS < Math.min(MIN_ADV, cut * 0.5)) {
+        const chars = winSegs.reduce((a, s) => a + (s.text || "").length, 0);
+        if (chars >= 40) {
+          let acc = 0;
+          for (const s of winSegs) {
+            s.start = winStartS + (acc / chars) * cut;
+            acc += (s.text || "").length;
+            s.rawEnd = winStartS + (acc / chars) * cut;
+            s.end = s.rawEnd;
+            s.tsEstimated = true;
+          }
+        }
+      }
     }
     processedS = cursorS;
     for (const s of winSegs) diarSegs.push(s);
