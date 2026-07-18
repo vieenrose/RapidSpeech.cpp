@@ -926,16 +926,35 @@ async function transcribe(source) {
       // text length — an estimate, but monotone and readable. Write it into
       // rawEnd: normalizeSegs() keeps only rawEnd-based ends.
       if (winSegs.length && coveredS < Math.min(MIN_ADV, cut * 0.5)) {
-        const chars = winSegs.reduce((a, s) => a + (s.text || "").length, 0);
+        // Split long unmarked text at sentence punctuation first — a fully
+        // marker-less 180 s window is otherwise one 700-char mega-segment.
+        const exploded = [];
+        for (const s of winSegs) {
+          const t = s.text || "";
+          if (t.length <= 120) { exploded.push(s); continue; }
+          const parts = t.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [t];
+          let buf = "";
+          for (const p of parts) {
+            buf += p;
+            if (buf.length >= 60) {
+              // emb was measured on the pre-split span — meaningless now
+              exploded.push({ spk: s.spk, text: buf, emb: null });
+              buf = "";
+            }
+          }
+          if (buf) exploded.push({ spk: s.spk, text: buf, emb: null });
+        }
+        const chars = exploded.reduce((a, s) => a + (s.text || "").length, 0);
         if (chars >= 40) {
           let acc = 0;
-          for (const s of winSegs) {
+          for (const s of exploded) {
             s.start = winStartS + (acc / chars) * cut;
             acc += (s.text || "").length;
             s.rawEnd = winStartS + (acc / chars) * cut;
             s.end = s.rawEnd;
             s.tsEstimated = true;
           }
+          winSegs = exploded;
         }
       }
     }
