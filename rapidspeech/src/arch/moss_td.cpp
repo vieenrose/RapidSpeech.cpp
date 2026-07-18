@@ -1098,7 +1098,25 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   if (use_q8_kv) {
     RS_LOG_INFO("MossTD: RS_KV_Q8 set — persistent KV cache stored as q8_0");
   }
-  const int32_t n_kv_max = n_cached_tokens_ + max_decode_tokens;
+  // KV eviction window (see the eviction block below for semantics). Read
+  // here because it also sizes the persistent KV allocation.
+  const double kv_window_s =
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 45.0;
+  // Eviction-aware KV sizing: with eviction on, live columns stay near
+  // n_cached + (decode tokens emitted per eviction window) — appends reuse
+  // compacted space — so the full n_cached + max_decode allocation (~40%
+  // larger at 300 s windows, the WASM 4 GB pressure point) is never live at
+  // once. Headroom = 16 tok/s of text over one window (measured zh dense
+  // speech ~8-10 tok/s incl. markers), floor 768. A capacity guard in the
+  // decode loop force-evicts if the model emits no timestamps (max_ts never
+  // advances -> normal eviction never fires) and the buffer fills anyway.
+  const int32_t n_kv_full = n_cached_tokens_ + max_decode_tokens;
+  const int kv_headroom = std::getenv("RS_KV_HEADROOM")   // test/debug override
+      ? atoi(std::getenv("RS_KV_HEADROOM"))
+      : std::max(768, (int)(kv_window_s * 16.0));
+  const int32_t n_kv_max = (kv_window_s > 0.0)
+      ? std::min<int32_t>(n_kv_full, (int32_t)n_cached_tokens_ + kv_headroom)
+      : n_kv_full;
   std::vector<ggml_tensor *> gpu_kv_k_vec(n_layer, nullptr);
   std::vector<ggml_tensor *> gpu_kv_v_vec(n_layer, nullptr);
   ggml_backend_buffer_t kv_gpu_buf = nullptr;
@@ -1244,8 +1262,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // audio-KV window, and bounded memory on long audio is a product requirement.
   // RS_AUDIO_KV_WINDOW=0 opts out (needed for v5-era models, which drift
   // under eviction); any other value overrides the window length.
-  const double kv_window_s =
-      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 45.0;
+  // (kv_window_s itself is read earlier — it also sizes the KV allocation.)
   const int kv_audio_base = n_prefix;                 // first audio col (sinks kept)
   const double tok_per_s = (double)span_T / std::max(1e-9, audio_T / 12.5);
   int kv_audio_lo = kv_audio_base;                    // first NON-evicted audio col
@@ -1254,6 +1271,29 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   llm_pos logical_pos = (llm_pos)(n_cached_tokens_ + 2);  // survives compaction
   const size_t kv_row_b = ggml_row_size(kv_type, kv_dim);
   std::vector<uint8_t> kv_move;                       // compaction staging
+  // Slide the still-needed KV tail left over audio columns older than
+  // keep_from. Returns the number of columns removed (0 if nothing to do).
+  auto compact_to = [&](int keep_from) -> int {
+    keep_from = std::min(std::max(keep_from, kv_audio_lo), kv_audio_end_phys);
+    const int delta = keep_from - kv_audio_lo;
+    const int tail = n_cached_tokens_ - keep_from;
+    if (delta <= 0 || tail <= 0) return 0;
+    kv_move.resize((size_t)tail * kv_row_b);
+    for (int il = 0; il < n_layer; ++il) {
+      for (ggml_tensor *kv : {gpu_kv_k_vec[il], gpu_kv_v_vec[il]}) {
+        ggml_backend_tensor_get(kv, kv_move.data(),
+                                (size_t)keep_from * kv_row_b,
+                                (size_t)tail * kv_row_b);
+        ggml_backend_tensor_set(kv, kv_move.data(),
+                                (size_t)kv_audio_lo * kv_row_b,
+                                (size_t)tail * kv_row_b);
+      }
+    }
+    n_cached_tokens_    -= delta;
+    kv_audio_end_phys   -= delta;
+    kv_evicted_total    += delta;
+    return delta;
+  };
   auto _tdec = std::chrono::steady_clock::now();
   for (int step = 0; step < max_decode_tokens; ++step) {
     // ---- audio-KV eviction (batched) ----
@@ -1264,30 +1304,27 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       // round -> model loses in-window audio and stops early).
       int keep_from = kv_audio_base +
           (int)((max_ts_seen - kv_window_s) * tok_per_s) - kv_evicted_total;
-      keep_from = std::min(std::max(keep_from, kv_audio_lo), kv_audio_end_phys);
-      const int delta = keep_from - kv_audio_lo;
-      if (delta >= 256) {                             // amortize the memmove
-        const int tail = n_cached_tokens_ - keep_from;
-        if (tail > 0) {
-          kv_move.resize((size_t)tail * kv_row_b);
-          for (int il = 0; il < n_layer; ++il) {
-            for (ggml_tensor *kv : {gpu_kv_k_vec[il], gpu_kv_v_vec[il]}) {
-              ggml_backend_tensor_get(kv, kv_move.data(),
-                                      (size_t)keep_from * kv_row_b,
-                                      (size_t)tail * kv_row_b);
-              ggml_backend_tensor_set(kv, kv_move.data(),
-                                      (size_t)kv_audio_lo * kv_row_b,
-                                      (size_t)tail * kv_row_b);
-            }
-          }
-          n_cached_tokens_    -= delta;
-          kv_audio_end_phys   -= delta;
-          kv_evicted_total    += delta;
-          if (prof && step % 64 < 1)
-            fprintf(stderr, "[prof] kv-evict: dropped %d cols, n_kv now %d\n",
-                    delta, n_cached_tokens_);
-        }
+      if (keep_from - kv_audio_lo >= 256) {           // amortize the memmove
+        const int delta = compact_to(keep_from);
+        if (prof && delta && step % 64 < 1)
+          fprintf(stderr, "[prof] kv-evict: dropped %d cols, n_kv now %d\n",
+                  delta, n_cached_tokens_);
       }
+    }
+    // ---- capacity guard for the eviction-sized allocation ----
+    // A timestamp-free decode (dense continuous speech) never advances
+    // max_ts, so normal eviction never fires and appends can fill the
+    // smaller buffer. The audio behind the transcription front is already
+    // consumed — force-drop the oldest columns; with none left, stop.
+    if (kv_window_s > 0.0 && n_cached_tokens_ >= n_kv_max - 2) {
+      const int delta = compact_to(kv_audio_lo + 512);
+      if (delta <= 0) {
+        RS_LOG_WARN("MossTD: KV capacity reached with no evictable audio "
+                    "columns — stopping decode at step %d", step);
+        break;
+      }
+      RS_LOG_WARN("MossTD: KV capacity guard force-evicted %d oldest audio "
+                  "cols (timestamp-free decode)", delta);
     }
     llm_pos decode_pos = logical_pos;
     llm_build_opts dec_opts;
