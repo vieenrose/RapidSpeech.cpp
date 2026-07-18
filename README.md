@@ -127,7 +127,22 @@ timestamps** in one pass (Whisper-Medium encoder + Qwen3-0.6B decoder, audio
 tokens spliced into the LLM). Emits `[start][Sxx]text[end]` segments; Q4_K GGUF
 (~700 MB). Runs on CPU / CUDA and **entirely in the browser via WebAssembly**
 (mel + encoder + streaming decoder in WASM, optional CAM++ cross-window speaker
-linking). zh-TW / English meetings.
+linking). zh-TW / English meetings. The shipped model is the
+[zh-TW v6-stream fine-tune](https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw)
+of [OpenMOSS's original](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)
+— same 0.9B architecture, adapted for deployment:
+
+| | Original MOSS-TD 0.9B | Shipped here (v6-stream) |
+|---|---|---|
+| Output script / domain | general Mandarin (Simplified-leaning) | Traditional Chinese (Taiwan) meetings + zh/EN code-switch |
+| Long-audio decode | full attention, KV grows O(audio) | bounded **45 s audio-KV window** (streaming FT + engine eviction, default on) — flat memory, ~20 % faster |
+| Decode robustness | — | tick-stall loop breaker, speech-aware premature-EOS guard, per-window watchdog |
+| Quantization | bf16 | diarization-defended q4 QAT → q4_K_M GGUF (707 MB) |
+| Diarization on long meetings | DER 0.74 (123 min) | DER 0.195 / consistency 0.905 via cross-window speaker linking |
+| Runs on | HF transformers (GPU) | CPU / CUDA / **browser WASM** / Jetson Nano gen1 |
+
+Training recipes and evals live in
+[vieenrose/distil-vibevoice-asr](https://github.com/vieenrose/distil-vibevoice-asr).
 
 **PrimeTTS** (v2 / v2.1) — single-speaker MB-iSTFT-VITS: TextEncoder (windowed
 rel-pos transformer) → deterministic duration predictor → residual-coupling flow
