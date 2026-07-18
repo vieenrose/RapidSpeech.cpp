@@ -834,7 +834,7 @@ async function transcribe(source) {
       // A 2 h file "running dry" at minute 4 is a decode failure, not EOF:
       // surface it instead of reporting Done (source.durS may be an estimate,
       // so allow 10% slack before calling it an error).
-      if (source.durS && cursorS < source.durS * 0.9) {
+      if (source.durS && cursorS < source.durS - Math.min(60, source.durS * 0.1)) {
         lastWinError = `audio source ended early at ${fmt(cursorS)} of ~${fmt(source.durS)} — media decode failed; try re-selecting the file`;
         console.error("[source]", lastWinError);
       }
@@ -1324,10 +1324,21 @@ function ffmpegWindowSource(file, estDurS, onStatus) {
       const ff = await ensure();
       const startS = (s0 / SR).toFixed(3), lenS = (n / SR + 0.5).toFixed(3);
       const inPath = mounted ? IN_DIR + "/in" : "in_all";
-      const code = await ff.exec(["-ss", startS, "-t", lenS, "-i", inPath,
+      let code = await ff.exec(["-ss", startS, "-t", lenS, "-i", inPath,
         "-vn", "-sn", "-dn", "-ar", String(SR), "-ac", "1", "-f", "f32le", "-y", "out.raw"]);
       if (code !== 0) throw new Error("ffmpeg window decode failed (code " + code + ")");
-      const data = await ff.readFile("out.raw");
+      let data = await ff.readFile("out.raw");
+      // Input-seeking (-ss before -i) uses the container index, which can run
+      // dry near the TAIL of long VBR files (measured: a 2 h meeting's last
+      // ~5 min of real speech silently dropped). If the fast path returns
+      // (near-)empty well before durS, retry with OUTPUT seeking — decodes
+      // from byte 0 (slow, ~once per file) but frame-exact to the true end.
+      if (data.length < SR * 2 && s0 / SR < estDurS - 30) {
+        console.warn(`[ffsrc] fast seek dry at ${(s0 / SR).toFixed(0)}s — exact-seek retry`);
+        code = await ff.exec(["-i", inPath, "-ss", startS, "-t", lenS,
+          "-vn", "-sn", "-dn", "-ar", String(SR), "-ac", "1", "-f", "f32le", "-y", "out.raw"]);
+        if (code === 0) data = await ff.readFile("out.raw");
+      }
       ff.deleteFile("out.raw").catch(() => {});
       const out = new Float32Array(data.slice().buffer);
       return out.length > n ? out.subarray(0, n) : out;
