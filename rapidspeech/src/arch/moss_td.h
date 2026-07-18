@@ -212,4 +212,5 @@ struct MossTDState : public RSState {
   int32_t              n_embd  = 0;
   std::vector<int32_t> token_ids;
   std::vector<std::string> tokens;
+  double speech_end_s = 0.0;  // last second with speech energy (0 = unknown)
 };

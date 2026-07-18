@@ -1,6 +1,7 @@
 #include "moss_td.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
@@ -546,6 +547,23 @@ bool MossTDModel::Encode(const std::vector<float> &input_frames,
     return false;
   }
   // input_frames is raw PCM because meta_.use_external_frontend = true.
+  // Speech-energy end (1 s RMS bins, -54 dBFS): the premature-EOS guard's
+  // coverage target — forcing decode over a trailing-silence region
+  // hallucinates (main-branch measurement).
+  {
+    MossTDState &stx = static_cast<MossTDState &>(state);
+    const int sr = meta_.audio_sample_rate > 0 ? meta_.audio_sample_rate : 16000;
+    stx.speech_end_s = 0.0;
+    const size_t n = input_frames.size();
+    for (size_t b0 = 0; b0 < n; b0 += (size_t)sr) {
+      const size_t b1 = std::min(n, b0 + (size_t)sr);
+      double e = 0.0;
+      for (size_t i = b0; i < b1; ++i)
+        e += (double)input_frames[i] * input_frames[i];
+      if (std::sqrt(e / (double)std::max<size_t>(1, b1 - b0)) > 0.002)
+        stx.speech_end_s = (double)b1 / sr;
+    }
+  }
   const bool prof = std::getenv("RS_PROFILE") != nullptr;
   auto _t0 = std::chrono::steady_clock::now();
   std::vector<float> mel;
@@ -895,6 +913,16 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     int n_backends = ggml_backend_sched_get_n_backends(sched);
     ggml_backend_t gpu_backend =
         ggml_backend_sched_get_backend(sched, n_backends - 1);
+    // Decode runs on the CPU on the Nano; a CUDA-resident KV makes the sched
+    // ship the whole live prefix device->host EVERY token (measured: fast
+    // path only 0.3->0.4 tok/s). Keep the persistent KV on the CPU backend
+    // (RS_KV_ON_GPU opts back for GPU-decode experiments).
+    if (std::getenv("RS_KV_ON_GPU") == nullptr) {
+      for (int bi = 0; bi < n_backends; ++bi) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+        if (ggml_backend_is_cpu(b)) { gpu_backend = b; break; }
+      }
+    }
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);
     if (kv_gpu_buf) ggml_backend_buffer_clear(kv_gpu_buf, 0);  // fixed-shape
     // attention reads masked tail rows; uninitialized data must not be NaN.
@@ -959,7 +987,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_CONSECUTIVE_REPEAT = 10;
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
-  struct NgramSeen { int count; double max_ts; };
+  struct NgramSeen { int count; int first_idx; double ts; int ts_ticks; };
   std::unordered_map<uint64_t, NgramSeen> ngram_seen_;
   constexpr float REPETITION_PENALTY = 1.10f;
   constexpr int PENALTY_WINDOW = 64;
@@ -976,11 +1004,14 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const double audio_dur_s =
       static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
   double max_ts_seen = 0.0;
+  int ts_tick_count = 0;
+  int n_eos_suppressed = 0;
   // RS_AUDIO_KV_WINDOW=<s>: monotonic audio-KV eviction (main-branch port,
   // incl. the evicted-total physical-shift fix). Requires the v6-stream
   // model (trained for the bounded window); v5 drifts/stops early.
   const double kv_window_s =
-      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 0.0;
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 45.0;
+  // DEFAULT ON (45 s; =0 opts out — required for v5-era models).
   const int kv_audio_base = n_prefix;
   const double kv_tok_per_s = 12.5;
   int kv_audio_lo = kv_audio_base;
@@ -1096,6 +1127,35 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       }
     }
 
+    // Premature-EOS guard (main backport): windows starting mid-utterance
+    // sometimes EOS with <60% of the SPEECH covered — silent loss. Suppress
+    // and take the best non-EOS token; duration guard + loop breaker bound
+    // any runaway. RS_EOS_MINCOVER=0 disables.
+    {
+      static const double eos_min_cover =
+          std::getenv("RS_EOS_MINCOVER") ? atof(std::getenv("RS_EOS_MINCOVER")) : 0.6;
+      const double speech_end =
+          static_cast<MossTDState &>(state).speech_end_s > 0.0
+              ? static_cast<MossTDState &>(state).speech_end_s : audio_dur_s;
+      if (next_token == eos_token_id && audio_dur_s > 30.0 &&
+          eos_min_cover > 0.0 && n_eos_suppressed < 64 &&
+          max_ts_seen < eos_min_cover * speech_end &&
+          max_ts_seen < speech_end - 15.0) {
+        float best2 = -1e30f; int32_t alt = -1;
+        for (int v = 0; v < n_vocab; ++v)
+          if (v != eos_token_id && dec_logits_host[v] > best2) {
+            best2 = dec_logits_host[v]; alt = v;
+          }
+        if (alt >= 0) {
+          if (n_eos_suppressed == 0)
+            RS_LOG_WARN("MossTD: premature EOS at %.0f/%.0f s — suppressing",
+                        max_ts_seen, speech_end);
+          next_token = alt;
+          ++n_eos_suppressed;
+        }
+      }
+    }
+
     if (next_token == best_token) consecutive_same_token++;
     else                          consecutive_same_token = 0;
     if (st.token_ids.size() >= 2 &&
@@ -1157,6 +1217,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
               break;
             }
             if (ts > max_ts_seen) max_ts_seen = ts;
+            ++ts_tick_count;
           }
         }
       }
@@ -1173,16 +1234,27 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           h ^= (uint64_t)(uint32_t)tk[j];
           h *= 1099511628211ULL;
         }
+        // Tick-stall semantics (main backport): "stalled clock" = ticking
+        // WITHOUT advancing. Timestamp-free dense reading (no ticks) must not
+        // count — legit statute formulas repeat every ~50 tokens with zero
+        // [ts]; counting them killed correct windows. On fire, trim to the
+        // first counted occurrence.
         auto it = ngram_seen_.find(h);
+        const int cur_idx = nsz;
         if (it == ngram_seen_.end()) {
-          ngram_seen_.emplace(h, NgramSeen{1, max_ts_seen});
-        } else if (max_ts_seen >= it->second.max_ts + 2.0) {
-          it->second = NgramSeen{1, max_ts_seen};
-        } else if (++it->second.count >= 3) {
-          RS_LOG_WARN("MossTD: repeated content n-gram x3 with stalled "
-                      "timestamps — stopping (loop breaker)");
-          ggml_backend_sched_reset(decode_sched);
-          break;
+          ngram_seen_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count});
+        } else if (max_ts_seen >= it->second.ts + 2.0) {
+          it->second = NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count};
+        } else if (ts_tick_count > it->second.ts_ticks) {
+          it->second.ts_ticks = ts_tick_count;
+          if (++it->second.count >= 3) {
+            RS_LOG_WARN("MossTD: n-gram recurred 3x with ticking-but-stalled "
+                        "clock — trimming + stopping (loop breaker)");
+            if ((int)st.token_ids.size() > it->second.first_idx)
+              st.token_ids.resize(it->second.first_idx);
+            ggml_backend_sched_reset(decode_sched);
+            break;
+          }
         }
       }
     }
