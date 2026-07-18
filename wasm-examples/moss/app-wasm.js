@@ -699,11 +699,22 @@ function collapseLoops(list) {
     const t = (s.text || s.t || "").trim();
     let dup = false;
     if (t.length >= 10) {
+      // near-adjacent echo (A,B,A,B within 30 s)
       for (let k = out.length - 1; k >= 0 && k >= out.length - 2; k--) {
         const p = out[k];
         if ((p.text || p.t || "").trim() === t && s.start - p.start < 30) {
           dup = true; break;
         }
+      }
+      // slow cycle: the SAME >=20-char sentence 3+ times inside 180 s
+      // (measured: one sentence 4x at 32-54 s spacing — past both the
+      // engine cycle detector and the 30 s window above). A legit verbatim
+      // re-read appears exactly twice.
+      if (!dup && t.length >= 20) {
+        let n = 0;
+        for (let k = out.length - 1; k >= 0 && s.start - out[k].start < 180; k--)
+          if ((out[k].text || out[k].t || "").trim() === t) n++;
+        if (n >= 2) dup = true;
       }
     }
     if (!dup) out.push(s);
