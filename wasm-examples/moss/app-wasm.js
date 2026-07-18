@@ -1240,14 +1240,67 @@ function mp3StreamSource(file, estDurS) {
   };
 }
 
+// Seek-based window source via ffmpeg.wasm — the robust path for EVERYTHING
+// that is not plain WAV. Mount the file (WORKERFS: zero-copy, any size) and
+// decode ONLY the requested window with `-ss` input seeking, which uses the
+// container/Xing seek index (VBR-correct — the byte-anchored mp3 chunker
+// trimmed real audio on VBR files and "ran dry" mid-file) and keeps memory
+// constant for 2 h videos (the old one-shot full decode blew the wasm heap
+// and died partway with a truncated stream).
+function ffmpegWindowSource(file, estDurS, onStatus) {
+  let ffP = null, mounted = false, wrote = false;
+  const IN_DIR = "/inwf";
+  async function ensure() {
+    if (ffP) return ffP;
+    ffP = (async () => {
+      const ff = await getFFmpeg();
+      try {
+        await ff.createDir(IN_DIR);
+        await ff.mount("WORKERFS", { files: [new File([file], "in", { type: file.type })] }, IN_DIR);
+        mounted = true;
+      } catch (e) {
+        console.warn("[ffsrc] WORKERFS mount failed, copying into MEMFS:", e && e.message);
+        onStatus && onStatus("Loading audio into converter\u2026");
+        await ff.writeFile("in_all", new Uint8Array(await file.arrayBuffer()));
+        wrote = true;
+      }
+      return ff;
+    })().catch((e) => { ffP = null; throw e; });
+    return ffP;
+  }
+  return {
+    durS: estDurS,
+    async getWindow(s0, n) {
+      const ff = await ensure();
+      const startS = (s0 / SR).toFixed(3), lenS = (n / SR + 0.5).toFixed(3);
+      const inPath = mounted ? IN_DIR + "/in" : "in_all";
+      const code = await ff.exec(["-ss", startS, "-t", lenS, "-i", inPath,
+        "-vn", "-sn", "-dn", "-ar", String(SR), "-ac", "1", "-f", "f32le", "-y", "out.raw"]);
+      if (code !== 0) throw new Error("ffmpeg window decode failed (code " + code + ")");
+      const data = await ff.readFile("out.raw");
+      ff.deleteFile("out.raw").catch(() => {});
+      const out = new Float32Array(data.slice().buffer);
+      return out.length > n ? out.subarray(0, n) : out;
+    },
+    close() {
+      (async () => {
+        const ff = await ffP; if (!ff) return;
+        if (mounted) { await ff.unmount(IN_DIR).catch(() => {}); await ff.deleteDir(IN_DIR).catch(() => {}); }
+        if (wrote) await ff.deleteFile("in_all").catch(() => {});
+      })().catch(() => {});
+    },
+  };
+}
+
 // Pick the best source for a blob.
 async function makeAudioSource(blob, onStatus) {
   const durationS = await probeDuration(blob).catch(() => 0);
   const isMp3 = /mpeg|mp3/i.test(blob.type) || /\.mp3$/i.test(blob.name || "");
   const wavHeader = !isMp3 ? await parseWavHeader(blob).catch(() => null) : null;
   if (wavHeader) return wavWindowSource(blob, wavHeader);
-  if (isMp3 && durationS > 0) return mp3StreamSource(blob, durationS);
-  // m4a/other: no reliable random access — one-shot decode (ffmpeg fallback inside).
+  // Everything else (mp3 incl. VBR, m4a, mp4/video): seek-based ffmpeg windows.
+  if (durationS > 0) return ffmpegWindowSource(blob, durationS, onStatus);
+  // Duration unknown (probe failed): one-shot decode (ffmpeg fallback inside).
   return arraySource(await blobTo16k(blob, 0, onStatus));
 }
 
