@@ -542,6 +542,24 @@ bool MossTDModel::Encode(const std::vector<float> &input_frames,
     return false;
   }
   // input_frames is raw PCM because meta_.use_external_frontend = true.
+  // Record where speech ENERGY ends (1 s RMS bins, same -54 dBFS threshold as
+  // the demo's silence gate): the premature-EOS guard must not force decode
+  // over a trailing-silence region (that hallucinates), so its coverage
+  // target is speech end, not window length.
+  {
+    auto &stx = static_cast<MossTDState &>(state);
+    const int sr = meta_.audio_sample_rate > 0 ? meta_.audio_sample_rate : 16000;
+    stx.speech_end_s = 0.0;
+    const size_t n = input_frames.size();
+    for (size_t b0 = 0; b0 < n; b0 += (size_t)sr) {
+      const size_t b1 = std::min(n, b0 + (size_t)sr);
+      double e = 0.0;
+      for (size_t i = b0; i < b1; ++i)
+        e += (double)input_frames[i] * input_frames[i];
+      if (std::sqrt(e / (double)std::max<size_t>(1, b1 - b0)) > 0.002)
+        stx.speech_end_s = (double)b1 / sr;
+    }
+  }
   const bool prof = std::getenv("RS_PROFILE") != nullptr;
   auto _t0 = std::chrono::steady_clock::now();
   std::vector<float> mel;
@@ -1172,7 +1190,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
   // hash -> {hits while time stagnant, max_ts_seen at last hit}
-  struct NgramSeen { int count; double max_ts; };
+  struct NgramSeen { int count; int first_idx; double ts; int ts_ticks; };
   std::unordered_map<uint64_t, NgramSeen> ngram_counts_;
   // The HF reference decodes with plain greedy, but under Q4_K the very first
   // format tokens sit on a knife edge: without a penalty the decode can lock
@@ -1210,6 +1228,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   const double audio_dur_s =
       static_cast<MossTDState &>(state).T_audio * 8.0 * 160.0 / 16000.0;
   double max_ts_seen = 0.0;
+  int ts_tick_count = 0;
+  int n_eos_suppressed = 0;     // total [ts] emissions this window
   // RS_AUDIO_KV_WINDOW=<seconds>: monotonic-alignment KV eviction. ASR
   // attention is effectively local in time — when emitting text for time T
   // the decoder needs audio KV near T, not minutes back. As max_ts advances,
@@ -1219,8 +1239,12 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // (eviction removes keys, doesn't renumber them); new tokens use logical
   // positions so RoPE stays monotone. Long-range speaker identity is carried
   // by CAM++ linking, not raw audio KV, so W~45s should be accuracy-safe.
+  // DEFAULT ON (45 s): the deployed v6-stream model is trained for a bounded
+  // audio-KV window, and bounded memory on long audio is a product requirement.
+  // RS_AUDIO_KV_WINDOW=0 opts out (needed for v5-era models, which drift
+  // under eviction); any other value overrides the window length.
   const double kv_window_s =
-      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 0.0;
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 45.0;
   const int kv_audio_base = n_prefix;                 // first audio col (sinks kept)
   const double tok_per_s = (double)span_T / std::max(1e-9, audio_T / 12.5);
   int kv_audio_lo = kv_audio_base;                    // first NON-evicted audio col
@@ -1365,6 +1389,36 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
       }
     }
 
+    // Mid-window EOS degeneration: on windows that START mid-utterance
+    // (pause-snap on continuous speech), the model sometimes emits EOS with
+    // less than half the audio transcribed (measured: EOS at 75/172 s, no
+    // guard fired — the rest of the window was silently lost). Suppress EOS
+    // while emitted timestamps cover < RS_EOS_MINCOVER (default 0.6) of the
+    // audio and take the best non-EOS token instead; the duration guard and
+    // loop breaker bound any forced-continuation garbage.
+    static const double eos_min_cover =
+        std::getenv("RS_EOS_MINCOVER") ? atof(std::getenv("RS_EOS_MINCOVER")) : 0.6;
+    const double speech_end =
+        static_cast<MossTDState &>(state).speech_end_s > 0.0
+            ? static_cast<MossTDState &>(state).speech_end_s : audio_dur_s;
+    if (next_token == eos_token_id && audio_dur_s > 30.0 &&
+        eos_min_cover > 0.0 && n_eos_suppressed < 64 &&
+        max_ts_seen < eos_min_cover * speech_end &&
+        max_ts_seen < speech_end - 15.0) {
+      float best2 = -1e30f; int32_t alt = -1;
+      for (int v = 0; v < n_vocab; ++v)
+        if (v != eos_token_id && dec_logits_host[v] > best2) {
+          best2 = dec_logits_host[v]; alt = v;
+        }
+      if (alt >= 0) {
+        if (n_eos_suppressed == 0)
+          RS_LOG_WARN("MossTD: premature EOS at %.0f/%.0f s — suppressing",
+                      max_ts_seen, audio_dur_s);
+        next_token = alt;
+        ++n_eos_suppressed;
+      }
+    }
+
     if (next_token == best_token) consecutive_same_token++;
     else                          consecutive_same_token = 0;
     if (st.token_ids.size() >= 2 &&
@@ -1469,6 +1523,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
               break;
             }
             if (ts > max_ts_seen) max_ts_seen = ts;
+            ++ts_tick_count;
           }
         }
       }
@@ -1492,16 +1547,32 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           h ^= (uint64_t)(uint32_t)tk[j];
           h *= 1099511628211ULL;
         }
+        // "Stalled clock" must mean the clock TICKED but didn't ADVANCE.
+        // A real segment loop emits a timestamp every cycle (measured: 34 ts
+        // across 11 repeats) that fails to move forward — that's stalling.
+        // A dense timestamp-FREE passage (statute enumeration legitimately
+        // repeats "駕駛人之行為因…" every ~50 tokens with zero [ts] at all)
+        // shows absence, not stalling — counting there killed correct
+        // windows. So a recurrence counts only if at least one [ts] was
+        // emitted since the same n-gram's previous occurrence; a >=2 s clock
+        // advance still resets (verbatim re-reads). On fire, trim to the
+        // first counted occurrence: one clean copy survives.
         auto it = ngram_counts_.find(h);
+        const int cur_idx = nsz;
         if (it == ngram_counts_.end()) {
-          ngram_counts_.emplace(h, NgramSeen{1, max_ts_seen});
-        } else if (max_ts_seen >= it->second.max_ts + 2.0) {
-          it->second = NgramSeen{1, max_ts_seen};   // time moved on: not a loop
-        } else if (++it->second.count >= 3) {
-          RS_LOG_WARN("MossTD: repeated content n-gram x3 with stalled "
-                      "timestamps — stopping (loop breaker)");
-          ggml_backend_sched_reset(sched);
-          break;
+          ngram_counts_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count});
+        } else if (max_ts_seen >= it->second.ts + 2.0) {
+          it->second = NgramSeen{1, cur_idx, max_ts_seen, ts_tick_count};
+        } else if (ts_tick_count > it->second.ts_ticks) {
+          it->second.ts_ticks = ts_tick_count;
+          if (++it->second.count >= 3) {
+            RS_LOG_WARN("MossTD: n-gram recurred 3x with ticking-but-stalled "
+                        "clock — trimming + stopping (loop breaker)");
+            if ((int)st.token_ids.size() > it->second.first_idx)
+              st.token_ids.resize(it->second.first_idx);
+            ggml_backend_sched_reset(sched);
+            break;
+          }
         }
       }
     }

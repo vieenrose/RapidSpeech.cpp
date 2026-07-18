@@ -202,9 +202,9 @@ const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
   // use monotonic KV EVICTION instead of q8: audio KV stays O(45 s) at full
   // f16 precision, heap stays flat, and sub-second timestamps survive.
   // Short windows get the engine default (f16, no eviction).
-  if (n_audio_tokens > 1500) setenv("RS_AUDIO_KV_WINDOW", "45", 1);
-  else                       unsetenv("RS_AUDIO_KV_WINDOW");
-  unsetenv("RS_KV_Q8");
+  // Eviction is the ENGINE default now (45 s; RS_AUDIO_KV_WINDOW=0 opts out),
+  // so no per-call setenv here — which also stops clobbering the page's
+  // ?env_RS_* debug knobs (rs_wasm_setenv).
 
   std::vector<float> pcmv(pcm, pcm + n_samples);
   auto st = m->CreateState();

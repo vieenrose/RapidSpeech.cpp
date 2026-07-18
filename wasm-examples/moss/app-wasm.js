@@ -860,6 +860,25 @@ async function transcribe(source) {
       finish();
       return;
     }
+    // Advance by the model's OWN last complete-segment boundary, not the
+    // acoustic pause-cut. On continuous dense speech (no real pauses) pauseCut
+    // lands mid-sentence, so the next window starts mid-utterance — where MOSS
+    // degenerates (loops or early-stops) and the loop-breaker kills the window,
+    // losing ~a minute. A segment's closing timestamp IS a clean utterance
+    // boundary, so restart there and re-transcribe the ragged tail after it.
+    {
+      let lastEnd = 0;
+      for (const s of winSegs)
+        if (s.rawEnd != null && s.rawEnd > s.start) lastEnd = Math.max(lastEnd, s.rawEnd);
+      const coveredS = lastEnd - winStartS;          // clean coverage this window
+      const MIN_ADV = 20;                            // never re-loop on tiny progress
+      if (lastEnd > 0 && coveredS >= MIN_ADV && coveredS < cut - 1 && !isLastWin) {
+        cursorS = lastEnd;                           // clean boundary < pause-cut
+        winSegs = winSegs.filter((s) => (s.rawEnd ?? s.end ?? s.start) <= lastEnd + 0.01);
+      }
+      // else: healthy window (covered ≈ cut) or a fully-degenerate one
+      // (covered < MIN_ADV) — keep the pause-cut advance to guarantee progress.
+    }
     processedS = cursorS;
     for (const s of winSegs) diarSegs.push(s);
     normalizeSegs(diarSegs);                 // fill end + window-local speaker
