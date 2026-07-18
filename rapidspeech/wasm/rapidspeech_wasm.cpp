@@ -44,7 +44,7 @@ extern "C" {
 
 // ── Globals (single-context for browser demos) ──────────────
 static rs_context_t *g_ctx = nullptr;
-static char g_last_text[4096] = {0};
+static char g_last_text[65536] = {0};  // 3072-token budget x ~3B CJK + tags
 
 // Buffer for TTS streaming PCM — owned by C, lifetime tied to g_ctx.
 // Each successful TTS chunk is copied here so JS can read it via

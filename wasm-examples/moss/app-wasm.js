@@ -451,8 +451,9 @@ function ensureModel() {
           (WANT_GPU && !m.gpu ? " · (GPU requested but engine is CPU-only)" : ""));
         resolve();
       } else if (m.type === "moss_token") {
-        tailProvisional = s2tw(m.text);      // live partial (Traditional)
-        tokenCount++;                        // one decoder token per stream event
+        beat("decoding");                    // streamed token = progress; without
+        tailProvisional = s2tw(m.text);      // this the stall watchdog counts a
+        tokenCount++;                        // healthy token-streaming decode as idle
         scheduleTailRender();
       } else if (m.type === "moss_phase") {
         // Liveness through the long silent phases (multi-chunk encode, prefill).
