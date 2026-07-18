@@ -6,6 +6,7 @@
 // Usage: moss_td_test <moss-td.gguf> <audio.wav> [--gpu] [--prompt "..."]
 #include "core/rs_context.h"
 #include "core/rs_model.h"
+#include "arch/moss_td.h"
 #include "rapidspeech.h"
 #include "utils/rs_wav.h"
 
@@ -21,11 +22,12 @@ int main(int argc, char **argv) {
   }
   const char *model_path = argv[1];
   const char *wav_path   = argv[2];
-  bool use_gpu = false;
+  bool use_gpu = false, stream = false;
   std::string prompt;
   for (int i = 3; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--gpu") use_gpu = true;
+    else if (a == "--stream") stream = true;
     else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
   }
 
@@ -41,6 +43,28 @@ int main(int argc, char **argv) {
          m.audio_sample_rate, m.vocab_size);
 
   if (!prompt.empty()) ctx->model->SetUserInputPrompt(prompt);
+
+  // --stream: line-oriented live progress on stdout for host processes
+  // (mirrors the wasm worker's moss_token / moss_phase messages).
+  //   @PARTIAL\t<full partial transcript so far>
+  //   @PHASE\t<name>\t<cur>\t<total>
+  if (stream) {
+    // static_cast: typeinfo isn't exported across the core .so boundary
+    // (-fvisibility=hidden), and arch_name already proves the type.
+    if (m.arch_name == "MossTD") {
+      auto *mtd = static_cast<MossTDModel *>(ctx->model.get());
+      mtd->SetOnToken([](const std::string &partial) {
+        std::string one = partial;
+        for (auto &c : one) if (c == '\n' || c == '\r') c = ' ';
+        printf("@PARTIAL\t%s\n", one.c_str());
+        fflush(stdout);
+      });
+      mtd->SetOnPhase([](const char *phase, int cur, int total) {
+        printf("@PHASE\t%s\t%d\t%d\n", phase, cur, total);
+        fflush(stdout);
+      });
+    }
+  }
 
   std::vector<float> pcm;
   if (!load_wav_file_resampled(wav_path, pcm, m.audio_sample_rate)) {
