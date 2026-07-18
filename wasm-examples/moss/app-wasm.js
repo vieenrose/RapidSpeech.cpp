@@ -20,7 +20,7 @@ const $ = (id) => document.getElementById(id);
 
 /* ---------------------------- configuration ------------------------------ */
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
-  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v6stream-q4_k_m.gguf";
+  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v61-q4_k_m.gguf";
 // CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
