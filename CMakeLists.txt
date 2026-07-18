@@ -538,6 +538,9 @@ if (RS_BUILD_CLI)
     add_executable(moss-td-test
             tools/moss_td_test.cpp
     )
+    add_executable(rs-speaker-embed
+            tools/speaker_embed_cli.cpp
+    )
     add_executable(rs-server
             examples/server/rs-server.cpp
     )
@@ -554,6 +557,7 @@ if (RS_BUILD_CLI)
             rs-kws
             rs-server
             moss-td-test
+            rs-speaker-embed
     )
 
     if (NOT WIN32)
@@ -574,6 +578,7 @@ if (RS_BUILD_CLI)
 
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(moss-td-test PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-speaker-embed PRIVATE rapidspeech-core ggml)
     target_include_directories(moss-td-test PRIVATE rapidspeech/src)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-asr-online PRIVATE rapidspeech-core ggml Threads::Threads)
