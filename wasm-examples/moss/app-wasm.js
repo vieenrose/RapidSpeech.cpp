@@ -868,8 +868,13 @@ async function transcribe(source) {
     // boundary, so restart there and re-transcribe the ragged tail after it.
     {
       let lastEnd = 0;
-      for (const s of winSegs)
-        if (s.rawEnd != null && s.rawEnd > s.start) lastEnd = Math.max(lastEnd, s.rawEnd);
+      for (const s of winSegs) {
+        // MOSS emits [start][Sxx]text[end]: the trailing [end] parses as the
+        // NEXT match's start, so rawEnd is usually null — use the computed
+        // end (next-segment start / start+3 fallback) or lastEnd never moves.
+        const e = s.rawEnd ?? s.end ?? s.start;
+        if (e > s.start || (s.end ?? 0) > lastEnd) lastEnd = Math.max(lastEnd, e);
+      }
       const coveredS = lastEnd - winStartS;          // clean coverage this window
       const MIN_ADV = 20;                            // never re-loop on tiny progress
       if (lastEnd > 0 && coveredS >= MIN_ADV && coveredS < cut - 1 && !isLastWin) {
