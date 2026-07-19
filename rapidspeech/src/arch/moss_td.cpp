@@ -1209,7 +1209,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
   // hash -> {hits while time stagnant, max_ts_seen at last hit}
   struct NgramSeen { int count; int first_idx; double ts; int ts_ticks;
-                     int last_idx; double last_delta; int cyc; };
+                     int last_idx; double last_delta; int cyc; int tight; };
   std::unordered_map<uint64_t, NgramSeen> ngram_counts_;
   // The HF reference decodes with plain greedy, but under Q4_K the very first
   // format tokens sit on a knife edge: without a penalty the decode can lock
@@ -1599,7 +1599,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         const int cur_idx = nsz;
         if (it == ngram_counts_.end()) {
           ngram_counts_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen,
-                                             ts_tick_count, cur_idx, -1.0, 1});
+                                             ts_tick_count, cur_idx, -1.0, 1, 0});
         } else if (max_ts_seen >= it->second.ts + 2.0) {
           // Clock advanced — usually a legit re-read. BUT a repetition loop
           // that FABRICATES advancing timestamps (measured: one utterance
@@ -1626,9 +1626,11 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           const int keep_cyc = periodic ? it->second.cyc : 1;
           const int keep_first = periodic ? it->second.first_idx : cur_idx;
           it->second = NgramSeen{1, keep_first, max_ts_seen, ts_tick_count,
-                                 cur_idx, periodic ? delta : -1.0, keep_cyc};
+                                 cur_idx, periodic ? delta : -1.0, keep_cyc, 0};
         } else if (ts_tick_count > it->second.ts_ticks) {
           it->second.ts_ticks = ts_tick_count;
+          it->second.last_idx = cur_idx;
+          it->second.tight = 0;
           if (++it->second.count >= 3) {
             RS_LOG_WARN("MossTD: n-gram recurred 3x with ticking-but-stalled "
                         "clock — trimming + stopping (loop breaker)");
@@ -1636,6 +1638,29 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
               st.token_ids.resize(it->second.first_idx);
             ggml_backend_sched_reset(sched);
             break;
+          }
+        } else {
+          // NO tick since this n-gram's last hit. Deliberately uncounted by
+          // the stall breaker (timestamp-free statute reading legitimately
+          // repeats formulas every ~50 tokens) — but a DEGENERATE tight loop
+          // ("這個需求的" x hundreds, observed on a 2 h WASM run) also emits
+          // zero timestamps and recurs BACK-TO-BACK. Distinguisher: stride.
+          // A phrase cycling every <=16 tokens, 8+ consecutive times, is
+          // ~40+ tokens of pure repetition — no real speech does that.
+          const int stride = cur_idx - it->second.last_idx;
+          it->second.last_idx = cur_idx;
+          if (stride > 0 && stride <= 16) {
+            if (++it->second.tight >= 8) {
+              RS_LOG_WARN("MossTD: n-gram recurred %dx at stride %d with no "
+                          "timestamps — tight loop, trimming + stopping",
+                          it->second.tight, stride);
+              if ((int)st.token_ids.size() > it->second.first_idx)
+                st.token_ids.resize(it->second.first_idx);
+              ggml_backend_sched_reset(sched);
+              break;
+            }
+          } else {
+            it->second.tight = 0;
           }
         }
       }
