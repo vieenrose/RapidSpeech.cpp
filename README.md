@@ -128,18 +128,18 @@ tokens spliced into the LLM). Emits `[start][Sxx]text[end]` segments; Q4_K GGUF
 (~700 MB). Runs on CPU / CUDA and **entirely in the browser via WebAssembly**
 (mel + encoder + streaming decoder in WASM, optional CAM++ cross-window speaker
 linking). zh-TW / English meetings. The shipped model is the
-[zh-TW v6.1 fine-tune](https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw)
+[zh-TW v7 fine-tune](https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw)
 of [OpenMOSS's original](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)
 — same 0.9B architecture, adapted for deployment:
 
-| | Original MOSS-TD 0.9B | Shipped here (v6.1) |
+| | Original MOSS-TD 0.9B | Shipped here (v7) |
 |---|---|---|
 | Output script / domain | general Mandarin (Simplified-leaning) | Traditional Chinese (Taiwan) meetings + zh/EN code-switch |
-| Code-switch MER (ASCEND zh/en/mixed/all) | reference | 0.200 / 0.438 / 0.163 / **0.267** (v6-stream was 0.285 all) |
+| Code-switch MER (ASCEND, q4 GGUF, all) | reference | **0.317** (v7, q4-native QAT; beats v6.1-q4's 0.352) |
 | Long-audio decode | full attention, KV grows O(audio) | bounded **45 s audio-KV window** (streaming FT + engine eviction, default on) — flat memory, ~20 % faster; KV buffer sized to the window (300 s window: 728→530 MB) |
 | Time markers on dense speech | sparse | sentence-cadence supervision (v6.1): 18–20 monotone markers on a 180 s no-pause window where v6 emitted 1 |
-| Decode robustness | — | tick-stall loop breaker, advancing-clock cycle detector, slow-cycle collapse, speech-aware premature-EOS guard, KV capacity guard, per-window watchdog |
-| Quantization | bf16 | diarization-defended q4 QAT → q4_K_M GGUF (707 MB) |
+| Decode robustness | — | q4-robust weights (v7 QAT — fixes dense-speech repetition at the weight level) + engine guards: tick-stall / advancing-clock / tight-loop breakers, speech-aware premature-EOS guard, KV capacity guard, per-window watchdog |
+| Quantization | bf16 | CE-only int4 QAT (v7) → q4_K_M GGUF (707 MB) — q4-robust, no repetition loop |
 | Diarization on long meetings | DER 0.74 (123 min) | DER 0.195 / consistency 0.905; cross-window linking v2 (tag-pooled units + cannot-link clustering) — 2 h meeting 24→10 speakers |
 | Runs on | HF transformers (GPU) | CPU / CUDA / **browser WASM** / Jetson Nano gen1 |
 
