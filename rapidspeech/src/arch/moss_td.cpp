@@ -1,4 +1,5 @@
 #include "moss_td.h"
+#include "arch/moss_loop_guard.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1207,10 +1208,7 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   constexpr int MAX_CONSECUTIVE_REPEAT = 10;
   constexpr int MAX_ALTERNATING_REPEAT = 10;
   constexpr int NGRAM = 8;                        // loop-breaker n-gram length
-  // hash -> {hits while time stagnant, max_ts_seen at last hit}
-  struct NgramSeen { int count; int first_idx; double ts; int ts_ticks;
-                     int last_idx; double last_delta; int cyc; int tight; };
-  std::unordered_map<uint64_t, NgramSeen> ngram_counts_;
+  rapidspeech::MossLoopGuard loop_guard_;         // degenerate-repetition breaker
   // The HF reference decodes with plain greedy, but under Q4_K the very first
   // format tokens sit on a knife edge: without a penalty the decode can lock
   // into a degenerate style (timestamps pinned at 0.00, "[00:00:00]" artifacts,
@@ -1585,83 +1583,29 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
           h ^= (uint64_t)(uint32_t)tk[j];
           h *= 1099511628211ULL;
         }
-        // "Stalled clock" must mean the clock TICKED but didn't ADVANCE.
-        // A real segment loop emits a timestamp every cycle (measured: 34 ts
-        // across 11 repeats) that fails to move forward — that's stalling.
-        // A dense timestamp-FREE passage (statute enumeration legitimately
-        // repeats "駕駛人之行為因…" every ~50 tokens with zero [ts] at all)
-        // shows absence, not stalling — counting there killed correct
-        // windows. So a recurrence counts only if at least one [ts] was
-        // emitted since the same n-gram's previous occurrence; a >=2 s clock
-        // advance still resets (verbatim re-reads). On fire, trim to the
-        // first counted occurrence: one clean copy survives.
-        auto it = ngram_counts_.find(h);
         const int cur_idx = nsz;
-        if (it == ngram_counts_.end()) {
-          ngram_counts_.emplace(h, NgramSeen{1, cur_idx, max_ts_seen,
-                                             ts_tick_count, cur_idx, -1.0, 1, 0});
-        } else if (max_ts_seen >= it->second.ts + 2.0) {
-          // Clock advanced — usually a legit re-read. BUT a repetition loop
-          // that FABRICATES advancing timestamps (measured: one utterance
-          // 13x, each cycle advancing ~3-7 s) looks exactly like this. Its
-          // signature: near-constant token stride AND near-constant small
-          // ts-delta per recurrence. Legit re-reads recur once at an
-          // irregular, usually large gap; timestamp-free passages have no
-          // deltas at all.
-          const int stride = cur_idx - it->second.last_idx;
-          const double delta = max_ts_seen - it->second.ts;
-          const bool periodic =
-              stride <= 256 && delta > 0.0 && delta <= 15.0 &&
-              (it->second.last_delta < 0.0 ||
-               std::fabs(delta - it->second.last_delta) <= 2.0);
-          if (periodic && ++it->second.cyc >= 4) {
+        // See moss_loop_guard.h for the three loop signatures. The guard is a
+        // pure state machine (unit tested in tests/test_moss_loop_guard.cpp);
+        // on a fire we trim the token stream to the first counted occurrence
+        // (one clean copy survives) and stop decoding.
+        auto d = loop_guard_.observe(h, cur_idx, max_ts_seen, ts_tick_count);
+        if (d.trim_and_stop) {
+          using R = rapidspeech::MossLoopGuard::Reason;
+          if (d.reason == R::AdvancingCycle)
             RS_LOG_WARN("MossTD: %d uniform cycles (stride~%d, dt~%.1fs) — "
                         "advancing-clock loop, trimming + stopping",
-                        it->second.cyc, stride, delta);
-            if ((int)st.token_ids.size() > it->second.first_idx)
-              st.token_ids.resize(it->second.first_idx);
-            ggml_backend_sched_reset(sched);
-            break;
-          }
-          const int keep_cyc = periodic ? it->second.cyc : 1;
-          const int keep_first = periodic ? it->second.first_idx : cur_idx;
-          it->second = NgramSeen{1, keep_first, max_ts_seen, ts_tick_count,
-                                 cur_idx, periodic ? delta : -1.0, keep_cyc, 0};
-        } else if (ts_tick_count > it->second.ts_ticks) {
-          it->second.ts_ticks = ts_tick_count;
-          it->second.last_idx = cur_idx;
-          it->second.tight = 0;
-          if (++it->second.count >= 3) {
-            RS_LOG_WARN("MossTD: n-gram recurred 3x with ticking-but-stalled "
-                        "clock — trimming + stopping (loop breaker)");
-            if ((int)st.token_ids.size() > it->second.first_idx)
-              st.token_ids.resize(it->second.first_idx);
-            ggml_backend_sched_reset(sched);
-            break;
-          }
-        } else {
-          // NO tick since this n-gram's last hit. Deliberately uncounted by
-          // the stall breaker (timestamp-free statute reading legitimately
-          // repeats formulas every ~50 tokens) — but a DEGENERATE tight loop
-          // ("這個需求的" x hundreds, observed on a 2 h WASM run) also emits
-          // zero timestamps and recurs BACK-TO-BACK. Distinguisher: stride.
-          // A phrase cycling every <=16 tokens, 8+ consecutive times, is
-          // ~40+ tokens of pure repetition — no real speech does that.
-          const int stride = cur_idx - it->second.last_idx;
-          it->second.last_idx = cur_idx;
-          if (stride > 0 && stride <= 16) {
-            if (++it->second.tight >= 8) {
-              RS_LOG_WARN("MossTD: n-gram recurred %dx at stride %d with no "
-                          "timestamps — tight loop, trimming + stopping",
-                          it->second.tight, stride);
-              if ((int)st.token_ids.size() > it->second.first_idx)
-                st.token_ids.resize(it->second.first_idx);
-              ggml_backend_sched_reset(sched);
-              break;
-            }
-          } else {
-            it->second.tight = 0;
-          }
+                        d.count, d.stride, d.delta);
+          else if (d.reason == R::TickStall)
+            RS_LOG_WARN("MossTD: n-gram recurred %dx with ticking-but-stalled "
+                        "clock — trimming + stopping (loop breaker)", d.count);
+          else
+            RS_LOG_WARN("MossTD: n-gram recurred %dx at stride %d with no "
+                        "timestamps — tight loop, trimming + stopping",
+                        d.count, d.stride);
+          if ((int)st.token_ids.size() > d.trim_idx)
+            st.token_ids.resize(d.trim_idx);
+          ggml_backend_sched_reset(sched);
+          break;
         }
       }
     }

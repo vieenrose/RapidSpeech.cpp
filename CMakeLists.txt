@@ -749,6 +749,7 @@ if (RS_BUILD_TESTS)
             kokoro_metal_convt
             kokoro_en_g2p
             wetext_normalizer
+            moss_loop_guard
     )
 
     foreach(module ${TEST_MODULES})
