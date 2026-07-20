@@ -19,8 +19,15 @@ import { itn } from "./itn.js";
 const $ = (id) => document.getElementById(id);
 
 /* ---------------------------- configuration ------------------------------ */
+// ROLLED BACK to v6.1 (2026-07-20). v7-q4 destroys speaker diarization: on the
+// 5-min example it emits ONE [S01] where base/v5/v6-stream/v6.1 all resolve the
+// reference's three speakers. It is a WEIGHTS x QUANT interaction — v7 at f16
+// still resolves three, only q4 collapses them — so an fp-only eval misses it.
+// v6.1-q4 diarizes correctly; its repetition-loop risk is covered by the engine
+// MossLoopGuard shipped since. Restore v7 only when v7.1 passes the bisect at
+// BOTH q4 and f16.
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
-  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v7-q4_k_m.gguf";
+  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v61-q4_k_m.gguf";
 // CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
