@@ -43,6 +43,7 @@ function promptWithHotwords() {
 const EXAMPLES =
   "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-onnx/resolve/main/demo/";
 
+const RS_WIN_DEBUG = new URLSearchParams(location.search).has("windbg");
 const SR = 16000, N_MEL = 80, N_FRAMES = 3000;
 // iOS WebKit refuses the desktop build's 4 GB shared-memory reservation and
 // caps tab memory ~1.5 GB, so iOS gets a small-max WASM variant + short windows
@@ -966,6 +967,42 @@ async function transcribe(source) {
         const e = s.rawEnd ?? s.end ?? s.start;
         if (e > s.start || (s.end ?? 0) > lastEnd) lastEnd = Math.max(lastEnd, e);
       }
+      // A window's LAST segment is often ragged: the model runs out of audio
+      // mid-utterance, so its text keeps going while the clock does not. That
+      // segment then carries far more text than its span can hold (measured:
+      // 127 chars stamped over 3 s = 42 ch/s, ~10x speech) and it swallows the
+      // NEXT utterance's text while wearing the next utterance's timestamp --
+      // which is how "請問各位委員…沒有異議通過" got merged into the 142 s
+      // segment instead of standing alone at ~134 s, where the model actually
+      // emitted it ([134.00][134.25][S01] in the raw engine output). Back the
+      // cursor up to that segment's START so the next window re-transcribes the
+      // whole utterance with real audio behind it -- the same "retreat to a
+      // clean boundary" the branch below already does, just triggered by
+      // raggedness instead of by coverage.
+      const MAX_CH_PER_S = 15;   // ~3x the fastest real rate observed (5.3)
+      const bySt = winSegs.slice().sort((a, b) => a.start - b.start);
+      let retreatTo = null;
+      for (let i = 0; i < bySt.length; i++) {
+        const s = bySt[i];
+        const end = bySt[i + 1]?.start ?? s.rawEnd ?? s.end ?? null;
+        const n = (s.text || "").length;
+        if (end === null || !(end > s.start) || n < 20) continue;
+        if (n / (end - s.start) > MAX_CH_PER_S) {
+          // Retreat to the previous GOOD segment's start, not to the ragged
+          // one's. A ragged segment's own timestamp is exactly what cannot be
+          // trusted: the reported case was stamped 142 s while its text began
+          // with speech from ~134 s, so cutting at 142 would silently DROP
+          // that audio. Backing up one more segment re-covers it; the stale
+          // copy is filtered out below, so nothing is duplicated.
+          retreatTo = i > 0 ? bySt[i - 1].start : null;
+          break;
+        }
+      }
+      if (retreatTo !== null && retreatTo - winStartS >= 20 && !isLastWin) {
+        cursorS = retreatTo;
+        winSegs = winSegs.filter((s) => s.start < retreatTo - 0.01);
+        lastEnd = retreatTo;
+      }
       const coveredS = lastEnd - winStartS;          // clean coverage this window
       const MIN_ADV = 20;                            // never re-loop on tiny progress
       if (lastEnd > 0 && coveredS >= MIN_ADV && coveredS < cut - 1 && !isLastWin) {
@@ -981,6 +1018,21 @@ async function transcribe(source) {
         // (it starts earlier) and drops only the ragged tail.
         winSegs = winSegs.filter((s) => s.start < lastEnd - 0.01 &&
           (s.rawEnd ?? s.end ?? s.start) <= lastEnd + 0.01);
+      }
+      // UNIVERSAL overlap guard. getWindow() hands the model the full WINDOW_S
+      // piece (180 s by default), but the cursor only advances to the
+      // pause-snapped `cut`, which pauseCut() picks from the LAST SNAP_S (12 s)
+      // of that piece. So up to 12 s of tail audio is transcribed by THIS
+      // window and transcribed AGAIN by the next one. Only the degenerate
+      // branch above filtered it; on a healthy window nothing did, so that
+      // overlap was emitted twice. Anything at/after the new cursor belongs to
+      // the next window by definition — drop it here, in every path.
+      winSegs = winSegs.filter((s) => s.start < cursorS - 0.01);
+      if (RS_WIN_DEBUG) {
+        const mk = winSegs.map((s) => s.start.toFixed(2)).join(",");
+        console.debug(`[win] start=${winStartS.toFixed(2)} cut=${cut.toFixed(2)} ` +
+          `covered=${(lastEnd - winStartS).toFixed(2)} nextCursor=${cursorS.toFixed(2)} ` +
+          `kept=${winSegs.length} starts=[${mk}]`);
       }
       // else: healthy window (covered ≈ cut) or a fully-degenerate one
       // (covered < MIN_ADV) — keep the pause-cut advance to guarantee progress.
