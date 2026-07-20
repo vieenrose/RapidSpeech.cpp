@@ -4,7 +4,7 @@
  * app.js): drop zone, examples, live streaming transcript, speaker legend
  * with click-to-filter, search, SRT/JSON export, heartbeat, progress bar,
  * click-to-seek player. The inference engine is different: instead of an
- * onnxruntime-web worker it drives a ggml Q4_K GGUF through RapidSpeech.cpp
+ * onnxruntime-web worker it drives a ggml F16 GGUF through RapidSpeech.cpp
  * compiled to multi-threaded WASM, hosted in a Web Worker (moss-worker.js) so
  * the page stays responsive. The decoder streams each token back live (via a
  * C++ postMessage hook), so the transcript fills in token by token; Stop takes
@@ -512,7 +512,7 @@ function ensureModel() {
     $("btn-load").disabled = true;
     setModelState("loading", "Loading WASM runtime…");
     $("dl-bars").innerHTML =
-      `<div>Q4_K GGUF<progress id="pg-model" max="100" value="0"></progress></div>`;
+      `<div>F16 GGUF<progress id="pg-model" max="100" value="0"></progress></div>`;
     await gpuPreflight();
     if (WASM_VARIANT === "gpu") setModelState("loading", "Loading WASM runtime (WebGPU)…");
     worker = new Worker(`./moss-worker.js?wasm=${WASM_VARIANT}`);
@@ -533,7 +533,7 @@ function ensureModel() {
       } else if (m.type === "ready") {
         modelReady = true; dlState = null; $("dl-bars").innerHTML = "";
         diarize = !!m.diarize;
-        setModelState("ready", `Model ready · Q4_K · WASM · ` +
+        setModelState("ready", `Model ready · F16 · WASM · ` +
           (m.gpu ? "WebGPU + " : "") + `${m.threads} threads` +
           (diarize ? " · CAM++ diarization" : "") +
           (WANT_GPU && !m.gpu ? " · (GPU requested but engine is CPU-only)" : ""));

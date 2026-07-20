@@ -146,7 +146,7 @@
       Speaker-attributed, timestamped transcription for Traditional-Chinese /
       English meetings. The
       <a href="https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw">0.9B MOSS model</a>
-      is quantized to a <b>ggml Q4_K GGUF</b> and runs <b>entirely in your browser</b>
+      is served as an <b>ggml F16 GGUF</b> and runs <b>entirely in your browser</b>
       via <a href="https://github.com/vieenrose/RapidSpeech.cpp">RapidSpeech.cpp</a>
       compiled to <b>WebAssembly (multi-threaded)</b>. Your audio never leaves your
       device. Try a real parliament meeting below, or transcribe your own recording.
@@ -157,7 +157,7 @@
     <h2>Model</h2>
     <div id="model-strip">
       <span id="model-state"><span class="dot"></span><span id="model-msg">Not loaded — starts automatically when needed</span></span>
-      <span id="quality" class="sub">Q4_K GGUF · ~700 MB one-time download · browser-cached</span>
+      <span id="quality" class="sub">F16 GGUF · ~2.1 GB one-time download · browser-cached · desktop only</span>
       <div style="margin-top:8px;font-size:.85rem">
         <label for="hotwords">Hotwords <small>(names/terms to bias recognition, comma-separated — e.g. 蔡其昌, 高端疫苗)</small></label><br>
         <input type="text" id="hotwords" placeholder="熱詞 / hotwords…" style="width:100%;max-width:560px;margin-top:2px">
@@ -233,8 +233,8 @@
     <summary>How it works · accuracy</summary>
     <p>
       Audio is transcribed in ~28-second windows by a 0.9B model (Whisper-Medium
-      encoder + Qwen3-0.6B decoder, fine-tuned for zh-TW meetings), quantized to
-      a <b>Q4_K GGUF</b>. Whisper-style 80-bin log-mel features are computed in
+      encoder + Qwen3-0.6B decoder, fine-tuned for zh-TW meetings), served as
+      an <b>F16 GGUF</b>. Whisper-style 80-bin log-mel features are computed in
       JavaScript; the encoder and decoder run in WebAssembly through
       <a href="https://github.com/vieenrose/RapidSpeech.cpp">RapidSpeech.cpp</a>
       (llama.cpp/ggml lineage), multi-threaded via SharedArrayBuffer under
@@ -254,7 +254,7 @@
     </p>
     <table>
       <tr><th></th><th>quant</th><th>download</th></tr>
-      <tr><td>decoder (this demo)</td><td>Q4_K_M GGUF</td><td>~700 MB</td></tr>
+      <tr><td>decoder (this demo)</td><td>F16 GGUF</td><td>~2.1 GB</td></tr>
     </table>
   </details>
 
@@ -263,7 +263,7 @@
     <b>CC-BY-4.0</b>, via <a href="https://huggingface.co/datasets/openfun/tw-ly-ivod">openfun/tw-ly-ivod</a>.
     Model: Apache-2.0 fine-tune of
     <a href="https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize">MOSS-Transcribe-Diarize</a>,
-    quantized to GGUF. Machine-generated transcripts may contain errors.
+    converted to GGUF. Machine-generated transcripts may contain errors.
     <br>Build: <code id="build" title="deployed Space commit">…</code>
   </footer>
 </div>
