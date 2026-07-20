@@ -963,7 +963,17 @@ async function transcribe(source) {
       const MIN_ADV = 20;                            // never re-loop on tiny progress
       if (lastEnd > 0 && coveredS >= MIN_ADV && coveredS < cut - 1 && !isLastWin) {
         cursorS = lastEnd;                           // clean boundary < pause-cut
-        winSegs = winSegs.filter((s) => (s.rawEnd ?? s.end ?? s.start) <= lastEnd + 0.01);
+        // Drop everything at/after the new cursor: the next window restarts at
+        // lastEnd and re-transcribes it (that is the point of backing up). The
+        // old test keyed on (rawEnd ?? end ?? start), but rawEnd is usually
+        // null (see above), so it collapsed to `start <= lastEnd` and KEPT the
+        // segment starting exactly at the boundary — which the next window then
+        // transcribed again. That produced a truncated duplicate fragment with
+        // an impossible speaking rate (measured: 38 chars in 0.9 s = 42 ch/s).
+        // Requiring start < lastEnd keeps the segment that DEFINED lastEnd
+        // (it starts earlier) and drops only the ragged tail.
+        winSegs = winSegs.filter((s) => s.start < lastEnd - 0.01 &&
+          (s.rawEnd ?? s.end ?? s.start) <= lastEnd + 0.01);
       }
       // else: healthy window (covered ≈ cut) or a fully-degenerate one
       // (covered < MIN_ADV) — keep the pause-cut advance to guarantee progress.
