@@ -666,8 +666,13 @@ function linkSpeakers(segs, threshold = 0.65) {
     const clusters = embIdx.map((_, i) => [i]);
     const wins = embIdx.map((i) => new Set([units[i].win]));
     const active = new Set(clusters.map((_, i) => i));
+    // `threshold` is a COSINE SIMILARITY (as documented); D holds cosine
+    // DISTANCE (1 - dot). Merge while distance < 1 - threshold. Passing the
+    // similarity straight in as the distance ceiling inverted the rule and
+    // merged anything above cosine 1-0.65=0.35 -- far too permissive.
+    const maxDist = 1 - threshold;
     for (;;) {
-      let bi = -1, bj = -1, bd = threshold;
+      let bi = -1, bj = -1, bd = maxDist;
       for (const i of active) for (const j of active) {
         if (j <= i) continue;
         // cannot-link veto: clusters sharing any window are distinct people
@@ -695,14 +700,27 @@ function linkSpeakers(segs, threshold = 0.65) {
   } else if (embIdx.length === 1) {
     labOfUnit.set(embIdx[0], nClusters++);
   }
-  // label segments; units with no embedding (all segments too short to
-  // embed) inherit the previous segment's cluster instead of minting a new
-  // speaker. Canonical S01/S02… by first appearance.
+  // Units with no embedding keep their OWN cluster rather than inheriting the
+  // neighbouring segment's. Inheriting silently discarded the model's own
+  // [Sxx] decision: on the 5-min example the engine correctly tagged the clerk
+  // (78-134 s) [S02], but with no embedding that span inherited the chair's
+  // cluster and the whole transcript collapsed to one speaker. A unit IS a
+  // (window, model-tag) pair, so giving it a fresh cluster preserves exactly
+  // the distinction the model made. Worst case is over-segmentation across
+  // windows (visible, recoverable) instead of silent speaker collapse.
+  units.forEach((u, i) => {
+    if (!labOfUnit.has(i) && u.segIdx.length) labOfUnit.set(i, nClusters++);
+  });
   const segCluster = new Array(segs.length);
   units.forEach((u, i) => {
     if (!labOfUnit.has(i)) return;
     for (const si of u.segIdx) segCluster[si] = labOfUnit.get(i);
   });
+  const nEmb = embIdx.length;
+  if (nEmb < units.length) {
+    console.warn(`linkSpeakers: ${units.length - nEmb}/${units.length} units ` +
+                 `had no CAM++ embedding (kept as separate speakers)`);
+  }
   const canon = new Map();
   const out = []; let prevCl = null;
   segs.forEach((s, i) => {
@@ -1596,7 +1614,14 @@ boot();
   try {
     const r = await fetch("./index.html", { method: "HEAD", cache: "no-store" });
     const c = r.headers.get("X-Repo-Commit");
-    el.textContent = c ? c.slice(0, 8) : "(local dev)";
-    if (c) el.title = "deployed Space commit " + c;
-  } catch { el.textContent = "(local dev)"; }
+    if (c) { el.textContent = c.slice(0, 8); el.title = "deployed Space commit " + c; return; }
+    el.textContent = stamped() || "(local dev)";
+  } catch { el.textContent = stamped() || "(local dev)"; }
+  // Fallback for hosts that do not emit X-Repo-Commit — notably the native C++
+  // Space, which serves this UI from its own app server rather than HF's
+  // static file host.
+  function stamped() {
+    const v = document.querySelector('meta[name="build-id"]')?.content;
+    return v && v !== "dev" ? v : null;
+  }
 })();

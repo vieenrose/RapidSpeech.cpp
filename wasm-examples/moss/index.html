@@ -3,6 +3,11 @@
 <head><script>window.huggingface={variables:{"SPACE_CREATOR_USER_ID":"60e91b56b6ee96e303fba97f"}};</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Stamped at deploy time by tools/stamp_build.sh. The X-Repo-Commit header
+     exists only on HF's STATIC file host, so the native C++ Space — which
+     serves this same UI from its own app server at /ui/ — never sees it and
+     always displayed "(local dev)". This meta works on both, and locally. -->
+<meta name="build-id" content="dev">
 <title>zh-TW 會議逐字稿 — RapidSpeech.cpp WASM · 100% 本機</title>
 <style>
   :root {
@@ -263,6 +268,6 @@
 </div>
 <!-- OpenCC Simplified->Traditional (self-contained cn2t bundle) for zh-TW output -->
 <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/cn2t.js" crossorigin="anonymous"></script>
-<script type="module" src="app-wasm.js?v=3987d04"></script>
+<script type="module" src="app-wasm.js?v=5d88cea"></script>
 </body>
 </html>
