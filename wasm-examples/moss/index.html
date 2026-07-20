@@ -178,7 +178,6 @@
       </div>
       <div id="win-row" style="margin-top:8px;font-size:.85rem">
         Window:
-        <label><input type="radio" name="win" value="90"> Fast 1.5 min</label>
         <label style="margin-left:8px"><input type="radio" name="win" value="180" checked> Best 3 min</label>
         <label style="margin-left:8px"><input type="radio" name="win" value="300"> 5 min (high memory · lower accuracy)</label>
       </div>
@@ -197,6 +196,8 @@
     <div class="inrow">
       <button id="btn-rec" disabled>● Record mic</button>
       <button id="btn-abort" class="danger" style="display:none">✕ Stop processing</button>
+      <button id="btn-load-tr" class="ghost" title="Load a previously saved .srt or .json transcript and play it against the audio — no inference">↥ Load transcript</button>
+      <input type="file" id="tr-in" accept=".srt,.json,text/plain,application/json" hidden>
       <span id="input-note" style="font-size:.83rem;color:var(--muted)"></span>
     </div>
     <div class="chips" id="examples">

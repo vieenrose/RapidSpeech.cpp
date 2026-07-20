@@ -19,15 +19,15 @@ import { itn } from "./itn.js";
 const $ = (id) => document.getElementById(id);
 
 /* ---------------------------- configuration ------------------------------ */
-// ROLLED BACK to v6.1 (2026-07-20). v7-q4 destroys speaker diarization: on the
-// 5-min example it emits ONE [S01] where base/v5/v6-stream/v6.1 all resolve the
-// reference's three speakers. It is a WEIGHTS x QUANT interaction — v7 at f16
-// still resolves three, only q4 collapses them — so an fp-only eval misses it.
-// v6.1-q4 diarizes correctly; its repetition-loop risk is covered by the engine
-// MossLoopGuard shipped since. Restore v7 only when v7.1 passes the bisect at
-// BOTH q4 and f16.
+// v7.1 at q5_K_M (2026-07-20). v7-q4 destroyed speaker diarization (ONE [S01]
+// where the reference has three speakers) — a WEIGHTS x QUANT interaction: the
+// same weights at f16 resolve all three. Measured quant ladder on v7.1, 171 s
+// window: f16 / q8_0 / q6_k / iq4_xs / q5_K_M all give 3 speakers + 13 markers;
+// only q4_K_M collapses to 2 speakers + 6 markers. The cliff sits exactly
+// between q4 and q5, so q5_K_M buys f16-identical diarization for 0.75 GB
+// instead of 2.13 GB (q4 was 0.71 GB). Do NOT drop back to q4.
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
-  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v61-q4_k_m.gguf";
+  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v71-q5_k_m.gguf";
 // CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
@@ -337,6 +337,83 @@ $("audio").addEventListener("timeupdate", () => {
     }
   }
 });
+
+/* ---- transcript import (.srt / .json) ----------------------------------- */
+// Round-trips what offerDownloads() writes, so a saved run can be replayed
+// against its audio without re-running inference. Also accepts the shapes our
+// eval tooling emits ({segments:[...]}, "spk" instead of "speaker") and plain
+// SRT from other tools, where the speaker may be "[S01] text", "S01: text" or
+// absent entirely.
+const SRT_TS = /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/;
+function srtTimeToS(t) {
+  const m = SRT_TS.exec(t);
+  if (!m) return null;
+  return +m[1] * 3600 + +m[2] * 60 + +m[3] + +m[4] / 1000;
+}
+function parseSRT(txt) {
+  const out = [];
+  for (const block of txt.replace(/\r/g, "").split(/\n\s*\n/)) {
+    const lines = block.split("\n").filter((l) => l.trim() !== "");
+    if (!lines.length) continue;
+    const ti = lines.findIndex((l) => l.includes("-->"));
+    if (ti < 0) continue;
+    const [a, b] = lines[ti].split("-->");
+    const start = srtTimeToS(a), end = srtTimeToS(b);
+    if (start === null) continue;
+    let text = lines.slice(ti + 1).join(" ").trim();
+    let speaker = "S01";
+    let m = /^\[(S\d+|[^\]]{1,20})\]\s*/.exec(text);
+    if (m) { speaker = m[1]; text = text.slice(m[0].length); }
+    else if ((m = /^(S\d+)\s*[:：]\s*/.exec(text))) { speaker = m[1]; text = text.slice(m[0].length); }
+    if (text) out.push({ start, end: end ?? start, speaker, text });
+  }
+  return out;
+}
+function parseTranscriptJSON(txt) {
+  let d = JSON.parse(txt);
+  if (d && !Array.isArray(d) && Array.isArray(d.segments)) d = d.segments;
+  if (!Array.isArray(d)) throw new Error("JSON is not an array of segments");
+  return d.map((o) => ({
+    start: +(o.start ?? o.s ?? 0),
+    end: o.end != null ? +o.end : (o.e != null ? +o.e : null),
+    speaker: String(o.speaker ?? o.spk ?? o.t_spk ?? "S01"),
+    text: String(o.text ?? o.t ?? "").trim(),
+  })).filter((o) => o.text && isFinite(o.start));
+}
+async function loadTranscriptFile(file) {
+  const txt = await file.text();
+  const isJson = /\.json$/i.test(file.name) || /^\s*[\[{]/.test(txt);
+  let list;
+  try {
+    list = isJson ? parseTranscriptJSON(txt) : parseSRT(txt);
+  } catch (e) {
+    $("status").textContent = `Could not parse ${file.name}: ${e.message}`;
+    return;
+  }
+  if (!list.length) {
+    $("status").textContent = `No segments found in ${file.name}`;
+    return;
+  }
+  list.sort((a, b) => a.start - b.start);
+  // Fill missing ends from the next start so click-to-seek highlighting works.
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].end == null || !(list[i].end > list[i].start)) {
+      list[i].end = list[i + 1]?.start ?? list[i].start + 3;
+    }
+  }
+  segs = list;
+  hiddenSpk = new Set();
+  renderLegend();
+  renderTranscript();
+  offerDownloads(segs);
+  const spk = new Set(segs.map((s) => s.speaker)).size;
+  $("stats").textContent =
+    `loaded ${segs.length} segments · ${spk} speaker${spk > 1 ? "s" : ""} · ` +
+    `${fmt(segs[segs.length - 1].end || 0)} · from ${file.name}`;
+  $("status").textContent = $("player-box").style.display === "none"
+    ? "transcript loaded — choose the matching audio file to play along"
+    : "transcript loaded";
+}
 
 function offerDownloads(finalSegs) {
   const ts = (t) => {
@@ -1028,6 +1105,15 @@ async function transcribe(source) {
       // overlap was emitted twice. Anything at/after the new cursor belongs to
       // the next window by definition — drop it here, in every path.
       winSegs = winSegs.filter((s) => s.start < cursorS - 0.01);
+      // ...and clamp the surviving tail segment's END to the cursor. Dropping
+      // by START alone still let the last kept segment run PAST the boundary
+      // (measured: end 172.80 while the next window's first segment began at
+      // 171.90 — a 0.9 s overlap), which double-covers that span on the
+      // timeline and makes the two segments look interleaved.
+      for (const s of winSegs) {
+        if (s.end != null && s.end > cursorS) s.end = cursorS;
+        if (s.rawEnd != null && s.rawEnd > cursorS) s.rawEnd = cursorS;
+      }
       if (RS_WIN_DEBUG) {
         const mk = winSegs.map((s) => s.start.toFixed(2)).join(",");
         console.debug(`[win] start=${winStartS.toFixed(2)} cut=${cut.toFixed(2)} ` +
@@ -1547,6 +1633,15 @@ drop.ondrop = (e) => {
 $("file-in").onchange = (e) => {
   const f = e.target.files[0];
   if (f) handleFile(f);
+  e.target.value = "";
+};
+
+// Transcript import is independent of the engine: it never touches the model,
+// so it stays enabled while the model is still downloading.
+$("btn-load-tr").onclick = () => $("tr-in").click();
+$("tr-in").onchange = (e) => {
+  const f = e.target.files[0];
+  if (f) loadTranscriptFile(f);
   e.target.value = "";
 };
 
