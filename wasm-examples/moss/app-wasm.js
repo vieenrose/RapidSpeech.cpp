@@ -19,18 +19,22 @@ import { itn } from "./itn.js";
 const $ = (id) => document.getElementById(id);
 
 /* ---------------------------- configuration ------------------------------ */
-// v7.1 at f16 (2026-07-20) — shipped for inspection; 2.13 GB download.
-// History: v7-q4 destroyed diarization (ONE [S01] where the reference has
-// three speakers) while the SAME weights at f16 resolved all three, so it is a
-// WEIGHTS x QUANT interaction that an fp-only eval cannot see. A speaker-count
-// ladder suggested q5_K_M was equivalent, but scoring TEXT showed otherwise:
-// v7.1 q5 @3 min = MER 0.157 vs f16 @3 min = 0.066 (q5 also drops the 115.9 /
-// 150.18 markers). Counting speakers is not sufficient to accept a quant --
-// measure MER too. NOTE: 2.13 GB will not load on iOS (~1.5 GB tab cap) and is
-// heavy on mobile generally; q5_K_M (0.75 GB) remains the small-footprint
-// option at some accuracy cost.
+// STAGE 1 (2026-07-20): base MOSS-TD at q4_K_M.
+// The zh-TW fine-tune lineage was over-specialised and structurally fragile.
+// Measured, same engine and audio: base ASCEND all .198 vs v7.1 .392 (English
+// .353 vs .687); base emits ~14 segments on 180 s of continuous speech where
+// every FT emitted 1; base's structural-token logit margin is 4.90 median vs
+// v7.1's 0.98, which is why base survives ggml/quant numerics and the FT does
+// not. Eviction is FREE on base: at f32, window 45 s vs off gives identical
+// output (17/17 segments, 1333 vs 1334 chars), and on 600 s of dense speech
+// eviction is 3x faster to decode (55.7 vs 169.3 ms/tok) with full coverage.
+// q4 chosen over f16/f32: 707 MB vs 2.13/3.97 GB, and against ground truth q4
+// is CLOSER on every cell (14 vs GT 12 where f32 gives 17; 15 vs GT 14 where
+// f32 gives 12; all 6 speakers where f32 finds 5).
+// Trade accepted: in-domain IVOD MER 0.145 vs the FT's 0.066 — to be won back
+// in stage 2/3 outside the weights (hotwords, curated zh-TW terms).
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
-  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v71-f16.gguf";
+  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-base-f16.gguf";
 // CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";

@@ -233,8 +233,7 @@
     <summary>How it works · accuracy</summary>
     <p>
       Audio is transcribed in ~28-second windows by a 0.9B model (Whisper-Medium
-      encoder + Qwen3-0.6B decoder, fine-tuned for zh-TW meetings), served as
-      an <b>F16 GGUF</b>. Whisper-style 80-bin log-mel features are computed in
+      encoder + Qwen3-0.6B decoder), served as an <b>F16 GGUF</b>. Whisper-style 80-bin log-mel features are computed in
       JavaScript; the encoder and decoder run in WebAssembly through
       <a href="https://github.com/vieenrose/RapidSpeech.cpp">RapidSpeech.cpp</a>
       (llama.cpp/ggml lineage), multi-threaded via SharedArrayBuffer under
