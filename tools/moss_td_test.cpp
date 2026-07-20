@@ -3,7 +3,7 @@
 // processor so we exercise MOSS's own single-pass long-form path for parity
 // against the HF/ONNX reference.
 //
-// Usage: moss_td_test <moss-td.gguf> <audio.wav> [--gpu] [--prompt "..."]
+// Usage: moss_td_test <moss-td.gguf> <audio.wav> [--gpu] [--threads N] [--prompt "..."]
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "arch/moss_td.h"
@@ -11,12 +11,15 @@
 #include "utils/rs_wav.h"
 
 #include <cstdio>
+#include <algorithm>
+#include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    printf("usage: %s <moss-td.gguf> <audio.wav> [--gpu] [--prompt \"...\"]\n",
+    printf("usage: %s <moss-td.gguf> <audio.wav> [--gpu] [--threads N] [--prompt \"...\"]\n",
            argv[0]);
     return 2;
   }
@@ -24,16 +27,26 @@ int main(int argc, char **argv) {
   const char *wav_path   = argv[2];
   bool use_gpu = false, stream = false;
   std::string prompt;
+  // Compute threads: --threads wins, then RS_INIT_THREADS, else min(8, hw).
+  // The old hardcoded 4 left a desktop CPU partly idle during the compute-bound
+  // audio encode, but the graph stops scaling around 8 and oversubscribing hurts
+  // (measured on a 22-thread host, 30 s clip: 4 -> 26.3 s, 8 -> 25.0 s,
+  // 16 -> 24.4 s, 22 -> 31.1 s), so cap the default rather than taking them all.
+  int n_threads = 0;
+  if (const char *e = std::getenv("RS_INIT_THREADS")) n_threads = atoi(e);
   for (int i = 3; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--gpu") use_gpu = true;
     else if (a == "--stream") stream = true;
+    else if (a == "--threads" && i + 1 < argc) n_threads = atoi(argv[++i]);
     else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
   }
+  if (n_threads <= 0) n_threads = (int)std::min(8u, std::thread::hardware_concurrency());
+  if (n_threads <= 0) n_threads = 4;
 
   rs_init_params_t p{};
   p.model_path = model_path;
-  p.n_threads  = 4;
+  p.n_threads  = n_threads;
   p.use_gpu    = use_gpu;
   p.task_type  = RS_TASK_ASR_OFFLINE;
   rs_context_t *ctx = rs_init_from_file(p);
