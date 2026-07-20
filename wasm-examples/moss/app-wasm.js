@@ -19,15 +19,18 @@ import { itn } from "./itn.js";
 const $ = (id) => document.getElementById(id);
 
 /* ---------------------------- configuration ------------------------------ */
-// v7.1 at q5_K_M (2026-07-20). v7-q4 destroyed speaker diarization (ONE [S01]
-// where the reference has three speakers) — a WEIGHTS x QUANT interaction: the
-// same weights at f16 resolve all three. Measured quant ladder on v7.1, 171 s
-// window: f16 / q8_0 / q6_k / iq4_xs / q5_K_M all give 3 speakers + 13 markers;
-// only q4_K_M collapses to 2 speakers + 6 markers. The cliff sits exactly
-// between q4 and q5, so q5_K_M buys f16-identical diarization for 0.75 GB
-// instead of 2.13 GB (q4 was 0.71 GB). Do NOT drop back to q4.
+// v7.1 at f16 (2026-07-20) — shipped for inspection; 2.13 GB download.
+// History: v7-q4 destroyed diarization (ONE [S01] where the reference has
+// three speakers) while the SAME weights at f16 resolved all three, so it is a
+// WEIGHTS x QUANT interaction that an fp-only eval cannot see. A speaker-count
+// ladder suggested q5_K_M was equivalent, but scoring TEXT showed otherwise:
+// v7.1 q5 @3 min = MER 0.157 vs f16 @3 min = 0.066 (q5 also drops the 115.9 /
+// 150.18 markers). Counting speakers is not sufficient to accept a quant --
+// measure MER too. NOTE: 2.13 GB will not load on iOS (~1.5 GB tab cap) and is
+// heavy on mobile generally; q5_K_M (0.75 GB) remains the small-footprint
+// option at some accuracy cost.
 const GGUF_URL = new URLSearchParams(location.search).get("gguf") ||
-  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v71-q5_k_m.gguf";
+  "https://huggingface.co/Luigi/moss-transcribe-diarize-zhtw-gguf/resolve/main/moss-td-zhtw-v71-f16.gguf";
 // CAM++ 192-d speaker encoder (~14 MB) — same-origin, for cross-window speaker
 // linking. Absent -> falls back to per-window [Sxx] tags.
 const SPK_GGUF_URL = new URLSearchParams(location.search).get("spk") || "./campplus.gguf";
@@ -1061,7 +1064,14 @@ async function transcribe(source) {
       let retreatTo = null;
       for (let i = 0; i < bySt.length; i++) {
         const s = bySt[i];
-        const end = bySt[i + 1]?.start ?? s.rawEnd ?? s.end ?? null;
+        // The LAST segment has no next-start, and rawEnd/end are usually null,
+        // so the old fallback chain yielded null and `continue` skipped it --
+        // yet the final segment is the one most likely to be ragged. Fall back
+        // to the window's own end (winStartS + cut). Measured miss: a 61-char
+        // segment spanning 171.30->171.90 (0.6 s, ~100 ch/s) survived and the
+        // next window re-transcribed the same utterance.
+        const end = bySt[i + 1]?.start ?? s.rawEnd ?? s.end ??
+                    (i === bySt.length - 1 ? winStartS + cut : null);
         const n = (s.text || "").length;
         if (end === null || !(end > s.start) || n < 20) continue;
         if (n / (end - s.start) > MAX_CH_PER_S) {
