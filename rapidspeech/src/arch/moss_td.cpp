@@ -12,6 +12,29 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
+
+// ---------------------------------------------------------------------------
+// RS_RAW=1 -- debugging escape hatch: disable every heuristic that alters
+// decoded output, leaving plain greedy decode equivalent to the official
+// PyTorch pipeline. Turns off: audio-KV eviction, repetition penalty, EOS
+// coverage suppression, and the degenerate-loop breaker.
+//
+// Why this exists: five engine-side heuristics sit between the model and what
+// a user sees, and each was added to fix a real defect. That makes any
+// surprising output ambiguous -- model, quantization, or heuristic? RS_RAW
+// collapses that to one question. It is a DEBUG switch: with it on, long audio
+// will truncate (that is what EOS suppression fixes) and degenerate repetition
+// will run to the decode cap.
+//
+// Individual RS_* variables still take precedence, so a single heuristic can
+// be re-enabled on top of RS_RAW to bisect which one is responsible.
+static inline bool rs_raw_mode() {
+  static const bool raw = [] {
+    const char *e = std::getenv("RS_RAW");
+    return e && std::atoi(e) != 0;
+  }();
+  return raw;
+}
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -766,8 +789,16 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // exceeded the earlier 2/3 ratio and were cut mid-sentence. Clamped so
   // short clips keep the old budget and pathological inputs can't balloon
   // the KV cache.
+  // Cap raised 3072 -> 5120 to match the official pipeline's max_new_tokens.
+  // The old 3072 was tuned on dense Mandarin (~1 token/char); English costs
+  // several tokens per word plus a timestamp+speaker pair per segment, so it
+  // exhausted the budget far sooner. Measured on a 32-min ICSI meeting: the
+  // engine stopped at 416 s (22% of the audio) against official's 587 s (31%)
+  // -- the 0.60 cap ratio predicted the 0.71 coverage ratio. Both truncate on
+  // long audio, which is why single-pass decoding cannot be a reference for
+  // full meetings; windowing is required, not merely a memory optimisation.
   const int max_decode_tokens =
-      std::min(3072, std::max(MAX_DECODE_TOKENS, audio_T));
+      std::min(5120, std::max(MAX_DECODE_TOKENS, audio_T));
 
   // -------- (a) projection graph: build the [n_embd, total_T] LLM input --------
   llm_cparams cparams;
@@ -1102,7 +1133,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // KV eviction window (see the eviction block below for semantics). Read
   // here because it also sizes the persistent KV allocation.
   const double kv_window_s =
-      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW")) : 45.0;
+      std::getenv("RS_AUDIO_KV_WINDOW") ? atof(std::getenv("RS_AUDIO_KV_WINDOW"))
+                                         : (rs_raw_mode() ? 0.0 : 45.0);
   // Eviction-aware KV sizing: with eviction on, live columns stay near
   // n_cached + (decode tokens emitted per eviction window) — appends reuse
   // compacted space — so the full n_cached + max_decode allocation (~40%
@@ -1217,7 +1249,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
   // with the QAT q4 model (f16 is clean either way). RS_REP_PENALTY overrides
   // (e.g. =1.0 for f16 parity runs).
   const char *rp_env = std::getenv("RS_REP_PENALTY");
-  const float REPETITION_PENALTY = rp_env ? (float)std::atof(rp_env) : 1.10f;
+  const float REPETITION_PENALTY =
+      rp_env ? (float)std::atof(rp_env) : (rs_raw_mode() ? 1.0f : 1.10f);
   constexpr int PENALTY_WINDOW = 64;
 
   if (prof) {
@@ -1433,7 +1466,8 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
     // audio and take the best non-EOS token instead; the duration guard and
     // loop breaker bound any forced-continuation garbage.
     static const double eos_min_cover =
-        std::getenv("RS_EOS_MINCOVER") ? atof(std::getenv("RS_EOS_MINCOVER")) : 0.6;
+        std::getenv("RS_EOS_MINCOVER") ? atof(std::getenv("RS_EOS_MINCOVER"))
+                                       : (rs_raw_mode() ? 0.0 : 0.6);
     const double speech_end =
         static_cast<MossTDState &>(state).speech_end_s > 0.0
             ? static_cast<MossTDState &>(state).speech_end_s : audio_dur_s;
@@ -1589,7 +1623,9 @@ bool MossTDModel::DecodeWithLLM(RSState &state, ggml_backend_sched_t sched) {
         // on a fire we trim the token stream to the first counted occurrence
         // (one clean copy survives) and stop decoding.
         auto d = loop_guard_.observe(h, cur_idx, max_ts_seen, ts_tick_count);
-        if (d.trim_and_stop) {
+        if (d.trim_and_stop && rs_raw_mode()) {
+          RS_LOG_WARN("MossTD: loop guard would have fired (RS_RAW=1, ignoring)");
+        } else if (d.trim_and_stop) {
           using R = rapidspeech::MossLoopGuard::Reason;
           if (d.reason == R::AdvancingCycle)
             RS_LOG_WARN("MossTD: %d uniform cycles (stride~%d, dt~%.1fs) — "
