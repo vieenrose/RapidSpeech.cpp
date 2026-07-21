@@ -102,6 +102,61 @@ endif()
 
 add_compile_definitions(GGML_MAX_NAME=128)
 
+
+# ------------------------------------------------- MOSS-TD build flags ---
+# These MUST be set BEFORE add_subdirectory(ggml) below: they are ggml cache
+# variables, and ggml reads them when its subdirectory is configured. Setting
+# them after (as they originally were, ~700 lines later) writes the cache but
+# has NO effect on the current configure -- a fresh clone would silently build
+# with -march=native and lose byte-reproducibility, while a re-configured tree
+# would pick them up and look correct. That discrepancy is exactly the kind of
+# thing this pinning exists to prevent.
+option(RS_BUILD_MOSS_TD "Build the vendored MOSS-Transcribe-Diarize port" ON)
+if(RS_BUILD_MOSS_TD)
+# PARITY-CRITICAL. Upstream moss-transcribe.cpp forces GGML_LLAMAFILE ON and
+# was validated that way. With it OFF, ggml uses different sgemm kernels
+# whose accumulation order differs, and that is enough to flip a near-tied
+# time-marker token: the English golden clip came out with 291.22 where the
+# reference has 291.26 -- one timestamp in 92, text byte-identical, every
+# other marker identical. Small, but it breaks byte-level parity, which is
+# the whole contract of this directory. Do not turn this off without
+# re-running the gate.
+set(GGML_LLAMAFILE ON CACHE BOOL "required for MOSS-TD byte-parity" FORCE)
+
+# PARITY-CRITICAL, and the subtler half. GGML_NATIVE compiles -march=native,
+# i.e. for whatever CPU happened to run the build, so the SAME source built
+# on two machines selects different SIMD kernels, accumulates in a different
+# order, and flips near-tied tokens. Measured: a build validated
+# byte-identical here decoded [30.22] and [291.22] on the HF Space's CPU
+# where the reference has [30.24] and [291.26] -- 2 timestamps in 92, text
+# and segmentation untouched.
+#
+# So pin an explicit baseline instead of "native". x86-64-v3 (AVX2+FMA+F16C)
+# is universal on any server this runs on; AVX512 is deliberately OFF because
+# its presence varies across machines and that variance is exactly the bug.
+# Byte-identity is a property of a FIXED instruction set, never an absolute.
+# x86 ONLY, and OPT-IN. These are global cache settings: forcing them
+# unconditionally would disable -march=native for every other arch in
+# rapidspeech-core, and on ARM (jetson-nano-gen1, Raspberry Pi) the AVX
+# flags are meaningless while GGML_NATIVE=OFF actively costs performance.
+# Byte-parity is a property of a FIXED instruction set, so it has to be
+# pinned per-architecture -- there is no cross-ISA parity to pin here.
+option(RS_MOSS_TD_PIN_ISA
+       "Pin x86-64-v3 ISA for MOSS-TD byte-reproducibility (x86 only)" OFF)
+if(RS_MOSS_TD_PIN_ISA AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(GGML_NATIVE  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_AVX     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_AVX2    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_FMA     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_F16C    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_AVX512  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    set(GGML_BMI2    OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    # Runtime multi-variant dispatch would re-introduce per-CPU kernel choice.
+    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+    message(STATUS "MOSS-TD: ISA pinned to x86-64-v3 for byte-reproducibility")
+endif()
+endif()
+
 add_subdirectory(${GGML_PATH} ggml)
 
 # Suppress implicit integer-to-enum and pointer-to-id conversion warnings in
@@ -221,8 +276,6 @@ set(RS_SOURCES
         rapidspeech/src/frontend/seamless_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
-        rapidspeech/src/arch/moss_td.h
-        rapidspeech/src/arch/moss_td.cpp
         rapidspeech/src/utils/rs_wav.cpp
         rapidspeech/src/utils/rs_data_paths.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
@@ -535,9 +588,6 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
-    add_executable(moss-td-test
-            tools/moss_td_test.cpp
-    )
     add_executable(rs-speaker-embed
             tools/speaker_embed_cli.cpp
     )
@@ -556,7 +606,6 @@ if (RS_BUILD_CLI)
             rs-speaker-id
             rs-kws
             rs-server
-            moss-td-test
             rs-speaker-embed
     )
 
@@ -577,9 +626,7 @@ if (RS_BUILD_CLI)
     endif()
 
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-    target_link_libraries(moss-td-test PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-embed PRIVATE rapidspeech-core ggml)
-    target_include_directories(moss-td-test PRIVATE rapidspeech/src)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-asr-online PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
@@ -749,7 +796,6 @@ if (RS_BUILD_TESTS)
             kokoro_metal_convt
             kokoro_en_g2p
             wetext_normalizer
-            moss_loop_guard
     )
 
     foreach(module ${TEST_MODULES})
@@ -826,4 +872,57 @@ if (RS_BUILD_TESTS)
             endif()
         endif()
     endforeach()
+endif()
+# ---------------------------------------------------------------- MOSS-TD ---
+# Vendored, UNMODIFIED, from localai-org/moss-transcribe.cpp (MIT). Full
+# provenance, licence and parity status in
+# rapidspeech/src/arch/moss_td/ATTRIBUTION.md.
+#
+# Built as its own self-contained target rather than folded into
+# rapidspeech-core on purpose: this code is validated byte-identical to the
+# reference PyTorch pipeline, and keeping it isolated (own include dirs, no
+# edits, no RapidSpeech headers reaching into it) is what lets that claim be
+# re-checked after any RapidSpeech-side change. Adaptation belongs in a wrapper.
+#
+# It carries its own `mt::` namespace and its own copy of dr_wav, so it does not
+# collide with rapidspeech/src/arch/qwen3.* or the core's audio IO.
+option(RS_BUILD_MOSS_TD "Build the vendored MOSS-Transcribe-Diarize port" ON)
+if(RS_BUILD_MOSS_TD)
+    set(MOSS_TD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/arch/moss_td)
+    file(GLOB MOSS_TD_SRC ${MOSS_TD_DIR}/*.cpp)
+    list(REMOVE_ITEM MOSS_TD_SRC ${MOSS_TD_DIR}/cli.cpp)   # cli.cpp has main()
+    # NB: the licence file must NOT be named *.cpp -- this GLOB happily fed the
+    # MIT text to the compiler ("MIT does not name a type").
+    add_library(moss-td STATIC ${MOSS_TD_SRC})
+    set_target_properties(moss-td PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(moss-td PUBLIC ${MOSS_TD_DIR}/include
+                               PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(moss-td PUBLIC ggml)
+
+    # Shared library for out-of-process consumers (the HF Space loads this with
+    # ctypes). This is why the C API matters: the CLI reloads the whole 1.8 GB
+    # model per invocation and round-trips audio through a temp wav, whereas
+    # moss_transcribe_capi_load() keeps the model resident and
+    # moss_transcribe_capi_transcribe_pcm() takes float PCM straight from
+    # memory. Same vendored code, no edits -- a wrapper, not a fork.
+    set_property(TARGET moss-td PROPERTY POSITION_INDEPENDENT_CODE ON)
+    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp)
+    set_target_properties(moss-td-shared PROPERTIES
+                          OUTPUT_NAME moss_td CXX_STANDARD 17
+                          CXX_STANDARD_REQUIRED ON)
+    target_include_directories(moss-td-shared PRIVATE ${MOSS_TD_DIR}
+                               ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(moss-td-shared PRIVATE moss-td)
+
+    # Per-stage latency profiler (wrapper; replicates transcribe_pcm16k's call
+    # sequence with timing, so moss_td/ needs no instrumentation).
+    add_executable(rs-moss-td-profile ${CMAKE_CURRENT_SOURCE_DIR}/tools/moss_td_profile.cpp)
+    set_target_properties(rs-moss-td-profile PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(rs-moss-td-profile PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(rs-moss-td-profile PRIVATE moss-td)
+
+    add_executable(rs-moss-td ${MOSS_TD_DIR}/cli.cpp)
+    set_target_properties(rs-moss-td PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(rs-moss-td PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(rs-moss-td PRIVATE moss-td)
 endif()

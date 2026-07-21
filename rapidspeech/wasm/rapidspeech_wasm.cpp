@@ -19,7 +19,6 @@
 #include "rapidspeech.h"
 
 #include "arch/keyword_loader.h"
-#include "arch/moss_td.h"
 #include "arch/sensevoice.h"
 #include "core/rs_context.h"
 #include "core/rs_kws.h"
@@ -36,7 +35,6 @@
 
 // Forward-declare explicit arch registrations so LTO cannot strip them.
 void rs_register_sensevoice();
-void rs_register_moss_td();
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,7 +82,6 @@ int rs_wasm_init_ex(const char *model_path, int task_type, int n_threads) {
   static bool archs_registered = false;
   if (!archs_registered) {
     rs_register_sensevoice();
-    rs_register_moss_td();
     archs_registered = true;
   }
   if (g_ctx) {
@@ -129,103 +126,12 @@ void rs_wasm_free(void) {
   rs_clear_error();
 }
 
-// ── MossTD: transcribe from externally-computed (JS) log-mel ─────────
-// The browser computes an HF-exact Whisper log-mel (see pipeline.js) and passes
-// it here as [n_mel, n_frames] bin-slow / frame-fast. This bypasses the C++
-// WhisperMelExtractor. Returns the diarized transcription string (owned by C).
-// n_audio_tokens: real-audio token count = (n_samples-1)/1280 + 1; drops the
-// trailing silence tokens of a 30 s-padded window. Pass 0 to keep all.
-EMSCRIPTEN_KEEPALIVE
-const char *rs_wasm_moss_transcribe_mel(const float *mel, int n_frames,
-                                        int n_mel, int n_audio_tokens,
-                                        const char *prompt) {
-  g_last_text[0] = '\0';
-  if (!g_ctx || !g_ctx->model || !mel || n_frames <= 0) return g_last_text;
-  auto *m = dynamic_cast<MossTDModel *>(g_ctx->model.get());
-  if (!m) return g_last_text;
-  if (prompt && prompt[0]) m->SetUserInputPrompt(prompt);
-  std::vector<float> melv(mel, mel + (size_t)n_frames * n_mel);
-  auto st = m->CreateState();
-  if (!m->EncodeMel(melv, n_frames, *st, g_ctx->sched, n_audio_tokens))
-    return g_last_text;
-  if (!m->Decode(*st, g_ctx->sched)) return g_last_text;
-  std::string text = m->GetTranscription(*st);
-  std::strncpy(g_last_text, text.c_str(), sizeof(g_last_text) - 1);
-  g_last_text[sizeof(g_last_text) - 1] = '\0';
-  return g_last_text;
-}
-
-// ── MossTD: transcribe from raw 16 kHz mono PCM (mel computed IN WASM) ───────
-// Faster + off the JS main thread vs computing the Whisper log-mel in JS. When
-// `stream` is nonzero, the decoder posts each partial transcript to the host
-// worker as {type:"moss_token", text} — used for live token-by-token output.
-// Returns the final diarized transcription (owned by C).
-EMSCRIPTEN_KEEPALIVE
-const char *rs_wasm_moss_transcribe_pcm(const float *pcm, int n_samples,
-                                        int n_audio_tokens, int stream,
-                                        const char *prompt) {
-  g_last_text[0] = '\0';
-  if (!g_ctx || !g_ctx->model || !pcm || n_samples <= 0) return g_last_text;
-  auto *m = dynamic_cast<MossTDModel *>(g_ctx->model.get());
-  if (!m) return g_last_text;
-  if (prompt && prompt[0]) m->SetUserInputPrompt(prompt);
-  if (stream) {
-    m->SetOnToken([](const std::string &partial) {
-      // Post the live partial transcript to the host page. This runs on the
-      // module's main thread (the Web Worker that loaded the module), so a
-      // plain postMessage reaches the page.
-      EM_ASM({
-        if (typeof postMessage === "function")
-          postMessage({ type: "moss_token", text: UTF8ToString($0) });
-      }, partial.c_str());
-    });
-    // Phase progress (encoder chunk N/M, prefill start, decode start) so the
-    // page can show liveness through the long silent phases of big windows.
-    m->SetOnPhase([](const char *phase, int cur, int total) {
-      EM_ASM({
-        if (typeof postMessage === "function")
-          postMessage({ type: "moss_phase", phase: UTF8ToString($0),
-                        cur: $1, total: $2 });
-      }, phase, cur, total);
-    });
-  } else {
-    m->SetOnToken(nullptr);
-    m->SetOnPhase(nullptr);
-  }
-  // For long (multi-chunk) windows the f32 KV cache would blow past the WASM
-  // 4 GB budget (300 s ~= 3854 ctx tokens -> ~1 GB f32 KV, 3.7 GB peak). q8_0 KV
-  // is near-lossless and cuts ~0.7 GB. Short clips stay f32 (fully lossless).
-  // KV policy: the engine default is now f16 (great natively), but in WASM a
-  // 180 s window at f16 KV measured 3743 MB heap high-water vs the 4096 MB
-  // hard cap — 350 MB of headroom is an OOM waiting to happen. With the
-  // v6-stream model (trained for a bounded 45 s audio-KV window) long windows
-  // use monotonic KV EVICTION instead of q8: audio KV stays O(45 s) at full
-  // f16 precision, heap stays flat, and sub-second timestamps survive.
-  // Short windows get the engine default (f16, no eviction).
-  // Eviction is the ENGINE default now (45 s; RS_AUDIO_KV_WINDOW=0 opts out),
-  // so no per-call setenv here — which also stops clobbering the page's
-  // ?env_RS_* debug knobs (rs_wasm_setenv).
-
-  std::vector<float> pcmv(pcm, pcm + n_samples);
-  auto st = m->CreateState();
-  // Encode() runs the C++ WhisperMelExtractor (mel) + encoder graph. The encoder
-  // is truncated to the real audio length (see MossTDModel::RunEncoder), so short
-  // clips don't pay for 30 s of silence.
-  if (!m->Encode(pcmv, *st, g_ctx->sched)) { m->SetOnToken(nullptr); m->SetOnPhase(nullptr); return g_last_text; }
-  // Drop trailing silence tokens to the real-audio length.
-  auto *mst = static_cast<MossTDState *>(st.get());
-  if (n_audio_tokens > 0 && n_audio_tokens < mst->T_audio) {
-    mst->audio_embeds.resize((size_t)mst->n_embd * n_audio_tokens);
-    mst->T_audio = n_audio_tokens;
-  }
-  if (!m->Decode(*st, g_ctx->sched)) { m->SetOnToken(nullptr); m->SetOnPhase(nullptr); return g_last_text; }
-  m->SetOnToken(nullptr);
-  m->SetOnPhase(nullptr);
-  std::string text = m->GetTranscription(*st);
-  std::strncpy(g_last_text, text.c_str(), sizeof(g_last_text) - 1);
-  g_last_text[sizeof(g_last_text) - 1] = '\0';
-  return g_last_text;
-}
+// NOTE: the MossTD WASM bindings (rs_wasm_moss_transcribe_mel / _pcm) were
+// removed together with the old arch/moss_td.cpp implementation. The current
+// MOSS-TD port is a self-contained vendored library (arch/moss_td/) exposed
+// through its own flat C API (moss_transcribe_capi_*), not registered into
+// rapidspeech-core's model registry, so it is not reachable from these
+// bindings. Re-adding WASM support means wrapping that C API instead.
 
 // ── Audio / text input ──────────────────────────────────────
 
@@ -626,7 +532,6 @@ int rs_wasm_kws_init(const char *model_path, const char *keywords_path,
   static bool archs_registered = false;
   if (!archs_registered) {
     rs_register_sensevoice();
-    rs_register_moss_td();
     archs_registered = true;
   }
   if (!model_path || !keywords_path) return -1;
