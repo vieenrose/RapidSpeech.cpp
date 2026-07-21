@@ -102,6 +102,48 @@ endif()
 
 add_compile_definitions(GGML_MAX_NAME=128)
 
+
+# ------------------------------------------------- MOSS-TD build flags ---
+# MUST be set BEFORE add_subdirectory(ggml): these are ggml cache variables and
+# ggml reads them when its subdirectory is configured. They originally lived
+# ~700 lines below, which wrote the cache but did NOT affect the current
+# configure -- a fresh clone silently built with -march=native and lost
+# byte-reproducibility, while a re-configured tree picked them up from cache and
+# looked correct. Backported from the main-branch integration.
+if(RS_BUILD_MOSS_TD_FLAGS_EARLY OR TRUE)
+# PARITY-CRITICAL. Upstream moss-transcribe.cpp forces GGML_LLAMAFILE ON and
+# was validated that way. With it OFF, ggml uses different sgemm kernels
+# whose accumulation order differs, and that is enough to flip a near-tied
+# time-marker token: the English golden clip came out with 291.22 where the
+# reference has 291.26 -- one timestamp in 92, text byte-identical, every
+# other marker identical. Small, but it breaks byte-level parity, which is
+# the whole contract of this directory. Do not turn this off without
+# re-running the gate.
+set(GGML_LLAMAFILE ON CACHE BOOL "required for MOSS-TD byte-parity" FORCE)
+
+# PARITY-CRITICAL, and the subtler half. GGML_NATIVE compiles -march=native,
+# i.e. for whatever CPU happened to run the build, so the SAME source built
+# on two machines selects different SIMD kernels, accumulates in a different
+# order, and flips near-tied tokens. Measured: a build validated
+# byte-identical here decoded [30.22] and [291.22] on the HF Space's CPU
+# where the reference has [30.24] and [291.26] -- 2 timestamps in 92, text
+# and segmentation untouched.
+#
+# So pin an explicit baseline instead of "native". x86-64-v3 (AVX2+FMA+F16C)
+# is universal on any server this runs on; AVX512 is deliberately OFF because
+# its presence varies across machines and that variance is exactly the bug.
+# Byte-identity is a property of a FIXED instruction set, never an absolute.
+set(GGML_NATIVE  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX2    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_FMA     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_F16C    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX512  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_BMI2    OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+# Runtime multi-variant dispatch would re-introduce per-CPU kernel choice.
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+endif()
+
 add_subdirectory(${GGML_PATH} ggml)
 
 # Suppress implicit integer-to-enum and pointer-to-id conversion warnings in
@@ -829,37 +871,6 @@ endif()
 # collide with rapidspeech/src/arch/qwen3.* or the core's audio IO.
 option(RS_BUILD_MOSS_TD "Build the vendored MOSS-Transcribe-Diarize port" ON)
 if(RS_BUILD_MOSS_TD)
-    # PARITY-CRITICAL. Upstream moss-transcribe.cpp forces GGML_LLAMAFILE ON and
-    # was validated that way. With it OFF, ggml uses different sgemm kernels
-    # whose accumulation order differs, and that is enough to flip a near-tied
-    # time-marker token: the English golden clip came out with 291.22 where the
-    # reference has 291.26 -- one timestamp in 92, text byte-identical, every
-    # other marker identical. Small, but it breaks byte-level parity, which is
-    # the whole contract of this directory. Do not turn this off without
-    # re-running the gate.
-    set(GGML_LLAMAFILE ON CACHE BOOL "required for MOSS-TD byte-parity" FORCE)
-
-    # PARITY-CRITICAL, and the subtler half. GGML_NATIVE compiles -march=native,
-    # i.e. for whatever CPU happened to run the build, so the SAME source built
-    # on two machines selects different SIMD kernels, accumulates in a different
-    # order, and flips near-tied tokens. Measured: a build validated
-    # byte-identical here decoded [30.22] and [291.22] on the HF Space's CPU
-    # where the reference has [30.24] and [291.26] -- 2 timestamps in 92, text
-    # and segmentation untouched.
-    #
-    # So pin an explicit baseline instead of "native". x86-64-v3 (AVX2+FMA+F16C)
-    # is universal on any server this runs on; AVX512 is deliberately OFF because
-    # its presence varies across machines and that variance is exactly the bug.
-    # Byte-identity is a property of a FIXED instruction set, never an absolute.
-    set(GGML_NATIVE  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX2    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_FMA     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_F16C    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX512  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_BMI2    OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    # Runtime multi-variant dispatch would re-introduce per-CPU kernel choice.
-    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
     set(MOSS_TD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/arch/moss_td)
     file(GLOB MOSS_TD_SRC ${MOSS_TD_DIR}/*.cpp)
     list(REMOVE_ITEM MOSS_TD_SRC ${MOSS_TD_DIR}/cli.cpp)   # cli.cpp has main()
