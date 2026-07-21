@@ -813,3 +813,59 @@ if (RS_BUILD_TESTS)
         endif()
     endforeach()
 endif()
+
+# ---------------------------------------------------------------- MOSS-TD ---
+# Vendored, UNMODIFIED, from localai-org/moss-transcribe.cpp (MIT). Full
+# provenance, licence and parity status in
+# rapidspeech/src/arch/moss_td/ATTRIBUTION.md.
+#
+# Built as its own self-contained target rather than folded into
+# rapidspeech-core on purpose: this code is validated byte-identical to the
+# reference PyTorch pipeline, and keeping it isolated (own include dirs, no
+# edits, no RapidSpeech headers reaching into it) is what lets that claim be
+# re-checked after any RapidSpeech-side change. Adaptation belongs in a wrapper.
+#
+# It carries its own `mt::` namespace and its own copy of dr_wav, so it does not
+# collide with rapidspeech/src/arch/qwen3.* or the core's audio IO.
+option(RS_BUILD_MOSS_TD "Build the vendored MOSS-Transcribe-Diarize port" ON)
+if(RS_BUILD_MOSS_TD)
+    # PARITY-CRITICAL. Upstream moss-transcribe.cpp forces GGML_LLAMAFILE ON and
+    # was validated that way. With it OFF, ggml uses different sgemm kernels
+    # whose accumulation order differs, and that is enough to flip a near-tied
+    # time-marker token: the English golden clip came out with 291.22 where the
+    # reference has 291.26 -- one timestamp in 92, text byte-identical, every
+    # other marker identical. Small, but it breaks byte-level parity, which is
+    # the whole contract of this directory. Do not turn this off without
+    # re-running the gate.
+    set(GGML_LLAMAFILE ON CACHE BOOL "required for MOSS-TD byte-parity" FORCE)
+    set(MOSS_TD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/arch/moss_td)
+    file(GLOB MOSS_TD_SRC ${MOSS_TD_DIR}/*.cpp)
+    list(REMOVE_ITEM MOSS_TD_SRC ${MOSS_TD_DIR}/cli.cpp)   # cli.cpp has main()
+    # NB: the licence file must NOT be named *.cpp -- this GLOB happily fed the
+    # MIT text to the compiler ("MIT does not name a type").
+    add_library(moss-td STATIC ${MOSS_TD_SRC})
+    set_target_properties(moss-td PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(moss-td PUBLIC ${MOSS_TD_DIR}/include
+                               PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(moss-td PUBLIC ggml)
+
+    # Shared library for out-of-process consumers (the HF Space loads this with
+    # ctypes). This is why the C API matters: the CLI reloads the whole 1.8 GB
+    # model per invocation and round-trips audio through a temp wav, whereas
+    # moss_transcribe_capi_load() keeps the model resident and
+    # moss_transcribe_capi_transcribe_pcm() takes float PCM straight from
+    # memory. Same vendored code, no edits -- a wrapper, not a fork.
+    set_property(TARGET moss-td PROPERTY POSITION_INDEPENDENT_CODE ON)
+    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp)
+    set_target_properties(moss-td-shared PROPERTIES
+                          OUTPUT_NAME moss_td CXX_STANDARD 17
+                          CXX_STANDARD_REQUIRED ON)
+    target_include_directories(moss-td-shared PRIVATE ${MOSS_TD_DIR}
+                               ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(moss-td-shared PRIVATE moss-td)
+
+    add_executable(rs-moss-td ${MOSS_TD_DIR}/cli.cpp)
+    set_target_properties(rs-moss-td PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(rs-moss-td PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(rs-moss-td PRIVATE moss-td)
+endif()
