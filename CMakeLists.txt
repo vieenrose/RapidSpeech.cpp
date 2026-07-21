@@ -886,6 +886,13 @@ if(RS_BUILD_MOSS_TD)
                                ${MOSS_TD_DIR}/third_party)
     target_link_libraries(moss-td-shared PRIVATE moss-td)
 
+    # Per-stage latency profiler (wrapper; replicates transcribe_pcm16k's call
+    # sequence with timing, so moss_td/ needs no instrumentation).
+    add_executable(rs-moss-td-profile ${CMAKE_CURRENT_SOURCE_DIR}/tools/moss_td_profile.cpp)
+    set_target_properties(rs-moss-td-profile PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(rs-moss-td-profile PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
+    target_link_libraries(rs-moss-td-profile PRIVATE moss-td)
+
     add_executable(rs-moss-td ${MOSS_TD_DIR}/cli.cpp)
     set_target_properties(rs-moss-td PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     target_include_directories(rs-moss-td PRIVATE ${MOSS_TD_DIR} ${MOSS_TD_DIR}/third_party)
