@@ -27,7 +27,11 @@ this directory still exactly matches its declared upstream — the fork — with
 zero unfork-tracked edits): opt-in audio-KV eviction, `MT_KV_EVICT_S=<seconds>`
 (default OFF; the default path is code-identical to localai-org@190a569).
 Timestamp-driven compaction of the prompt audio span during decode, ported from
-the pre-purification engine's `RS_AUDIO_KV_WINDOW`. Validated 2026-07-22:
+the pre-purification engine's `RS_AUDIO_KV_WINDOW`. Plus `MT_KV_F16=1` (also
+default OFF): F16 KV cache, halving KV bandwidth; validated 2026-07-22 —
+35×90s windows 19/23 byte-identical (min 99.74%), 16-min full-pass zh 100.0%
+agreement (312→312 utts) / en 99.82, speaker-tag sequences zh 100.0% / en
+99.1%, zh timestamps exact. Validated 2026-07-22:
 35× 90 s windows across zh/en 16-min meetings ≥98.5% agreement (most
 byte-identical), full 16-min single-pass 99.77% zh / 99.48% en, and −19%
 end-to-end wall on a Samsung A53 with byte-identical output. The parity gate

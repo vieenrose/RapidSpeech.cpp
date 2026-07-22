@@ -61,10 +61,17 @@ bool Qwen3Decoder::load(const ModelLoader& m, int max_seq) {
     if (!kv_ctx_) return false;
     k_cache_.assign(L, nullptr);
     v_cache_.assign(L, nullptr);
+    // MT_KV_F16=1 (opt-in): store the cache in F16. Halves KV bytes and the
+    // per-token KV bandwidth that dominates long-context decode on CPU.
+    // ggml_cpy converts on store; attention scores stay GGML_PREC_F32.
+    // Default remains F32 (the byte-validated configuration).
+    const char* kvenv = std::getenv("MT_KV_F16");
+    const ggml_type kvt = (kvenv && atoi(kvenv) != 0) ? GGML_TYPE_F16
+                                                      : GGML_TYPE_F32;
     for (int l = 0; l < L; ++l) {
-        k_cache_[l] = ggml_new_tensor_4d(kv_ctx_.get(), GGML_TYPE_F32,
+        k_cache_[l] = ggml_new_tensor_4d(kv_ctx_.get(), kvt,
                                          hp_.head_dim, hp_.n_kv_heads, max_seq_, 1);
-        v_cache_[l] = ggml_new_tensor_4d(kv_ctx_.get(), GGML_TYPE_F32,
+        v_cache_[l] = ggml_new_tensor_4d(kv_ctx_.get(), kvt,
                                          hp_.head_dim, hp_.n_kv_heads, max_seq_, 1);
     }
     kv_buffer_ = allocate_ctx_tensors(kv_ctx_.get());
