@@ -53,6 +53,13 @@ public:
     void reset();
     int  past_len() const { return past_len_; }
 
+    // Audio-KV eviction: physically compact the cache by sliding columns
+    // [keep_from, past_len_) down onto lo, dropping [lo, keep_from). Cached K
+    // keeps its baked RoPE (eviction removes keys, never renumbers them); new
+    // tokens keep monotone LOGICAL positions (logical_next_), which eviction
+    // does not rewind. Returns the number of columns removed.
+    int evict(int lo, int keep_from);
+
 private:
     bool run(const std::vector<float>& embeds, int T, std::vector<float>* out_hidden);
 
@@ -62,6 +69,7 @@ private:
     struct ggml_tensor* token_embd_  = nullptr;   // [hidden, vocab] — tied lm_head
     const ModelLoader* m_ = nullptr;
     int max_seq_ = 0, past_len_ = 0;
+    int logical_next_ = 0;   // RoPE position of the next token (>= past_len_ once evicting)
 
     // Device-resident per-layer K/V cache: [head_dim, n_kv_heads, max_seq, 1].
     GgmlCtxPtr kv_ctx_;

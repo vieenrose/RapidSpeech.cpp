@@ -104,15 +104,13 @@ add_compile_definitions(GGML_MAX_NAME=128)
 
 
 # ------------------------------------------------- MOSS-TD build flags ---
-# These MUST be set BEFORE add_subdirectory(ggml) below: they are ggml cache
-# variables, and ggml reads them when its subdirectory is configured. Setting
-# them after (as they originally were, ~700 lines later) writes the cache but
-# has NO effect on the current configure -- a fresh clone would silently build
-# with -march=native and lose byte-reproducibility, while a re-configured tree
-# would pick them up and look correct. That discrepancy is exactly the kind of
-# thing this pinning exists to prevent.
-option(RS_BUILD_MOSS_TD "Build the vendored MOSS-Transcribe-Diarize port" ON)
-if(RS_BUILD_MOSS_TD)
+# MUST be set BEFORE add_subdirectory(ggml): these are ggml cache variables and
+# ggml reads them when its subdirectory is configured. They originally lived
+# ~700 lines below, which wrote the cache but did NOT affect the current
+# configure -- a fresh clone silently built with -march=native and lost
+# byte-reproducibility, while a re-configured tree picked them up from cache and
+# looked correct. Backported from the main-branch integration.
+if(RS_BUILD_MOSS_TD_FLAGS_EARLY OR TRUE)
 # PARITY-CRITICAL. Upstream moss-transcribe.cpp forces GGML_LLAMAFILE ON and
 # was validated that way. With it OFF, ggml uses different sgemm kernels
 # whose accumulation order differs, and that is enough to flip a near-tied
@@ -135,26 +133,15 @@ set(GGML_LLAMAFILE ON CACHE BOOL "required for MOSS-TD byte-parity" FORCE)
 # is universal on any server this runs on; AVX512 is deliberately OFF because
 # its presence varies across machines and that variance is exactly the bug.
 # Byte-identity is a property of a FIXED instruction set, never an absolute.
-# x86 ONLY, and OPT-IN. These are global cache settings: forcing them
-# unconditionally would disable -march=native for every other arch in
-# rapidspeech-core, and on ARM (jetson-nano-gen1, Raspberry Pi) the AVX
-# flags are meaningless while GGML_NATIVE=OFF actively costs performance.
-# Byte-parity is a property of a FIXED instruction set, so it has to be
-# pinned per-architecture -- there is no cross-ISA parity to pin here.
-option(RS_MOSS_TD_PIN_ISA
-       "Pin x86-64-v3 ISA for MOSS-TD byte-reproducibility (x86 only)" OFF)
-if(RS_MOSS_TD_PIN_ISA AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    set(GGML_NATIVE  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX2    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_FMA     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_F16C    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_AVX512  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    set(GGML_BMI2    OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    # Runtime multi-variant dispatch would re-introduce per-CPU kernel choice.
-    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
-    message(STATUS "MOSS-TD: ISA pinned to x86-64-v3 for byte-reproducibility")
-endif()
+set(GGML_NATIVE  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX2    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_FMA     ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_F16C    ON  CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_AVX512  OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+set(GGML_BMI2    OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
+# Runtime multi-variant dispatch would re-introduce per-CPU kernel choice.
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "pinned ISA for MOSS-TD byte-parity" FORCE)
 endif()
 
 add_subdirectory(${GGML_PATH} ggml)
@@ -588,9 +575,6 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
-    add_executable(rs-speaker-embed
-            tools/speaker_embed_cli.cpp
-    )
     add_executable(rs-server
             examples/server/rs-server.cpp
     )
@@ -606,7 +590,6 @@ if (RS_BUILD_CLI)
             rs-speaker-id
             rs-kws
             rs-server
-            rs-speaker-embed
     )
 
     if (NOT WIN32)
@@ -626,7 +609,6 @@ if (RS_BUILD_CLI)
     endif()
 
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-    target_link_libraries(rs-speaker-embed PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-asr-online PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
@@ -873,6 +855,7 @@ if (RS_BUILD_TESTS)
         endif()
     endforeach()
 endif()
+
 # ---------------------------------------------------------------- MOSS-TD ---
 # Vendored, UNMODIFIED, from localai-org/moss-transcribe.cpp (MIT). Full
 # provenance, licence and parity status in
@@ -906,7 +889,11 @@ if(RS_BUILD_MOSS_TD)
     # moss_transcribe_capi_transcribe_pcm() takes float PCM straight from
     # memory. Same vendored code, no edits -- a wrapper, not a fork.
     set_property(TARGET moss-td PROPERTY POSITION_INDEPENDENT_CODE ON)
-    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp)
+    # moss_td_stream.cpp adds the token-streaming entry points (live demo
+    # transcript); a wrapper like the profiler -- moss_td/ itself stays
+    # unmodified, and with a NULL callback it delegates to the vendored path.
+    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/moss_td_stream.cpp)
     set_target_properties(moss-td-shared PROPERTIES
                           OUTPUT_NAME moss_td CXX_STANDARD 17
                           CXX_STANDARD_REQUIRED ON)

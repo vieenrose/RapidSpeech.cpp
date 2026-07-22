@@ -8,6 +8,7 @@
 #include "qwen3_decoder.hpp"
 #include "common.hpp"
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -46,12 +47,34 @@ std::string transcribe_pcm16k(ModelLoader& m, const std::vector<float>& samples,
         fuse_embeds(m, input_ids, audio_embeds, n_tokens, hidden, c.audio_token_id);
     if (fused.empty()) { MT_LOGE("transcribe_pcm16k: fuse_embeds failed"); return {}; }
 
-    // 5. Greedy generate.
+    // 5. Greedy generate. MT_KV_EVICT_S=<seconds> (opt-in) enables audio-KV
+    // eviction: the audio span (audio placeholders + interleaved time-marker
+    // text) older than (max emitted timestamp - window) is compacted out of
+    // the KV cache during decode. Changes numerics — never on by default.
     const int seq = (int)input_ids.size();
     Qwen3Decoder dec;
     if (!dec.load(m, seq + max_new + 16)) { MT_LOGE("transcribe_pcm16k: decoder load failed"); return {}; }
-    std::vector<int32_t> new_ids =
-        greedy_generate(dec, m, fused, seq, max_new, c.eos_token_id);
+    const char* evict_env = std::getenv("MT_KV_EVICT_S");
+    std::vector<int32_t> new_ids;
+    if (evict_env && atof(evict_env) > 0.0) {
+        KvEvictOpts ev;
+        ev.window_s = atof(evict_env);
+        int lo = -1, hi = -1;
+        for (int i = 0; i < seq; ++i) {
+            if (input_ids[i] == c.audio_token_id) { if (lo < 0) lo = i; hi = i; }
+        }
+        const double audio_s = (double)samples.size() / 16000.0;
+        if (lo >= 0 && hi > lo && audio_s > 0.0) {
+            ev.span_lo   = lo;
+            ev.span_end  = hi + 1;
+            ev.tok_per_s = (double)(ev.span_end - ev.span_lo) / audio_s;
+            ev.tok       = &tok;
+        }
+        new_ids = greedy_generate_evict(dec, m, fused, seq, max_new,
+                                        c.eos_token_id, ev);
+    } else {
+        new_ids = greedy_generate(dec, m, fused, seq, max_new, c.eos_token_id);
+    }
     if (new_ids.empty()) { MT_LOGE("transcribe_pcm16k: no tokens generated"); return {}; }
 
     // 6. Decode (skips special tokens, dropping the trailing EOS) + strip.

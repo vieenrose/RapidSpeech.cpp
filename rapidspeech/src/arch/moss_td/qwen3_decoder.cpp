@@ -80,14 +80,39 @@ bool Qwen3Decoder::load(const ModelLoader& m, int max_seq) {
 
 void Qwen3Decoder::reset() {
     past_len_ = 0;  // views are bounded by past_len_; stale cache bytes are never read
+    logical_next_ = 0;
+}
+
+int Qwen3Decoder::evict(int lo, int keep_from) {
+    if (lo < 0 || keep_from <= lo || keep_from > past_len_) return 0;
+    const int delta = keep_from - lo;
+    const int tail  = past_len_ - keep_from;
+    if (tail > 0) {
+        std::vector<uint8_t> stage;
+        for (int l = 0; l < hp_.n_layers; ++l) {
+            for (struct ggml_tensor* kv : {k_cache_[l], v_cache_[l]}) {
+                const size_t col = kv->nb[2];   // bytes per cached position
+                stage.resize((size_t)tail * col);
+                ggml_backend_tensor_get(kv, stage.data(),
+                                        (size_t)keep_from * col,
+                                        (size_t)tail * col);
+                ggml_backend_tensor_set(kv, stage.data(),
+                                        (size_t)lo * col,
+                                        (size_t)tail * col);
+            }
+        }
+    }
+    past_len_ -= delta;
+    return delta;
 }
 
 bool Qwen3Decoder::run(const std::vector<float>& embeds, int T,
                        std::vector<float>* out_hidden) {
-    const int L    = hp_.n_layers;
-    const int H    = hp_.hidden;
-    const int past = past_len_;
-    const int kv   = past + T;
+    const int L     = hp_.n_layers;
+    const int H     = hp_.hidden;
+    const int past  = past_len_;
+    const int kv    = past + T;
+    const int lbase = logical_next_;  // RoPE positions; == past unless evicting
 
     if (embeds.size() < (size_t)H * T) { MT_LOGE("Qwen3Decoder: embeds too small"); return false; }
     if (past + T > max_seq_) { MT_LOGE("Qwen3Decoder: sequence exceeds max_seq"); return false; }
@@ -126,7 +151,7 @@ bool Qwen3Decoder::run(const std::vector<float>& embeds, int T,
         ggml_backend_tensor_set(x, embeds.data(), 0, (size_t)H * T * sizeof(float));
 
         std::vector<int32_t> p(T);
-        for (int i = 0; i < T; ++i) p[i] = past + i;
+        for (int i = 0; i < T; ++i) p[i] = lbase + i;
         ggml_backend_tensor_set(pos, p.data(), 0, (size_t)T * sizeof(int32_t));
 
         if (mask) {
@@ -142,6 +167,7 @@ bool Qwen3Decoder::run(const std::vector<float>& embeds, int T,
     if (!compute_graph_with_inputs(gf, set_inputs)) return false;
 
     past_len_ = kv;
+    logical_next_ = lbase + T;
     out_hidden->resize((size_t)H * T);
     ggml_backend_tensor_get(y, out_hidden->data(), 0, (size_t)H * T * sizeof(float));
     return true;

@@ -3,6 +3,10 @@
 #include "backend.hpp"
 #include "common.hpp"
 #include "ggml_extend.hpp"
+#include "tokenizer.hpp"
+
+#include <cstdlib>
+#include <string>
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -226,6 +230,91 @@ std::vector<int32_t> greedy_generate(Qwen3Decoder& dec, ModelLoader& m,
         if ((int)h1.size() < H) { MT_LOGE("greedy_generate: decode_one failed"); break; }
         logits = dec.logits_from_hidden(h1);
         if (logits.empty()) { MT_LOGE("greedy_generate: logits failed"); break; }
+    }
+    return ids;
+}
+
+std::vector<int32_t> greedy_generate_evict(Qwen3Decoder& dec, ModelLoader& m,
+                                           const std::vector<float>& fused,
+                                           int seq, int max_new, int eos,
+                                           const KvEvictOpts& ev) {
+    std::vector<int32_t> ids;
+    const int H = dec.hidden();
+    if (H <= 0 || seq <= 0 || max_new <= 0) {
+        MT_LOGE("greedy_generate_evict: bad args");
+        return ids;
+    }
+    if (ev.window_s <= 0.0 || !ev.tok || ev.tok_per_s <= 0.0 ||
+        ev.span_end <= ev.span_lo) {
+        return greedy_generate(dec, m, fused, seq, max_new, eos);
+    }
+
+    std::vector<float> hid;
+    if (!dec.prefill(fused, seq, &hid)) { MT_LOGE("greedy_generate_evict: prefill failed"); return ids; }
+    if ((int)hid.size() < H * seq) { MT_LOGE("greedy_generate_evict: short prefill hidden"); return ids; }
+
+    std::vector<float> last(hid.end() - H, hid.end());
+    std::vector<float> logits = dec.logits_from_hidden(last);
+    if (logits.empty()) { MT_LOGE("greedy_generate_evict: logits failed"); return ids; }
+
+    // Timestamp tracking over the decoded text stream. Timestamps arrive as
+    // plain text "[ss.ss]" split across tokens; keep an unconsumed tail and
+    // harvest every complete bracket group. Speaker tags "[S01]" fail the
+    // digits/dot filter and are ignored.
+    std::string tail;
+    double max_ts = 0.0;
+    int span_end_phys = ev.span_end;   // audio-span end in PHYSICAL columns
+    int evicted_total = 0;
+    auto harvest_ts = [&]() {
+        size_t close;
+        while ((close = tail.find(']')) != std::string::npos) {
+            const size_t open = tail.rfind('[', close);
+            if (open != std::string::npos && close > open + 1) {
+                bool num = true; int digits = 0;
+                for (size_t i = open + 1; i < close; ++i) {
+                    const char ch = tail[i];
+                    if (ch >= '0' && ch <= '9') { ++digits; }
+                    else if (ch != '.') { num = false; break; }
+                }
+                if (num && digits > 0) {
+                    const double ts = atof(tail.substr(open + 1, close - open - 1).c_str());
+                    if (ts > max_ts) max_ts = ts;
+                }
+            }
+            tail.erase(0, close + 1);
+        }
+        if (tail.size() > 32) tail.erase(0, tail.size() - 32);  // bound memory
+    };
+
+    ids.reserve((size_t)max_new);
+    for (;;) {
+        int t = argmax_first(logits);
+        ids.push_back(t);
+        if (t == eos) break;
+        if ((int)ids.size() >= max_new) break;
+
+        tail += ev.tok->decode({t});
+        harvest_ts();
+        if (max_ts > ev.window_s) {
+            // Absolute audio column for (max_ts - W), shifted into PHYSICAL
+            // space by what previous compactions already removed. Without the
+            // shift every compaction after the first double-evicts.
+            int keep_from = ev.span_lo +
+                (int)((max_ts - ev.window_s) * ev.tok_per_s) - evicted_total;
+            if (keep_from > span_end_phys) keep_from = span_end_phys;
+            if (keep_from - ev.span_lo >= ev.min_batch) {
+                const int delta = dec.evict(ev.span_lo, keep_from);
+                evicted_total += delta;
+                span_end_phys -= delta;
+            }
+        }
+
+        std::vector<float> emb = embed_token(m, t, H);
+        if (emb.empty()) { MT_LOGE("greedy_generate_evict: embed failed @%d", t); break; }
+        std::vector<float> h1 = dec.decode_one(emb);
+        if ((int)h1.size() < H) { MT_LOGE("greedy_generate_evict: decode_one failed"); break; }
+        logits = dec.logits_from_hidden(h1);
+        if (logits.empty()) { MT_LOGE("greedy_generate_evict: logits failed"); break; }
     }
     return ids;
 }

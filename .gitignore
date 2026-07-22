@@ -1,1 +1,5 @@
 build
+# Out-of-tree build directories. A build tree was accidentally committed onto
+# this branch (794 object files and a .so); this branch is meant to be auditable
+# source only, so keep them out.
+build*/
