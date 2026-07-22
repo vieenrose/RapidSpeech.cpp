@@ -13,6 +13,7 @@
 #include "qwen3_decoder.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace mt {
@@ -63,6 +64,41 @@ std::vector<int32_t> greedy_generate_evict(Qwen3Decoder& dec, ModelLoader& m,
                                            const std::vector<float>& fused,
                                            int seq, int max_new, int eos,
                                            const KvEvictOpts& ev);
+
+// Batched greedy decoding over N INDEPENDENT streams (windows): the decoder
+// must have been load()ed with n_streams >= N. Each stream is prefilled
+// separately (single-stream graph against its own cache set), then all still-
+// active streams advance one token per decode_batch step so per-step weight
+// reads are shared. Per-stream semantics (argmax FIRST-index tie-break, EOS /
+// max_new stop, INCLUDING the trailing EOS, optional per-stream audio-KV
+// eviction driven by emitted "[ss.ss]" timestamps) are exactly those of
+// greedy_generate / greedy_generate_evict — per-stream results are expected
+// byte-identical to sequential decoding. A stream that stops is dropped from
+// the batch (the next step runs with fewer columns) until all are done.
+// The lm_head stays per-stream ([hidden,1] mul_mat): token_embd is F16 in
+// deployed models and ggml's llamafile sgemm would take a different (tiled)
+// kernel for >=4 columns, breaking bit-identity with sequential decoding.
+struct BatchStream {
+    const std::vector<float>* fused = nullptr;  // seq token-major embedding rows
+    int seq = 0;
+    KvEvictOpts ev;   // ev.window_s <= 0 (default): no eviction for this stream
+};
+// Optional observation hooks (for streaming wrappers; the CLI passes neither).
+// They observe only — they do not alter the decode:
+// - on_prefill(stream): immediately BEFORE stream s's prefill graph runs.
+// - on_token(stream, ids, done): immediately AFTER stream s appended a token;
+//   ids = that stream's generated ids so far (INCLUDING the new token, and
+//   including a terminal EOS); done = this token ended the stream (EOS or
+//   max_new), i.e. the stream will not be in the next decode_batch step.
+using BatchPrefillHook = std::function<void(int stream)>;
+using BatchTokenHook   = std::function<void(int stream,
+                                            const std::vector<int32_t>& ids,
+                                            bool done)>;
+std::vector<std::vector<int32_t>> greedy_generate_batch(
+    Qwen3Decoder& dec, ModelLoader& m,
+    const std::vector<BatchStream>& streams, int max_new, int eos,
+    const BatchPrefillHook& on_prefill = {},
+    const BatchTokenHook& on_token = {});
 
 // Build the fused input embeddings [hidden x seq] (feature-fastest, token-major
 // flat: out[p*hidden + h]).

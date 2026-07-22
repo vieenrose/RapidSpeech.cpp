@@ -158,4 +158,111 @@ Qwen3LayerOut qwen3_layer_forward(struct ggml_context* ctx, struct ggml_tensor* 
     return out;
 }
 
+struct ggml_tensor* qwen3_layer_forward_batch(struct ggml_context* ctx,
+                                              struct ggml_tensor* x,
+                                              struct ggml_tensor* pos,
+                                              const Qwen3Layer& w,
+                                              const Qwen3Hparams& hp,
+                                              struct ggml_cgraph* gf,
+                                              const Qwen3StreamKV* kvs,
+                                              int n_streams) {
+    const int hd     = hp.head_dim;
+    const int n_h    = hp.n_heads;
+    const int n_kv_h = hp.n_kv_heads;
+    const float eps  = hp.rms_eps;
+    const int B      = n_streams;
+
+    // ---- SHARED weight-bound ops on [hidden, B]: every mul_mat computes
+    // column b as an independent per-row dot product, so column b's values
+    // are the same as a [hidden, 1] call would produce. ----
+    struct ggml_tensor* xn = rms_norm(ctx, x, w.attn_norm, eps);
+
+    struct ggml_tensor* q = ggml_mul_mat(ctx, w.attn_q, xn);
+    struct ggml_tensor* k = ggml_mul_mat(ctx, w.attn_k, xn);
+    struct ggml_tensor* v = ggml_mul_mat(ctx, w.attn_v, xn);
+
+    // [hd, heads, B, 1]: dim2 is the "token" dim — one token per stream, so
+    // RoPE's per-token pos[] entries become per-STREAM logical positions.
+    q = ggml_reshape_4d(ctx, q, hd, n_h,    B, 1);
+    k = ggml_reshape_4d(ctx, k, hd, n_kv_h, B, 1);
+    v = ggml_reshape_4d(ctx, v, hd, n_kv_h, B, 1);
+
+    q = rms_norm(ctx, q, w.q_norm, eps);
+    k = rms_norm(ctx, k, w.k_norm, eps);
+
+    if (hp.use_rope) {
+        q = ggml_rope_ext(ctx, q, pos, /*freq_factors=*/nullptr,
+                          hd, kQwen3RopeMode, /*n_ctx_orig=*/0,
+                          hp.rope_base, /*freq_scale=*/1.0f,
+                          /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                          /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+        k = ggml_rope_ext(ctx, k, pos, /*freq_factors=*/nullptr,
+                          hd, kQwen3RopeMode, 0,
+                          hp.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    // ---- PER-STREAM attention branches: each is shape-for-shape the
+    // single-stream T=1 cache path (mask=null: with one query at the cache
+    // end every cached key is causally valid). ----
+    struct ggml_tensor* o_cat = nullptr;
+    for (int s = 0; s < B; ++s) {
+        struct ggml_tensor* kc = kvs[s].k_cache;
+        struct ggml_tensor* vc = kvs[s].v_cache;
+        const int past = kvs[s].past;
+        const int64_t kv_len = (int64_t)past + 1;
+
+        // This stream's new K/V column (slice s of the shared projection).
+        struct ggml_tensor* k_s = ggml_view_4d(ctx, k, hd, n_kv_h, 1, 1,
+            k->nb[1], k->nb[2], k->nb[3], (size_t)s * k->nb[2]);
+        struct ggml_tensor* v_s = ggml_view_4d(ctx, v, hd, n_kv_h, 1, 1,
+            v->nb[1], v->nb[2], v->nb[3], (size_t)s * v->nb[2]);
+        struct ggml_tensor* k_dst = ggml_view_4d(ctx, kc, hd, n_kv_h, 1, 1,
+            kc->nb[1], kc->nb[2], kc->nb[3], (size_t)past * kc->nb[2]);
+        struct ggml_tensor* v_dst = ggml_view_4d(ctx, vc, hd, n_kv_h, 1, 1,
+            vc->nb[1], vc->nb[2], vc->nb[3], (size_t)past * vc->nb[2]);
+        // Expand the stores NOW so they execute before this stream's
+        // attention read of the same buffer (node insertion order).
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_s, k_dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, v_s, v_dst));
+
+        struct ggml_tensor* k_used = ggml_view_4d(ctx, kc, hd, n_kv_h, kv_len, 1,
+            kc->nb[1], kc->nb[2], kc->nb[3], 0);
+        struct ggml_tensor* v_used = ggml_view_4d(ctx, vc, hd, n_kv_h, kv_len, 1,
+            vc->nb[1], vc->nb[2], vc->nb[3], 0);
+
+        struct ggml_tensor* q_s = ggml_view_4d(ctx, q, hd, n_h, 1, 1,
+            q->nb[1], q->nb[2], q->nb[3], (size_t)s * q->nb[2]);
+
+        struct ggml_tensor* q_p = ggml_permute(ctx, q_s,    0, 2, 1, 3);  // [hd, 1, n_h, 1]
+        struct ggml_tensor* k_p = ggml_permute(ctx, k_used, 0, 2, 1, 3);  // [hd, kv, n_kv, 1]
+        struct ggml_tensor* v_p = ggml_permute(ctx, v_used, 0, 2, 1, 3);
+
+        struct ggml_tensor* scores = ggml_mul_mat(ctx, k_p, q_p);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        struct ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, /*mask=*/nullptr,
+                                                     scale, /*max_bias=*/0.0f);
+
+        struct ggml_tensor* v_t = maybe_cont(ctx, ggml_transpose(ctx, v_p));
+        struct ggml_tensor* o_s = ggml_mul_mat(ctx, v_t, attn);   // [hd, 1, n_h, 1]
+
+        o_s = ggml_permute(ctx, o_s, 0, 2, 1, 3);                 // [hd, n_h, 1, 1]
+        o_s = ggml_cont_2d(ctx, o_s, n_h * hd, 1);
+
+        o_cat = o_cat ? ggml_concat(ctx, o_cat, o_s, /*dim=*/1) : o_s;
+    }
+
+    // ---- SHARED tail: o-projection, residual, FFN on [hidden, B]. ----
+    struct ggml_tensor* o = ggml_mul_mat(ctx, w.attn_o, o_cat);
+    struct ggml_tensor* h = ggml_add(ctx, x, o);
+
+    struct ggml_tensor* hn = rms_norm(ctx, h, w.ffn_norm, eps);
+    struct ggml_tensor* g  = ggml_mul_mat(ctx, w.ffn_gate, hn);
+    struct ggml_tensor* u  = ggml_mul_mat(ctx, w.ffn_up,   hn);
+    struct ggml_tensor* f  = ggml_mul_mat(ctx, w.ffn_down, ggml_mul(ctx, ggml_silu(ctx, g), u));
+
+    return ggml_add(ctx, h, f);
+}
+
 }  // namespace mt

@@ -319,4 +319,138 @@ std::vector<int32_t> greedy_generate_evict(Qwen3Decoder& dec, ModelLoader& m,
     return ids;
 }
 
+// Timestamp harvesting for the batched loop — EXACTLY the logic inlined in
+// greedy_generate_evict (kept duplicated there to avoid touching the deployed
+// single-stream path): scan `tail` for complete "[...]" groups, keep the max
+// numeric "[ss.ss]" value in *max_ts, drop consumed text, bound the tail.
+static void harvest_ts_tail(std::string& tail, double* max_ts) {
+    size_t close;
+    while ((close = tail.find(']')) != std::string::npos) {
+        const size_t open = tail.rfind('[', close);
+        if (open != std::string::npos && close > open + 1) {
+            bool num = true; int digits = 0;
+            for (size_t i = open + 1; i < close; ++i) {
+                const char ch = tail[i];
+                if (ch >= '0' && ch <= '9') { ++digits; }
+                else if (ch != '.') { num = false; break; }
+            }
+            if (num && digits > 0) {
+                const double ts = atof(tail.substr(open + 1, close - open - 1).c_str());
+                if (ts > *max_ts) *max_ts = ts;
+            }
+        }
+        tail.erase(0, close + 1);
+    }
+    if (tail.size() > 32) tail.erase(0, tail.size() - 32);  // bound memory
+}
+
+std::vector<std::vector<int32_t>> greedy_generate_batch(
+        Qwen3Decoder& dec, ModelLoader& m,
+        const std::vector<BatchStream>& streams, int max_new, int eos,
+        const BatchPrefillHook& on_prefill, const BatchTokenHook& on_token) {
+    const int N = (int)streams.size();
+    const int H = dec.hidden();
+    std::vector<std::vector<int32_t>> all_ids(N);
+    if (N <= 0 || H <= 0 || max_new <= 0) {
+        MT_LOGE("greedy_generate_batch: bad args");
+        return all_ids;
+    }
+    if (N > dec.n_streams()) {
+        MT_LOGE("greedy_generate_batch: %d streams but decoder has %d", N, dec.n_streams());
+        return all_ids;
+    }
+
+    struct St {
+        std::vector<float> logits;
+        bool failed = false;
+        // eviction state (mirrors greedy_generate_evict)
+        bool   evict_on = false;
+        std::string tail;
+        double max_ts = 0.0;
+        int    span_end_phys = 0;
+        int    evicted_total = 0;
+    };
+    std::vector<St> st(N);
+
+    // ---- per-stream prefill (single-stream graph against cache set s) ----
+    std::vector<int> active;
+    for (int s = 0; s < N; ++s) {
+        const BatchStream& in = streams[s];
+        if (!in.fused || in.seq <= 0) { MT_LOGE("greedy_generate_batch: bad stream %d", s); st[s].failed = true; continue; }
+        if (on_prefill) on_prefill(s);
+        std::vector<float> hid;
+        if (!dec.prefill_stream(s, *in.fused, in.seq, &hid) ||
+            (int)hid.size() < H * in.seq) {
+            MT_LOGE("greedy_generate_batch: prefill failed (stream %d)", s);
+            st[s].failed = true;
+            continue;
+        }
+        std::vector<float> last(hid.end() - H, hid.end());
+        st[s].logits = dec.logits_from_hidden(last);
+        if (st[s].logits.empty()) { MT_LOGE("greedy_generate_batch: logits failed (stream %d)", s); st[s].failed = true; continue; }
+        // Same eviction gating as greedy_generate_evict's fallback check.
+        const KvEvictOpts& ev = in.ev;
+        st[s].evict_on = ev.window_s > 0.0 && ev.tok && ev.tok_per_s > 0.0 &&
+                         ev.span_end > ev.span_lo;
+        st[s].span_end_phys = ev.span_end;
+        all_ids[s].reserve((size_t)max_new);
+        active.push_back(s);
+    }
+
+    // ---- batched decode: one token per active stream per step ----
+    std::vector<float> embeds, hid;
+    while (!active.empty()) {
+        std::vector<int> next;
+        embeds.clear();
+        for (int s : active) {
+            const int t = argmax_first(st[s].logits);
+            all_ids[s].push_back(t);
+            const bool done = (t == eos) ||
+                              ((int)all_ids[s].size() >= max_new);
+            if (on_token) on_token(s, all_ids[s], done);
+            if (done) continue;
+
+            if (st[s].evict_on) {
+                const KvEvictOpts& ev = streams[s].ev;
+                st[s].tail += ev.tok->decode({t});
+                harvest_ts_tail(st[s].tail, &st[s].max_ts);
+                if (st[s].max_ts > ev.window_s) {
+                    int keep_from = ev.span_lo +
+                        (int)((st[s].max_ts - ev.window_s) * ev.tok_per_s) -
+                        st[s].evicted_total;
+                    if (keep_from > st[s].span_end_phys) keep_from = st[s].span_end_phys;
+                    if (keep_from - ev.span_lo >= ev.min_batch) {
+                        const int delta = dec.evict_stream(s, ev.span_lo, keep_from);
+                        st[s].evicted_total += delta;
+                        st[s].span_end_phys -= delta;
+                    }
+                }
+            }
+
+            std::vector<float> emb = embed_token(m, t, H);
+            if (emb.empty()) { MT_LOGE("greedy_generate_batch: embed failed @%d (stream %d)", t, s); continue; }
+            embeds.insert(embeds.end(), emb.begin(), emb.end());
+            next.push_back(s);
+        }
+        if (next.empty()) break;
+
+        if (!dec.decode_batch(embeds, next, &hid) ||
+            (int)hid.size() < H * (int)next.size()) {
+            MT_LOGE("greedy_generate_batch: decode_batch failed");
+            break;
+        }
+        // lm_head per stream ([hidden,1]) — see header note on bit-identity.
+        bool ok = true;
+        for (int b = 0; b < (int)next.size(); ++b) {
+            std::vector<float> row(hid.begin() + (size_t)b * H,
+                                   hid.begin() + (size_t)(b + 1) * H);
+            st[next[b]].logits = dec.logits_from_hidden(row);
+            if (st[next[b]].logits.empty()) { MT_LOGE("greedy_generate_batch: logits failed"); ok = false; break; }
+        }
+        if (!ok) break;
+        active = std::move(next);
+    }
+    return all_ids;
+}
+
 }  // namespace mt
