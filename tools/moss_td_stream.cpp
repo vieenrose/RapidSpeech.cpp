@@ -26,6 +26,7 @@
 #include "qwen3_decoder.hpp"
 #include "transcribe.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -104,6 +105,46 @@ const char* mtd_stream_transcribe_pcm(mtd_stream_ctx* ctx, const float* pcm,
     std::vector<float> logits = dec.logits_from_hidden(last);
     if (logits.empty()) return nullptr;
 
+    // MT_KV_EVICT_S: mirror the vendored transcribe.cpp opt-in exactly, so the
+    // streaming and blocking paths stay in agreement whether or not eviction
+    // is enabled (gated by byte-comparing both on the golden clips).
+    double evict_w = 0.0, evict_tps = 0.0;
+    int span_lo = -1, span_end = -1;
+    if (const char* e = std::getenv("MT_KV_EVICT_S"); e && atof(e) > 0.0) {
+        int lo = -1, hi = -1;
+        for (int i = 0; i < seq; ++i)
+            if (input_ids[i] == c.audio_token_id) { if (lo < 0) lo = i; hi = i; }
+        const double audio_s = (double)samples.size() / 16000.0;
+        if (lo >= 0 && hi > lo && audio_s > 0.0) {
+            evict_w = atof(e);
+            span_lo = lo; span_end = hi + 1;
+            evict_tps = (double)(span_end - span_lo) / audio_s;
+        }
+    }
+    std::string ev_tail;
+    double max_ts = 0.0;
+    int span_end_phys = span_end, evicted_total = 0;
+    auto harvest_ts = [&]() {
+        size_t close;
+        while ((close = ev_tail.find(']')) != std::string::npos) {
+            const size_t open = ev_tail.rfind('[', close);
+            if (open != std::string::npos && close > open + 1) {
+                bool num = true; int digits = 0;
+                for (size_t i = open + 1; i < close; ++i) {
+                    const char ch = ev_tail[i];
+                    if (ch >= '0' && ch <= '9') { ++digits; }
+                    else if (ch != '.') { num = false; break; }
+                }
+                if (num && digits > 0) {
+                    const double ts = atof(ev_tail.substr(open + 1, close - open - 1).c_str());
+                    if (ts > max_ts) max_ts = ts;
+                }
+            }
+            ev_tail.erase(0, close + 1);
+        }
+        if (ev_tail.size() > 32) ev_tail.erase(0, ev_tail.size() - 32);
+    };
+
     cb(1, "decode", 0, max_new, user);
     // Greedy loop -- replicates mt::greedy_generate (argmax FIRST-index-on-tie)
     // with a per-token partial-detokenize + callback.
@@ -119,7 +160,23 @@ const char* mtd_stream_transcribe_pcm(mtd_stream_ctx* ctx, const float* pcm,
 
         // Full re-decode keeps UTF-8 and marker fragments correct; cost is
         // trivial next to a decode step.
-        cb(0, tok.decode(new_ids).c_str(), (int)new_ids.size(), max_new, user);
+        const std::string partial = tok.decode(new_ids);
+        cb(0, partial.c_str(), (int)new_ids.size(), max_new, user);
+
+        if (evict_w > 0.0) {
+            ev_tail += tok.decode({new_ids.back()});
+            harvest_ts();
+            if (max_ts > evict_w) {
+                int keep_from = span_lo +
+                    (int)((max_ts - evict_w) * evict_tps) - evicted_total;
+                if (keep_from > span_end_phys) keep_from = span_end_phys;
+                if (keep_from - span_lo >= 256) {
+                    const int delta = dec.evict(span_lo, keep_from);
+                    evicted_total += delta;
+                    span_end_phys -= delta;
+                }
+            }
+        }
 
         std::vector<float> emb = mt::embed_token(m, best, hidden);
         if (emb.empty()) break;

@@ -3,9 +3,10 @@
 Every `.cpp`/`.hpp` in this directory (and `include/`, `third_party/dr_wav.h`)
 is **vendored, unmodified**, from:
 
-> **moss-transcribe.cpp** — https://github.com/localai-org/moss-transcribe.cpp
+> **moss-transcribe.cpp** — https://github.com/vieenrose/moss-transcribe.cpp
+> (fork of https://github.com/localai-org/moss-transcribe.cpp @ `190a569`)
 > Licence: MIT (see `LICENSE-moss-transcribe-cpp.txt`, reproduced verbatim)
-> Upstream revision: see `UPSTREAM_REV` (`190a569c13b4b247450f2fb3b2a431244e84833e`)
+> Upstream revision: see `UPSTREAM_REV`
 
 It is a from-scratch C++17 ggml port of
 [OpenMOSS MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
@@ -21,7 +22,16 @@ re-syncing with upstream harder. So the rule for this directory is:
 not in here. If a change genuinely must happen upstream-side, record it here with
 the reason, and re-run the parity gate afterwards.
 
-Local deltas so far: **none.**
+Local deltas vs localai-org upstream: **one feature, carried in our fork** (so
+this directory still exactly matches its declared upstream — the fork — with
+zero unfork-tracked edits): opt-in audio-KV eviction, `MT_KV_EVICT_S=<seconds>`
+(default OFF; the default path is code-identical to localai-org@190a569).
+Timestamp-driven compaction of the prompt audio span during decode, ported from
+the pre-purification engine's `RS_AUDIO_KV_WINDOW`. Validated 2026-07-22:
+35× 90 s windows across zh/en 16-min meetings ≥98.5% agreement (most
+byte-identical), full 16-min single-pass 99.77% zh / 99.48% en, and −19%
+end-to-end wall on a Samsung A53 with byte-identical output. The parity gate
+below applies to the default (eviction-off) path and is unaffected.
 
 ## Parity status in THIS tree
 

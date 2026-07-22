@@ -43,6 +43,27 @@ std::vector<int32_t> greedy_generate(Qwen3Decoder& dec, ModelLoader& m,
                                      const std::vector<float>& fused, int seq,
                                      int max_new, int eos);
 
+// Optional audio-KV eviction for greedy_generate (MT_KV_EVICT_S): ASR
+// attention is effectively local in time — when emitting text for time T the
+// decoder needs audio KV near T, not minutes back. As the max emitted
+// timestamp advances, columns of the prompt's audio span older than
+// (max_ts - window_s) are physically compacted out of the KV cache, so
+// per-token attention traffic stays O(window) instead of O(audio). Ported
+// from the pre-purification RapidSpeech engine (RS_AUDIO_KV_WINDOW).
+class Tokenizer;
+struct KvEvictOpts {
+    double window_s  = 0.0;      // eviction window in seconds (<=0: off)
+    int    span_lo   = 0;        // first audio-span column in the prompt
+    int    span_end  = 0;        // one past the last audio-span column
+    double tok_per_s = 0.0;      // audio-span columns per second of audio
+    const Tokenizer* tok = nullptr;  // to detect emitted [ss.ss] timestamps
+    int    min_batch = 256;      // amortize the compaction memmove
+};
+std::vector<int32_t> greedy_generate_evict(Qwen3Decoder& dec, ModelLoader& m,
+                                           const std::vector<float>& fused,
+                                           int seq, int max_new, int eos,
+                                           const KvEvictOpts& ev);
+
 // Build the fused input embeddings [hidden x seq] (feature-fastest, token-major
 // flat: out[p*hidden + h]).
 //
