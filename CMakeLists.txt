@@ -889,7 +889,11 @@ if(RS_BUILD_MOSS_TD)
     # moss_transcribe_capi_transcribe_pcm() takes float PCM straight from
     # memory. Same vendored code, no edits -- a wrapper, not a fork.
     set_property(TARGET moss-td PROPERTY POSITION_INDEPENDENT_CODE ON)
-    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp)
+    # moss_td_stream.cpp adds the token-streaming entry points (live demo
+    # transcript); a wrapper like the profiler -- moss_td/ itself stays
+    # unmodified, and with a NULL callback it delegates to the vendored path.
+    add_library(moss-td-shared SHARED ${MOSS_TD_DIR}/moss_transcribe_capi.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/moss_td_stream.cpp)
     set_target_properties(moss-td-shared PROPERTIES
                           OUTPUT_NAME moss_td CXX_STANDARD 17
                           CXX_STANDARD_REQUIRED ON)
