@@ -31,5 +31,30 @@ Qwen3LayerOut qwen3_layer_forward(struct ggml_context* ctx, struct ggml_tensor* 
     struct ggml_cgraph* gf = nullptr,
     struct ggml_tensor* k_cache = nullptr, struct ggml_tensor* v_cache = nullptr,
     int past_seq = 0);
+
+// ---- batched multi-stream decode (one token per independent stream) ----
+//
+// One K/V cache set + past length per stream. The layer runs the SHARED
+// weight-bound ops (attn_norm, q/k/v projections, q/k head norms, RoPE,
+// o-projection, FFN) once on x:[hidden, B] — each of the B columns is an
+// independent dot-product per output row, so per-column numerics match the
+// single-stream [hidden, 1] path — and runs attention as B per-stream
+// branches, each structurally identical to the single-stream T=1 cache path
+// (cpy the stream's new K/V column into ITS cache at past, attend over that
+// cache's [0, past+1) prefix, GGML_PREC_F32 scores, no mask). RoPE positions
+// come per COLUMN from pos:int32[B] (each stream's own logical position).
+// Per-stream attention outputs are ggml_concat'd back to [n_h*hd, B].
+struct Qwen3StreamKV {
+    struct ggml_tensor* k_cache = nullptr;   // [hd, n_kv_h, max_seq, 1]
+    struct ggml_tensor* v_cache = nullptr;
+    int past = 0;                            // valid cached columns
+};
+// x:[hidden, B]; pos:int32[B] (per-stream logical positions); kvs: B entries.
+// Returns the layer output [hidden, B]. K/V stores are expanded into gf
+// before the attention reads (same ordering contract as the single path).
+struct ggml_tensor* qwen3_layer_forward_batch(struct ggml_context* ctx,
+    struct ggml_tensor* x, struct ggml_tensor* pos,
+    const Qwen3Layer& w, const Qwen3Hparams& hp, struct ggml_cgraph* gf,
+    const Qwen3StreamKV* kvs, int n_streams);
 }  // namespace mt
 #endif
